@@ -9,6 +9,7 @@
 #include "ui_common.h"
 #include "ui_numpad.h"
 #include <math.h>  /* 用于cosf和sinf函数 */
+#include <stdio.h>
 
 /*********************
  *  STATIC PROTOTYPES
@@ -52,6 +53,17 @@ static lv_obj_t *g_dialog = NULL;        /* 确认对话框 */
 static lv_obj_t *g_program_checkboxes[100]; /* 程序选择复选框数组 */
 static int g_program_checkbox_count = 0;    /* 实际创建的复选框数量 */
 
+/* Zigbee 设备状态标签（首页"当前设备状态"区域） */
+static lv_obj_t *g_field_val_labels[6] = {NULL};  /* 6 行传感器值 */
+static lv_obj_t *g_field_name_labels[6] = {NULL};  /* 6 行名称标签 */
+static int g_selected_field = 0;                    /* 当前选中的田地(0~5) */
+
+/* 右下：设备开关状态标签 */
+static lv_obj_t *g_dev_status_label = NULL;
+
+/* Zigbee 连接状态标签 */
+static lv_obj_t *g_zigbee_status_label = NULL;
+
 /**********************
  *   GLOBAL FUNCTIONS
  **********************/
@@ -69,6 +81,12 @@ void ui_home_create(lv_obj_t *parent)
     g_btn_label = NULL;
     g_tick_count = 0;
     g_program_checkbox_count = 0;
+    g_dev_status_label = NULL;
+    g_zigbee_status_label = NULL;
+    for (int i = 0; i < 6; i++) {
+        g_field_val_labels[i] = NULL;
+        g_field_name_labels[i] = NULL;
+    }
     /* g_dialog 由 ui_home_close_dialog() 在 ui_switch_nav 中处理 */
 
     /* 清空父容器 */
@@ -214,56 +232,47 @@ static void create_status_list(lv_obj_t *parent)
     lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 左侧：设备状态 */
-    /* 标题 "当前设备状态" */
+    /* 标题 "当前设备状态" + 田地选择按钮 */
     lv_obj_t *title = lv_label_create(status_card);
     lv_label_set_text(title, "当前设备状态");
     lv_obj_set_style_text_font(title, &my_fontbd_16, 0);
     lv_obj_set_style_text_color(title, COLOR_TEXT_MAIN, 0);
     lv_obj_set_pos(title, 20, 20);
 
-    /* EC - 使用两个标签实现对齐 */
-    lv_obj_t *label_ec_name = lv_label_create(status_card);
-    lv_label_set_text(label_ec_name, "EC(ms/cm):");
-    lv_obj_set_style_text_font(label_ec_name, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_ec_name, 30, 80);
+    /* Zigbee 连接状态 */
+    g_zigbee_status_label = lv_label_create(status_card);
+    lv_label_set_text(g_zigbee_status_label, "Zigbee 离线");
+    lv_obj_set_style_text_font(g_zigbee_status_label, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_zigbee_status_label, lv_color_hex(0x999999), 0);
+    lv_obj_set_pos(g_zigbee_status_label, 280, 20);
 
-    lv_obj_t *label_ec_val = lv_label_create(status_card);
-    lv_label_set_text(label_ec_val, "---");
-    lv_obj_set_style_text_font(label_ec_val, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_ec_val, 240, 80);
+    /* 田地选择下拉框 */
+    lv_obj_t *field_dd = lv_dropdown_create(status_card);
+    lv_dropdown_set_options(field_dd, "田地1\n田地2\n田地3\n田地4\n田地5\n田地6");
+    lv_obj_set_size(field_dd, 100, 35);
+    lv_obj_set_pos(field_dd, 160, 14);
+    lv_obj_set_style_text_font(field_dd, &my_font_cn_16, 0);
+    lv_obj_add_event_cb(field_dd, ui_dropdown_list_font_cb, LV_EVENT_READY, NULL);
 
-    /* PH */
-    lv_obj_t *label_ph_name = lv_label_create(status_card);
-    lv_label_set_text(label_ph_name, "PH:");
-    lv_obj_set_style_text_font(label_ph_name, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_ph_name, 30, 145);
+    /* 6 行传感器数据 */
+    static const char *sensor_names[] = {
+        "氮(mg/kg):", "磷(mg/kg):", "钾(mg/kg):",
+        "温度(°C):", "湿度(%):", "光照(lux):"
+    };
 
-    lv_obj_t *label_ph_val = lv_label_create(status_card);
-    lv_label_set_text(label_ph_val, "---");
-    lv_obj_set_style_text_font(label_ph_val, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_ph_val, 240, 145);
+    for (int i = 0; i < 6; i++) {
+        int y = 65 + i * 45;
 
-    /* Pressure */
-    lv_obj_t *label_pressure_name = lv_label_create(status_card);
-    lv_label_set_text(label_pressure_name, "Pressure(MPa):");
-    lv_obj_set_style_text_font(label_pressure_name, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_pressure_name, 30, 210);
+        g_field_name_labels[i] = lv_label_create(status_card);
+        lv_label_set_text(g_field_name_labels[i], sensor_names[i]);
+        lv_obj_set_style_text_font(g_field_name_labels[i], &my_font_cn_16, 0);
+        lv_obj_set_pos(g_field_name_labels[i], 30, y);
 
-    lv_obj_t *label_pressure_val = lv_label_create(status_card);
-    lv_label_set_text(label_pressure_val, "---");
-    lv_obj_set_style_text_font(label_pressure_val, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_pressure_val, 240, 210);
-
-    /* Flow */
-    lv_obj_t *label_flow_name = lv_label_create(status_card);
-    lv_label_set_text(label_flow_name, "Flow(m3/h):");
-    lv_obj_set_style_text_font(label_flow_name, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_flow_name, 30, 275);
-
-    lv_obj_t *label_flow_val = lv_label_create(status_card);
-    lv_label_set_text(label_flow_val, "---");
-    lv_obj_set_style_text_font(label_flow_val, &my_font_cn_16, 0);
-    lv_obj_set_pos(label_flow_val, 240, 275);
+        g_field_val_labels[i] = lv_label_create(status_card);
+        lv_label_set_text(g_field_val_labels[i], "---");
+        lv_obj_set_style_text_font(g_field_val_labels[i], &my_font_cn_16, 0);
+        lv_obj_set_pos(g_field_val_labels[i], 180, y);
+    }
 
     /* 右上角：按钮区域 - 更小的尺寸 */
     lv_obj_t *btn_program = lv_btn_create(status_card);
@@ -1065,6 +1074,23 @@ void ui_home_close_dialog(void)
 }
 
 /**
+ * @brief 导航离开首页时，置空所有静态对象指针，防止异步回调访问已释放内存
+ */
+void ui_home_invalidate_objects(void)
+{
+    g_arc = NULL;
+    g_mode_label = NULL;
+    g_btn_toggle = NULL;
+    g_btn_label = NULL;
+    g_dev_status_label = NULL;
+    g_zigbee_status_label = NULL;
+    for (int i = 0; i < 6; i++) {
+        g_field_val_labels[i] = NULL;
+        g_field_name_labels[i] = NULL;
+    }
+}
+
+/**
  * @brief 统一设置按钮回调
  */
 static void btn_uniform_set_cb(lv_event_t *e)
@@ -1171,5 +1197,97 @@ static void uniform_set_cancel_cb(lv_event_t *e)
     /* 关闭确认对话框 */
     if (confirm_dialog != NULL) {
         lv_obj_del(confirm_dialog);
+    }
+}
+
+/* ---- Zigbee 数据更新接口 ---- */
+
+/* 内部缓存，用于田地切换时恢复数据 */
+static struct {
+    float n, p, k, temp, humi, light;
+    bool  valid;
+} s_field_cache[6] = {0};
+
+void ui_home_update_field(int field_id,
+    float n, float p, float k, float temp, float humi, float light)
+{
+    if (field_id < 1 || field_id > 6) return;
+    int idx = field_id - 1;
+
+    /* 缓存数据 */
+    s_field_cache[idx].n = n;
+    s_field_cache[idx].p = p;
+    s_field_cache[idx].k = k;
+    s_field_cache[idx].temp = temp;
+    s_field_cache[idx].humi = humi;
+    s_field_cache[idx].light = light;
+    s_field_cache[idx].valid = true;
+
+    /* 只更新当前选中的田地 */
+    if (idx != g_selected_field) return;
+    if (!g_field_val_labels[0]) return;
+
+    char buf[16];
+    float vals[] = {n, p, k, temp, humi, light};
+    for (int i = 0; i < 6; i++) {
+        snprintf(buf, sizeof(buf), "%.1f", vals[i]);
+        lv_label_set_text(g_field_val_labels[i], buf);
+    }
+}
+
+void ui_home_update_pipe(int pipe_id,
+    bool valve_on, float flow, float pressure)
+{
+    (void)pipe_id;
+    (void)valve_on;
+    (void)flow;
+    (void)pressure;
+    /* 管道数据在设备页面显示，首页仅汇总在 g_dev_status_label */
+}
+
+void ui_home_update_tank(int tank_id, bool switch_on, float level)
+{
+    (void)tank_id;
+    (void)switch_on;
+    (void)level;
+    /* 储料罐数据在设备页面显示 */
+}
+
+void ui_home_update_mixer(bool on)
+{
+    (void)on;
+    /* 搅拌机状态在设备页面显示 */
+}
+
+void ui_home_update_control(bool water_pump, bool fert_pump,
+    bool fert_valve, bool water_valve, bool mixer)
+{
+    if (!g_dev_status_label) return;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "主水泵: %s  施肥泵: %s\n"
+        "出肥阀: %s  注水阀: %s\n"
+        "搅拌机: %s",
+        water_pump  ? "开启" : "关闭",
+        fert_pump   ? "开启" : "关闭",
+        fert_valve  ? "开启" : "关闭",
+        water_valve ? "开启" : "关闭",
+        mixer       ? "开启" : "关闭");
+    lv_label_set_text(g_dev_status_label, buf);
+}
+
+void ui_home_update_zigbee_status(bool online, int frame_count)
+{
+    if (!g_zigbee_status_label) return;
+
+    if (online) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Zigbee 在线 (%d帧)", frame_count);
+        lv_label_set_text(g_zigbee_status_label, buf);
+        lv_obj_set_style_text_color(g_zigbee_status_label, lv_color_hex(0x4CAF50), 0);
+    } else {
+        lv_label_set_text(g_zigbee_status_label, "Zigbee 离线");
+        lv_obj_set_style_text_color(g_zigbee_status_label, lv_color_hex(0x999999), 0);
     }
 }

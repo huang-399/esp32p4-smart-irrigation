@@ -123,6 +123,10 @@ void ui_switch_nav(nav_item_t nav)
        to prevent async scan callbacks from accessing freed memory */
     ui_wifi_invalidate_objects();
 
+    /* Invalidate home page pointers before destroying content
+       to prevent zigbee async callbacks from accessing freed memory */
+    ui_home_invalidate_objects();
+
     /* 清空内容区 */
     lv_obj_clean(g_ui_main.content);
 

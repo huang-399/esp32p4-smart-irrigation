@@ -132,6 +132,7 @@ void ui_home_create(lv_obj_t *parent);
  * @brief 关闭首页弹窗（如果存在）
  */
 void ui_home_close_dialog(void);
+void ui_home_invalidate_objects(void);
 
 /**
  * @brief 创建程序管理界面
@@ -256,6 +257,180 @@ void ui_statusbar_set_wifi_connected(bool connected);
  * @param time_str 时间字符串，如 "15:41:48\n2026/01/12 周一" 或 "--:--:--\n----/--/-- --"
  */
 void ui_statusbar_set_time(const char *time_str);
+
+/* ---- Zigbee 设备数据更新（由 main.c 在 LVGL 线程中调用） ---- */
+
+void ui_home_update_field(int field_id,
+    float n, float p, float k, float temp, float humi, float light);
+void ui_home_update_pipe(int pipe_id,
+    bool valve_on, float flow, float pressure);
+void ui_home_update_tank(int tank_id, bool switch_on, float level);
+void ui_home_update_mixer(bool on);
+void ui_home_update_control(bool water_pump, bool fert_pump,
+    bool fert_valve, bool water_valve, bool mixer);
+void ui_home_update_zigbee_status(bool online, int frame_count);
+
+/* ---- 设备控制回调（UI → main.c → zigbee_bridge） ---- */
+
+/* dev_type: 0x02=阀门, 0x03=储料罐, 0x04=独立设备 */
+typedef void (*ui_device_control_cb_t)(uint8_t dev_type, uint8_t dev_id, bool on);
+void ui_device_register_control_cb(ui_device_control_cb_t cb);
+
+/* ---- 传感器搜索回调（设置页面） ---- */
+
+typedef struct {
+    char    name[32];
+    char    type_name[16];
+    uint8_t dev_type;
+    uint8_t dev_id;
+    uint8_t sensor_index;
+} ui_sensor_found_item_t;
+
+typedef void (*ui_search_sensor_cb_t)(void);
+void ui_settings_register_search_sensor_cb(ui_search_sensor_cb_t cb);
+void ui_settings_update_search_results(const ui_sensor_found_item_t *items, int count);
+
+/* ---- 设备注册表回调类型（UI → main.c → device_registry） ---- */
+
+/* 添加参数结构体 */
+typedef struct {
+    uint8_t  type;       /* dev_type_t */
+    uint8_t  port;       /* dev_port_t */
+    uint16_t id;
+    char     name[32];
+} ui_device_add_params_t;
+
+typedef struct {
+    uint8_t  type;       /* valve_type_t */
+    uint8_t  channel;
+    uint16_t parent_device_id;
+    char     name[32];
+} ui_valve_add_params_t;
+
+typedef struct {
+    uint8_t  type;       /* sensor_type_t */
+    uint8_t  sensor_index;
+    uint8_t  zb_dev_type; /* Zigbee 设备类型 (0x01=田地, 0x02=管道, 0x03=控制) */
+    uint16_t parent_device_id;
+    char     name[32];
+} ui_sensor_add_params_t;
+
+/* 添加/删除/编辑回调类型 */
+typedef bool (*ui_device_add_cb_t)(const ui_device_add_params_t *params);
+typedef bool (*ui_valve_add_cb_t)(const ui_valve_add_params_t *params);
+typedef bool (*ui_sensor_add_cb_t)(const ui_sensor_add_params_t *params);
+typedef bool (*ui_device_delete_cb_t)(uint16_t device_id);
+typedef bool (*ui_valve_delete_cb_t)(uint16_t valve_id);
+typedef bool (*ui_sensor_delete_cb_t)(uint32_t composed_id);
+typedef bool (*ui_device_edit_cb_t)(uint16_t device_id, const ui_device_add_params_t *params);
+typedef bool (*ui_valve_edit_cb_t)(uint16_t valve_id, const ui_valve_add_params_t *params);
+typedef bool (*ui_sensor_edit_cb_t)(uint32_t composed_id, const ui_sensor_add_params_t *params);
+
+/* 表格行数据结构 */
+typedef struct {
+    uint8_t  type;
+    uint8_t  port;
+    uint16_t id;
+    char     name[32];
+} ui_device_row_t;
+
+typedef struct {
+    uint8_t  type;
+    uint8_t  channel;
+    uint16_t id;
+    uint16_t parent_device_id;
+    char     name[32];
+    char     parent_name[32];
+} ui_valve_row_t;
+
+typedef struct {
+    uint8_t  type;
+    uint8_t  sensor_index;
+    uint8_t  zb_dev_type;
+    uint16_t parent_device_id;
+    uint32_t composed_id;
+    char     name[32];
+    char     parent_name[32];
+} ui_sensor_row_t;
+
+/* 查询回调类型 */
+typedef int  (*ui_get_device_count_cb_t)(void);
+typedef int  (*ui_get_device_list_cb_t)(ui_device_row_t *out, int max, int offset);
+typedef int  (*ui_get_valve_count_cb_t)(void);
+typedef int  (*ui_get_valve_list_cb_t)(ui_valve_row_t *out, int max, int offset);
+typedef int  (*ui_get_sensor_count_cb_t)(void);
+typedef int  (*ui_get_sensor_list_cb_t)(ui_sensor_row_t *out, int max, int offset);
+typedef int  (*ui_get_device_dropdown_cb_t)(char *buf, int buf_size);
+typedef int  (*ui_get_channel_count_cb_t)(uint16_t device_id);
+typedef bool (*ui_is_sensor_added_cb_t)(uint32_t composed_id);
+typedef uint8_t (*ui_next_sensor_index_cb_t)(uint16_t parent_device_id);
+
+/* 从下拉框选项解析出设备 ID */
+typedef uint16_t (*ui_parse_device_id_cb_t)(int dropdown_index);
+
+/* 注册函数 */
+void ui_settings_register_device_add_cb(ui_device_add_cb_t cb);
+void ui_settings_register_valve_add_cb(ui_valve_add_cb_t cb);
+void ui_settings_register_sensor_add_cb(ui_sensor_add_cb_t cb);
+void ui_settings_register_device_delete_cb(ui_device_delete_cb_t cb);
+void ui_settings_register_valve_delete_cb(ui_valve_delete_cb_t cb);
+void ui_settings_register_sensor_delete_cb(ui_sensor_delete_cb_t cb);
+void ui_settings_register_device_edit_cb(ui_device_edit_cb_t cb);
+void ui_settings_register_valve_edit_cb(ui_valve_edit_cb_t cb);
+void ui_settings_register_sensor_edit_cb(ui_sensor_edit_cb_t cb);
+void ui_settings_register_query_cbs(
+    ui_get_device_count_cb_t    dev_count_cb,
+    ui_get_device_list_cb_t     dev_list_cb,
+    ui_get_valve_count_cb_t     valve_count_cb,
+    ui_get_valve_list_cb_t      valve_list_cb,
+    ui_get_sensor_count_cb_t    sensor_count_cb,
+    ui_get_sensor_list_cb_t     sensor_list_cb,
+    ui_get_device_dropdown_cb_t dev_dropdown_cb,
+    ui_get_channel_count_cb_t   ch_count_cb,
+    ui_is_sensor_added_cb_t     is_added_cb,
+    ui_next_sensor_index_cb_t   next_idx_cb,
+    ui_parse_device_id_cb_t     parse_id_cb
+);
+
+/* 刷新表格（添加/删除后调用） */
+void ui_settings_refresh_device_table(void);
+void ui_settings_refresh_valve_table(void);
+void ui_settings_refresh_sensor_table(void);
+void ui_settings_refresh_zone_table(void);
+
+/* ---- 灌区管理回调类型 ---- */
+
+typedef struct {
+    int      slot_index;
+    char     name[32];
+    uint8_t  valve_count;
+    uint8_t  device_count;
+    char     valve_names[128];
+    char     device_names[128];
+} ui_zone_row_t;
+
+typedef struct {
+    char     name[32];
+    uint8_t  valve_count;
+    uint8_t  device_count;
+    uint16_t valve_ids[16];
+    uint16_t device_ids[8];
+} ui_zone_add_params_t;
+
+typedef bool (*ui_zone_add_cb_t)(const ui_zone_add_params_t *params);
+typedef bool (*ui_zone_delete_cb_t)(int slot_index);
+typedef bool (*ui_zone_edit_cb_t)(int slot_index, const ui_zone_add_params_t *params);
+typedef int  (*ui_get_zone_count_cb_t)(void);
+typedef int  (*ui_get_zone_list_cb_t)(ui_zone_row_t *out, int max, int offset);
+typedef bool (*ui_get_zone_detail_cb_t)(int slot_index, ui_zone_add_params_t *out);
+
+void ui_settings_register_zone_add_cb(ui_zone_add_cb_t cb);
+void ui_settings_register_zone_delete_cb(ui_zone_delete_cb_t cb);
+void ui_settings_register_zone_edit_cb(ui_zone_edit_cb_t cb);
+void ui_settings_register_zone_query_cbs(
+    ui_get_zone_count_cb_t  count_cb,
+    ui_get_zone_list_cb_t   list_cb,
+    ui_get_zone_detail_cb_t detail_cb);
 
 #ifdef __cplusplus
 } /* extern "C" */

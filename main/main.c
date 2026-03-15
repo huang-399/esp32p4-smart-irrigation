@@ -16,6 +16,8 @@
 #include "wifi_manager.h"
 #include "display_manager.h"
 #include "event_recorder.h"
+#include "zigbee_bridge.h"
+#include "device_registry.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include <stdlib.h>
@@ -352,6 +354,447 @@ static void wifi_init_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+/* ---- Zigbee bridge callbacks ---- */
+
+typedef struct {
+    uint8_t dev_type;
+    uint8_t dev_id;
+} zb_ui_msg_t;
+
+static int s_zb_frame_count = 0;         /* 收到的总帧数 */
+
+static void update_zb_ui_async(void *param)
+{
+    zb_ui_msg_t *msg = (zb_ui_msg_t *)param;
+
+    /* 更新帧计数和 Zigbee 状态 */
+    s_zb_frame_count++;
+    ui_home_update_zigbee_status(true, s_zb_frame_count);
+
+    if (msg->dev_type == ZB_DEV_FIELD) {
+        const zb_field_data_t *f = zigbee_bridge_get_field(msg->dev_id);
+        if (f) {
+            ui_home_update_field(msg->dev_id,
+                f->nitrogen, f->phosphorus, f->potassium,
+                f->temperature, f->humidity, f->light);
+        }
+    } else if (msg->dev_type == ZB_DEV_PIPE) {
+        const zb_pipe_data_t *pd = zigbee_bridge_get_pipes();
+        if (pd) {
+            for (int i = 0; i < 7; i++) {
+                ui_home_update_pipe(i, pd->pipes[i].valve_on,
+                    pd->pipes[i].flow, pd->pipes[i].pressure);
+            }
+        }
+    } else if (msg->dev_type == ZB_DEV_CONTROL) {
+        const zb_control_data_t *cd = zigbee_bridge_get_control();
+        if (cd) {
+            ui_home_update_control(cd->water_pump_on, cd->fert_pump_on,
+                cd->fert_valve_on, cd->water_valve_on, cd->mixer_on);
+            for (int i = 0; i < 3; i++) {
+                ui_home_update_tank(i + 1, cd->tanks[i].switch_on,
+                    cd->tanks[i].level);
+            }
+        }
+    }
+
+    free(msg);
+}
+
+static void on_zb_data(uint8_t dev_type, uint8_t dev_id, void *user_data)
+{
+    (void)user_data;
+    zb_ui_msg_t *msg = malloc(sizeof(zb_ui_msg_t));
+    if (!msg) return;
+    msg->dev_type = dev_type;
+    msg->dev_id = dev_id;
+    lv_async_call(update_zb_ui_async, msg);
+}
+
+/* 设备控制回调（UI → zigbee_bridge） */
+static void on_device_control(uint8_t dev_type, uint8_t dev_id, bool on)
+{
+    ESP_LOGI(TAG, "Device control: type=0x%02X id=%d on=%d", dev_type, dev_id, on);
+    zigbee_bridge_send_control(dev_type, dev_id, on);
+}
+
+/* 搜索传感器回调（在 LVGL 任务中执行，不可使用大栈数组） */
+static void on_search_sensor(void)
+{
+    ESP_LOGI(TAG, "Sensor search requested");
+
+    /* PSRAM 堆分配，避免 LVGL 任务栈溢出 */
+    zb_discovered_item_t *items = malloc(64 * sizeof(zb_discovered_item_t));
+    if (!items) {
+        ESP_LOGE(TAG, "alloc discovered items failed");
+        return;
+    }
+    int count = zigbee_bridge_get_discovered(items, 64);
+    ESP_LOGI(TAG, "Found %d sensors", count);
+
+    if (count > 0) {
+        ui_sensor_found_item_t *ui_items = malloc(count * sizeof(ui_sensor_found_item_t));
+        if (!ui_items) {
+            free(items);
+            ESP_LOGE(TAG, "alloc ui_items failed");
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            strncpy(ui_items[i].name, items[i].name, 32);
+            strncpy(ui_items[i].type_name, items[i].type_name, 16);
+            ui_items[i].dev_type = items[i].dev_type;
+            ui_items[i].dev_id = items[i].dev_id;
+            ui_items[i].sensor_index = items[i].sensor_index;
+        }
+        /* 已在 LVGL 任务上下文，无需 bsp_display_lock */
+        ui_settings_update_search_results(ui_items, count);
+        free(ui_items);
+    } else {
+        /* 未找到任何传感器，弹窗提示 */
+        ui_settings_update_search_results(NULL, 0);
+    }
+    free(items);
+}
+
+/* ---- device_registry 桥接回调 ---- */
+
+static bool on_device_add(const ui_device_add_params_t *params)
+{
+    dev_device_info_t dev = {0};
+    dev.type = params->type;
+    dev.port = params->port;
+    dev.id   = params->id;
+    snprintf(dev.name, sizeof(dev.name), "%s", params->name);
+    esp_err_t ret = device_registry_add(&dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Add device failed: %s", esp_err_to_name(ret));
+    }
+    return (ret == ESP_OK);
+}
+
+static bool on_valve_add(const ui_valve_add_params_t *params)
+{
+    dev_valve_info_t valve = {0};
+    valve.type = params->type;
+    valve.channel = params->channel;
+    valve.parent_device_id = params->parent_device_id;
+    snprintf(valve.name, sizeof(valve.name), "%s", params->name);
+    esp_err_t ret = valve_registry_add(&valve);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Add valve failed: %s", esp_err_to_name(ret));
+    }
+    return (ret == ESP_OK);
+}
+
+static bool on_sensor_add(const ui_sensor_add_params_t *params)
+{
+    dev_sensor_info_t sensor = {0};
+    sensor.type = params->type;
+    sensor.sensor_index = params->sensor_index;
+    sensor.zb_dev_type = params->zb_dev_type;
+    sensor.parent_device_id = params->parent_device_id;
+    sensor.composed_id = (uint32_t)params->zb_dev_type * 1000000
+                       + (uint32_t)params->parent_device_id * 100
+                       + params->sensor_index;
+    snprintf(sensor.name, sizeof(sensor.name), "%s", params->name);
+    esp_err_t ret = sensor_registry_add(&sensor);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Add sensor failed: %s", esp_err_to_name(ret));
+    }
+    return (ret == ESP_OK);
+}
+
+static bool on_device_delete(uint16_t device_id)
+{
+    esp_err_t ret = device_registry_remove(device_id);
+    return (ret == ESP_OK);
+}
+
+static bool on_valve_delete(uint16_t valve_id)
+{
+    esp_err_t ret = valve_registry_remove(valve_id);
+    return (ret == ESP_OK);
+}
+
+static bool on_sensor_delete(uint32_t composed_id)
+{
+    esp_err_t ret = sensor_registry_remove(composed_id);
+    return (ret == ESP_OK);
+}
+
+static bool on_device_edit(uint16_t id, const ui_device_add_params_t *params)
+{
+    dev_device_info_t dev = {0};
+    dev.type = params->type;
+    dev.port = params->port;
+    dev.id = params->id;
+    snprintf(dev.name, sizeof(dev.name), "%s", params->name);
+    return device_registry_update(id, &dev) == ESP_OK;
+}
+
+static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
+{
+    dev_valve_info_t valve = {0};
+    valve.type = params->type;
+    valve.channel = params->channel;
+    valve.parent_device_id = params->parent_device_id;
+    snprintf(valve.name, sizeof(valve.name), "%s", params->name);
+    return valve_registry_update(id, &valve) == ESP_OK;
+}
+
+static bool on_sensor_edit(uint32_t composed_id, const ui_sensor_add_params_t *params)
+{
+    dev_sensor_info_t sensor = {0};
+    sensor.type = params->type;
+    snprintf(sensor.name, sizeof(sensor.name), "%s", params->name);
+    return sensor_registry_update(composed_id, &sensor) == ESP_OK;
+}
+
+static int on_get_device_count(void)
+{
+    return device_registry_get_count();
+}
+
+static int on_get_device_list(ui_device_row_t *out, int max, int offset)
+{
+    const dev_device_info_t *all = device_registry_get_all();
+    int filled = 0;
+    int skipped = 0;
+    for (int i = 0; i < DEV_REG_MAX_DEVICES && filled < max; i++) {
+        if (!all[i].valid) continue;
+        if (skipped < offset) { skipped++; continue; }
+        out[filled].type = all[i].type;
+        out[filled].port = all[i].port;
+        out[filled].id   = all[i].id;
+        snprintf(out[filled].name, sizeof(out[filled].name), "%s", all[i].name);
+        filled++;
+    }
+    return filled;
+}
+
+static int on_get_valve_count(void)
+{
+    return valve_registry_get_count();
+}
+
+static int on_get_valve_list(ui_valve_row_t *out, int max, int offset)
+{
+    const dev_valve_info_t *all = valve_registry_get_all();
+    const dev_device_info_t *devs = device_registry_get_all();
+    int filled = 0;
+    int skipped = 0;
+    for (int i = 0; i < DEV_REG_MAX_VALVES && filled < max; i++) {
+        if (!all[i].valid) continue;
+        if (skipped < offset) { skipped++; continue; }
+        out[filled].type = all[i].type;
+        out[filled].channel = all[i].channel;
+        out[filled].id   = all[i].id;
+        out[filled].parent_device_id = all[i].parent_device_id;
+        snprintf(out[filled].name, sizeof(out[filled].name), "%s", all[i].name);
+        /* 查找父设备名称 */
+        out[filled].parent_name[0] = '\0';
+        for (int j = 0; j < DEV_REG_MAX_DEVICES; j++) {
+            if (devs[j].valid && devs[j].id == all[i].parent_device_id) {
+                snprintf(out[filled].parent_name, sizeof(out[filled].parent_name), "%s", devs[j].name);
+                break;
+            }
+        }
+        if (out[filled].parent_name[0] == '\0') {
+            snprintf(out[filled].parent_name, sizeof(out[filled].parent_name), "ID:%d(已删除)", all[i].parent_device_id);
+        }
+        filled++;
+    }
+    return filled;
+}
+
+static int on_get_sensor_count(void)
+{
+    return sensor_registry_get_count();
+}
+
+static int on_get_sensor_list(ui_sensor_row_t *out, int max, int offset)
+{
+    const dev_sensor_info_t *all = sensor_registry_get_all();
+    const dev_device_info_t *devs = device_registry_get_all();
+    int filled = 0;
+    int skipped = 0;
+    for (int i = 0; i < DEV_REG_MAX_SENSORS && filled < max; i++) {
+        if (!all[i].valid) continue;
+        if (skipped < offset) { skipped++; continue; }
+        out[filled].type = all[i].type;
+        out[filled].sensor_index = all[i].sensor_index;
+        out[filled].zb_dev_type = all[i].zb_dev_type;
+        out[filled].parent_device_id = all[i].parent_device_id;
+        out[filled].composed_id = all[i].composed_id;
+        snprintf(out[filled].name, sizeof(out[filled].name), "%s", all[i].name);
+        /* 查找父设备名称 */
+        out[filled].parent_name[0] = '\0';
+        for (int j = 0; j < DEV_REG_MAX_DEVICES; j++) {
+            if (devs[j].valid && devs[j].id == all[i].parent_device_id) {
+                snprintf(out[filled].parent_name, sizeof(out[filled].parent_name), "%s", devs[j].name);
+                break;
+            }
+        }
+        if (out[filled].parent_name[0] == '\0') {
+            snprintf(out[filled].parent_name, sizeof(out[filled].parent_name), "ID:%d(已删除)", all[i].parent_device_id);
+        }
+        filled++;
+    }
+    return filled;
+}
+
+static int on_get_device_dropdown(char *buf, int buf_size)
+{
+    return device_registry_build_dropdown_str(buf, buf_size);
+}
+
+static int on_get_channel_count(uint16_t device_id)
+{
+    return device_registry_get_channel_count(device_id);
+}
+
+static bool on_is_sensor_added(uint32_t composed_id)
+{
+    return sensor_registry_is_id_taken(composed_id);
+}
+
+static uint8_t on_next_sensor_index(uint16_t parent_device_id)
+{
+    return sensor_registry_next_index(parent_device_id);
+}
+
+static uint16_t on_parse_device_id(int dropdown_index)
+{
+    const dev_device_info_t *all = device_registry_get_all();
+    int count = 0;
+    for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+        if (!all[i].valid) continue;
+        if (count == dropdown_index) return all[i].id;
+        count++;
+    }
+    return 0;
+}
+
+/* ---- zone 桥接回调 ---- */
+
+static bool on_zone_add(const ui_zone_add_params_t *params)
+{
+    dev_zone_info_t zone = {0};
+    snprintf(zone.name, sizeof(zone.name), "%s", params->name);
+    zone.valve_count = params->valve_count;
+    zone.device_count = params->device_count;
+    memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
+    memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
+    return zone_registry_add(&zone) == ESP_OK;
+}
+
+static bool on_zone_delete(int slot_index)
+{
+    return zone_registry_remove(slot_index) == ESP_OK;
+}
+
+static bool on_zone_edit(int slot_index, const ui_zone_add_params_t *params)
+{
+    dev_zone_info_t zone = {0};
+    snprintf(zone.name, sizeof(zone.name), "%s", params->name);
+    zone.valve_count = params->valve_count;
+    zone.device_count = params->device_count;
+    memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
+    memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
+    return zone_registry_update(slot_index, &zone) == ESP_OK;
+}
+
+static int on_get_zone_count(void)
+{
+    return zone_registry_get_count();
+}
+
+static int on_get_zone_list(ui_zone_row_t *out, int max, int offset)
+{
+    const dev_zone_info_t *all = zone_registry_get_all();
+    const dev_valve_info_t *valves = valve_registry_get_all();
+    const dev_device_info_t *devs = device_registry_get_all();
+    int filled = 0;
+    int skipped = 0;
+
+    for (int i = 0; i < DEV_REG_MAX_ZONES && filled < max; i++) {
+        if (!all[i].valid) continue;
+        if (skipped < offset) { skipped++; continue; }
+
+        out[filled].slot_index = i;
+        snprintf(out[filled].name, sizeof(out[filled].name), "%s", all[i].name);
+        out[filled].valve_count = all[i].valve_count;
+        out[filled].device_count = all[i].device_count;
+
+        /* 拼接阀门名称摘要 */
+        out[filled].valve_names[0] = '\0';
+        int pos = 0;
+        for (int v = 0; v < all[i].valve_count; v++) {
+            const char *vname = NULL;
+            for (int j = 0; j < DEV_REG_MAX_VALVES; j++) {
+                if (valves[j].valid && valves[j].id == all[i].valve_ids[v]) {
+                    vname = valves[j].name;
+                    break;
+                }
+            }
+            if (v > 0 && pos < (int)sizeof(out[filled].valve_names) - 2) {
+                pos += snprintf(out[filled].valve_names + pos,
+                    sizeof(out[filled].valve_names) - pos, ",");
+            }
+            if (vname) {
+                pos += snprintf(out[filled].valve_names + pos,
+                    sizeof(out[filled].valve_names) - pos, "%s", vname);
+            } else {
+                pos += snprintf(out[filled].valve_names + pos,
+                    sizeof(out[filled].valve_names) - pos, "ID:%d", all[i].valve_ids[v]);
+            }
+        }
+
+        /* 拼接设备名称摘要 */
+        out[filled].device_names[0] = '\0';
+        pos = 0;
+        for (int d = 0; d < all[i].device_count; d++) {
+            const char *dname = NULL;
+            for (int j = 0; j < DEV_REG_MAX_DEVICES; j++) {
+                if (devs[j].valid && devs[j].id == all[i].device_ids[d]) {
+                    dname = devs[j].name;
+                    break;
+                }
+            }
+            if (d > 0 && pos < (int)sizeof(out[filled].device_names) - 2) {
+                pos += snprintf(out[filled].device_names + pos,
+                    sizeof(out[filled].device_names) - pos, ",");
+            }
+            if (dname) {
+                pos += snprintf(out[filled].device_names + pos,
+                    sizeof(out[filled].device_names) - pos, "%s", dname);
+            } else {
+                pos += snprintf(out[filled].device_names + pos,
+                    sizeof(out[filled].device_names) - pos, "ID:%d", all[i].device_ids[d]);
+            }
+        }
+
+        filled++;
+    }
+    return filled;
+}
+
+static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out)
+{
+    const dev_zone_info_t *all = zone_registry_get_all();
+    if (slot_index < 0 || slot_index >= DEV_REG_MAX_ZONES) return false;
+    if (!all[slot_index].valid) return false;
+
+    snprintf(out->name, sizeof(out->name), "%s", all[slot_index].name);
+    out->valve_count = all[slot_index].valve_count;
+    out->device_count = all[slot_index].device_count;
+    memcpy(out->valve_ids, all[slot_index].valve_ids,
+           sizeof(uint16_t) * all[slot_index].valve_count);
+    memcpy(out->device_ids, all[slot_index].device_ids,
+           sizeof(uint16_t) * all[slot_index].device_count);
+    return true;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting Smart Irrigation System");
@@ -367,6 +810,7 @@ void app_main(void)
             .mirror_y = 0,
         },
     };
+    cfg.lv_adapter_cfg.task_stack_size = 16 * 1024; /* 16KB，默认 8KB 不够 */
 
     /* Initialize BSP display + touch + LVGL task */
     lv_display_t *disp = bsp_display_start_with_config(&cfg);
@@ -403,6 +847,12 @@ void app_main(void)
     /* Register display settings callbacks */
     ui_display_register_brightness_cb(on_brightness_change);
     ui_display_register_timeout_cb(on_timeout_change);
+
+    /* Initialize device registry (NVS-based, before UI init) */
+    esp_err_t dr_ret = device_registry_init();
+    if (dr_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Device registry init failed: %s", esp_err_to_name(dr_ret));
+    }
 
     /* Load programs & formulas from NVS (before UI init so lists are populated) */
     ui_program_store_init();
@@ -452,6 +902,51 @@ void app_main(void)
 
     /* Register event records query callback */
     ui_alarm_rec_register_query_cb(on_query_records);
+
+    /* Register device control callback (UI → zigbee_bridge) */
+    ui_device_register_control_cb(on_device_control);
+
+    /* Register sensor search callback */
+    ui_settings_register_search_sensor_cb(on_search_sensor);
+
+    /* Register device registry callbacks (UI → device_registry) */
+    ui_settings_register_device_add_cb(on_device_add);
+    ui_settings_register_valve_add_cb(on_valve_add);
+    ui_settings_register_sensor_add_cb(on_sensor_add);
+    ui_settings_register_device_delete_cb(on_device_delete);
+    ui_settings_register_valve_delete_cb(on_valve_delete);
+    ui_settings_register_sensor_delete_cb(on_sensor_delete);
+    ui_settings_register_device_edit_cb(on_device_edit);
+    ui_settings_register_valve_edit_cb(on_valve_edit);
+    ui_settings_register_sensor_edit_cb(on_sensor_edit);
+    ui_settings_register_query_cbs(
+        on_get_device_count,
+        on_get_device_list,
+        on_get_valve_count,
+        on_get_valve_list,
+        on_get_sensor_count,
+        on_get_sensor_list,
+        on_get_device_dropdown,
+        on_get_channel_count,
+        on_is_sensor_added,
+        on_next_sensor_index,
+        on_parse_device_id
+    );
+
+    /* Register zone callbacks */
+    ui_settings_register_zone_add_cb(on_zone_add);
+    ui_settings_register_zone_delete_cb(on_zone_delete);
+    ui_settings_register_zone_edit_cb(on_zone_edit);
+    ui_settings_register_zone_query_cbs(on_get_zone_count, on_get_zone_list, on_get_zone_detail);
+
+    /* Initialize Zigbee bridge (UART1: TX=GPIO49, RX=GPIO50) */
+    esp_err_t zb_ret = zigbee_bridge_init(49, 50);
+    if (zb_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee bridge init failed: %s", esp_err_to_name(zb_ret));
+    } else {
+        zigbee_bridge_register_data_cb(on_zb_data, NULL);
+        ESP_LOGI(TAG, "Zigbee bridge initialized");
+    }
 
     /* Initialize WiFi in background task (esp_hosted may block waiting for companion chip) */
     xTaskCreate(wifi_init_task, "wifi_init", 8192, NULL, 5, NULL);
