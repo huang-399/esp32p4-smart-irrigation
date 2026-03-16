@@ -326,6 +326,10 @@ typedef bool (*ui_device_edit_cb_t)(uint16_t device_id, const ui_device_add_para
 typedef bool (*ui_valve_edit_cb_t)(uint16_t valve_id, const ui_valve_add_params_t *params);
 typedef bool (*ui_sensor_edit_cb_t)(uint32_t composed_id, const ui_sensor_add_params_t *params);
 
+/* 查重回调类型 */
+typedef bool (*ui_is_name_taken_cb_t)(const char *name);
+typedef bool (*ui_is_device_id_taken_cb_t)(uint16_t id);
+
 /* 表格行数据结构 */
 typedef struct {
     uint8_t  type;
@@ -378,6 +382,14 @@ void ui_settings_register_sensor_delete_cb(ui_sensor_delete_cb_t cb);
 void ui_settings_register_device_edit_cb(ui_device_edit_cb_t cb);
 void ui_settings_register_valve_edit_cb(ui_valve_edit_cb_t cb);
 void ui_settings_register_sensor_edit_cb(ui_sensor_edit_cb_t cb);
+
+/* 查重回调注册 */
+void ui_settings_register_device_name_check_cb(ui_is_name_taken_cb_t cb);
+void ui_settings_register_device_id_check_cb(ui_is_device_id_taken_cb_t cb);
+void ui_settings_register_valve_name_check_cb(ui_is_name_taken_cb_t cb);
+void ui_settings_register_sensor_name_check_cb(ui_is_name_taken_cb_t cb);
+void ui_settings_register_zone_name_check_cb(ui_is_name_taken_cb_t cb);
+
 void ui_settings_register_query_cbs(
     ui_get_device_count_cb_t    dev_count_cb,
     ui_get_device_list_cb_t     dev_list_cb,

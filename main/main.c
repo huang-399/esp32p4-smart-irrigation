@@ -529,7 +529,8 @@ static bool on_device_edit(uint16_t id, const ui_device_add_params_t *params)
     dev.port = params->port;
     dev.id = params->id;
     snprintf(dev.name, sizeof(dev.name), "%s", params->name);
-    return device_registry_update(id, &dev) == ESP_OK;
+    bool ok = device_registry_update(id, &dev) == ESP_OK;
+    return ok;
 }
 
 static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
@@ -539,7 +540,8 @@ static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
     valve.channel = params->channel;
     valve.parent_device_id = params->parent_device_id;
     snprintf(valve.name, sizeof(valve.name), "%s", params->name);
-    return valve_registry_update(id, &valve) == ESP_OK;
+    bool ok = valve_registry_update(id, &valve) == ESP_OK;
+    return ok;
 }
 
 static bool on_sensor_edit(uint32_t composed_id, const ui_sensor_add_params_t *params)
@@ -547,7 +549,8 @@ static bool on_sensor_edit(uint32_t composed_id, const ui_sensor_add_params_t *p
     dev_sensor_info_t sensor = {0};
     sensor.type = params->type;
     snprintf(sensor.name, sizeof(sensor.name), "%s", params->name);
-    return sensor_registry_update(composed_id, &sensor) == ESP_OK;
+    bool ok = sensor_registry_update(composed_id, &sensor) == ESP_OK;
+    return ok;
 }
 
 static int on_get_device_count(void)
@@ -675,6 +678,13 @@ static uint16_t on_parse_device_id(int dropdown_index)
     return 0;
 }
 
+/* ---- 查重桥接回调 ---- */
+static bool on_device_name_taken(const char *name) { return device_registry_is_name_taken(name); }
+static bool on_device_id_taken(uint16_t id)        { return device_registry_is_id_taken(id); }
+static bool on_valve_name_taken(const char *name)   { return valve_registry_is_name_taken(name); }
+static bool on_sensor_name_taken(const char *name)  { return sensor_registry_is_name_taken(name); }
+static bool on_zone_name_taken(const char *name)    { return zone_registry_is_name_taken(name); }
+
 /* ---- zone 桥接回调 ---- */
 
 static bool on_zone_add(const ui_zone_add_params_t *params)
@@ -685,12 +695,14 @@ static bool on_zone_add(const ui_zone_add_params_t *params)
     zone.device_count = params->device_count;
     memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
     memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
-    return zone_registry_add(&zone) == ESP_OK;
+    bool ok = zone_registry_add(&zone) == ESP_OK;
+    return ok;
 }
 
 static bool on_zone_delete(int slot_index)
 {
-    return zone_registry_remove(slot_index) == ESP_OK;
+    bool ok = zone_registry_remove(slot_index) == ESP_OK;
+    return ok;
 }
 
 static bool on_zone_edit(int slot_index, const ui_zone_add_params_t *params)
@@ -701,7 +713,8 @@ static bool on_zone_edit(int slot_index, const ui_zone_add_params_t *params)
     zone.device_count = params->device_count;
     memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
     memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
-    return zone_registry_update(slot_index, &zone) == ESP_OK;
+    bool ok = zone_registry_update(slot_index, &zone) == ESP_OK;
+    return ok;
 }
 
 static int on_get_zone_count(void)
@@ -932,6 +945,13 @@ void app_main(void)
         on_next_sensor_index,
         on_parse_device_id
     );
+
+    /* Register duplicate-check callbacks */
+    ui_settings_register_device_name_check_cb(on_device_name_taken);
+    ui_settings_register_device_id_check_cb(on_device_id_taken);
+    ui_settings_register_valve_name_check_cb(on_valve_name_taken);
+    ui_settings_register_sensor_name_check_cb(on_sensor_name_taken);
+    ui_settings_register_zone_name_check_cb(on_zone_name_taken);
 
     /* Register zone callbacks */
     ui_settings_register_zone_add_cb(on_zone_add);

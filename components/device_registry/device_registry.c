@@ -5,16 +5,14 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include <string.h>
 #include <stdio.h>
 
 static const char *TAG = "dev_reg";
 
 #define NVS_NAMESPACE   "dev_reg"
-#define NVS_KEY_DEVICES "devices"
-#define NVS_KEY_VALVES  "valves"
-#define NVS_KEY_SENSORS "sensors"
-#define NVS_KEY_ZONES   "zones"
 
 /* ---- 静态数据 ---- */
 static dev_device_info_t s_devices[DEV_REG_MAX_DEVICES];
@@ -23,6 +21,14 @@ static dev_sensor_info_t s_sensors[DEV_REG_MAX_SENSORS];
 static dev_zone_info_t   s_zones[DEV_REG_MAX_ZONES];
 static SemaphoreHandle_t s_mutex = NULL;
 static bool s_inited = false;
+
+/* ---- 后台 NVS 持久化（不阻塞 LVGL 线程） ---- */
+typedef struct {
+    uint8_t type;   /* 0=device, 1=valve, 2=sensor, 3=zone */
+    uint8_t slot;
+} persist_msg_t;
+
+static QueueHandle_t s_persist_queue = NULL;
 
 /* ---- 类型名称表 ---- */
 static const char *s_dev_type_names[] = {
@@ -43,11 +49,163 @@ static const char *s_valve_type_names[] = {
     "电磁阀"
 };
 
-/* ---- NVS 辅助 ---- */
+/* ---- NVS 逐条读写 ---- */
+
+static esp_err_t save_one_device(int slot)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
+
+    char key[8];
+    snprintf(key, sizeof(key), "d_%d", slot);
+
+    if (s_devices[slot].valid) {
+        ret = nvs_set_blob(handle, key, &s_devices[slot], sizeof(dev_device_info_t));
+    } else {
+        ret = nvs_erase_key(handle, key);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
+static esp_err_t save_one_valve(int slot)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
+
+    char key[8];
+    snprintf(key, sizeof(key), "v_%d", slot);
+
+    if (s_valves[slot].valid) {
+        ret = nvs_set_blob(handle, key, &s_valves[slot], sizeof(dev_valve_info_t));
+    } else {
+        ret = nvs_erase_key(handle, key);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
+static esp_err_t save_one_sensor(int slot)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
+
+    char key[8];
+    snprintf(key, sizeof(key), "s_%d", slot);
+
+    if (s_sensors[slot].valid) {
+        ret = nvs_set_blob(handle, key, &s_sensors[slot], sizeof(dev_sensor_info_t));
+    } else {
+        ret = nvs_erase_key(handle, key);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
+static esp_err_t save_one_zone(int slot)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
+
+    char key[8];
+    snprintf(key, sizeof(key), "z_%d", slot);
+
+    if (s_zones[slot].valid) {
+        ret = nvs_set_blob(handle, key, &s_zones[slot], sizeof(dev_zone_info_t));
+    } else {
+        ret = nvs_erase_key(handle, key);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
+/* ---- 后台持久化任务和投递函数 ---- */
+
+static void persist_task(void *param)
+{
+    (void)param;
+    persist_msg_t msg;
+
+    while (xQueueReceive(s_persist_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        bool device_dirty[DEV_REG_MAX_DEVICES] = {0};
+        bool valve_dirty[DEV_REG_MAX_VALVES] = {0};
+        bool sensor_dirty[DEV_REG_MAX_SENSORS] = {0};
+        bool zone_dirty[DEV_REG_MAX_ZONES] = {0};
+
+        switch (msg.type) {
+            case 0: device_dirty[msg.slot] = true; break;
+            case 1: valve_dirty[msg.slot] = true; break;
+            case 2: sensor_dirty[msg.slot] = true; break;
+            case 3: zone_dirty[msg.slot] = true; break;
+        }
+
+        /* 排空队列中已积累的请求（去重） */
+        persist_msg_t extra;
+        while (xQueueReceive(s_persist_queue, &extra, 0) == pdTRUE) {
+            switch (extra.type) {
+                case 0: device_dirty[extra.slot] = true; break;
+                case 1: valve_dirty[extra.slot] = true; break;
+                case 2: sensor_dirty[extra.slot] = true; break;
+                case 3: zone_dirty[extra.slot] = true; break;
+            }
+        }
+
+        esp_err_t ret;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+            if (device_dirty[i]) {
+                ret = save_one_device(i);
+                if (ret != ESP_OK) ESP_LOGE(TAG, "Persist d_%d failed: %s", i, esp_err_to_name(ret));
+            }
+        }
+        for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+            if (valve_dirty[i]) {
+                ret = save_one_valve(i);
+                if (ret != ESP_OK) ESP_LOGE(TAG, "Persist v_%d failed: %s", i, esp_err_to_name(ret));
+            }
+        }
+        for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
+            if (sensor_dirty[i]) {
+                ret = save_one_sensor(i);
+                if (ret != ESP_OK) ESP_LOGE(TAG, "Persist s_%d failed: %s", i, esp_err_to_name(ret));
+            }
+        }
+        for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
+            if (zone_dirty[i]) {
+                ret = save_one_zone(i);
+                if (ret != ESP_OK) ESP_LOGE(TAG, "Persist z_%d failed: %s", i, esp_err_to_name(ret));
+            }
+        }
+        xSemaphoreGive(s_mutex);
+    }
+}
+
+static void persist_post(uint8_t type, uint8_t slot)
+{
+    if (s_persist_queue) {
+        persist_msg_t msg = { .type = type, .slot = slot };
+        xQueueSend(s_persist_queue, &msg, 0);
+    }
+}
+
+/* ---- NVS 加载（兼容旧整 blob 格式，自动迁移） ---- */
+
 static esp_err_t load_from_nvs(void)
 {
     nvs_handle_t handle;
-    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG, "NVS namespace not found, starting empty");
         return ESP_OK;
@@ -55,97 +213,111 @@ static esp_err_t load_from_nvs(void)
     ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
 
     size_t len;
+    bool migrated = false;
 
+    /* --- 设备 --- */
     len = sizeof(s_devices);
-    ret = nvs_get_blob(handle, NVS_KEY_DEVICES, s_devices, &len);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "No saved devices");
-    } else if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Load devices failed: %s", esp_err_to_name(ret));
+    ret = nvs_get_blob(handle, "devices", s_devices, &len);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Migrating devices from old blob format");
+        for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+            if (s_devices[i].valid) {
+                char key[8];
+                snprintf(key, sizeof(key), "d_%d", i);
+                nvs_set_blob(handle, key, &s_devices[i], sizeof(dev_device_info_t));
+            }
+        }
+        nvs_erase_key(handle, "devices");
+        migrated = true;
+    } else {
+        for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "d_%d", i);
+            len = sizeof(dev_device_info_t);
+            ret = nvs_get_blob(handle, key, &s_devices[i], &len);
+            if (ret != ESP_OK) memset(&s_devices[i], 0, sizeof(dev_device_info_t));
+        }
     }
 
+    /* --- 阀门 --- */
     len = sizeof(s_valves);
-    ret = nvs_get_blob(handle, NVS_KEY_VALVES, s_valves, &len);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "No saved valves");
-    } else if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Load valves failed: %s", esp_err_to_name(ret));
+    ret = nvs_get_blob(handle, "valves", s_valves, &len);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Migrating valves from old blob format");
+        for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+            if (s_valves[i].valid) {
+                char key[8];
+                snprintf(key, sizeof(key), "v_%d", i);
+                nvs_set_blob(handle, key, &s_valves[i], sizeof(dev_valve_info_t));
+            }
+        }
+        nvs_erase_key(handle, "valves");
+        migrated = true;
+    } else {
+        for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "v_%d", i);
+            len = sizeof(dev_valve_info_t);
+            ret = nvs_get_blob(handle, key, &s_valves[i], &len);
+            if (ret != ESP_OK) memset(&s_valves[i], 0, sizeof(dev_valve_info_t));
+        }
     }
 
+    /* --- 传感器 --- */
     len = sizeof(s_sensors);
-    ret = nvs_get_blob(handle, NVS_KEY_SENSORS, s_sensors, &len);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "No saved sensors");
-    } else if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Load sensors failed: %s", esp_err_to_name(ret));
+    ret = nvs_get_blob(handle, "sensors", s_sensors, &len);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Migrating sensors from old blob format");
+        for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
+            if (s_sensors[i].valid) {
+                char key[8];
+                snprintf(key, sizeof(key), "s_%d", i);
+                nvs_set_blob(handle, key, &s_sensors[i], sizeof(dev_sensor_info_t));
+            }
+        }
+        nvs_erase_key(handle, "sensors");
+        migrated = true;
+    } else {
+        for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "s_%d", i);
+            len = sizeof(dev_sensor_info_t);
+            ret = nvs_get_blob(handle, key, &s_sensors[i], &len);
+            if (ret != ESP_OK) memset(&s_sensors[i], 0, sizeof(dev_sensor_info_t));
+        }
     }
 
+    /* --- 灌区 --- */
     len = sizeof(s_zones);
-    ret = nvs_get_blob(handle, NVS_KEY_ZONES, s_zones, &len);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "No saved zones");
-    } else if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Load zones failed: %s", esp_err_to_name(ret));
+    ret = nvs_get_blob(handle, "zones", s_zones, &len);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Migrating zones from old blob format");
+        for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
+            if (s_zones[i].valid) {
+                char key[8];
+                snprintf(key, sizeof(key), "z_%d", i);
+                nvs_set_blob(handle, key, &s_zones[i], sizeof(dev_zone_info_t));
+            }
+        }
+        nvs_erase_key(handle, "zones");
+        migrated = true;
+    } else {
+        for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "z_%d", i);
+            len = sizeof(dev_zone_info_t);
+            ret = nvs_get_blob(handle, key, &s_zones[i], &len);
+            if (ret != ESP_OK) memset(&s_zones[i], 0, sizeof(dev_zone_info_t));
+        }
+    }
+
+    if (migrated) {
+        nvs_commit(handle);
+        ESP_LOGI(TAG, "NVS migration to per-entry format complete");
     }
 
     nvs_close(handle);
     return ESP_OK;
-}
-
-static esp_err_t save_devices(void)
-{
-    nvs_handle_t handle;
-    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
-
-    ret = nvs_set_blob(handle, NVS_KEY_DEVICES, s_devices, sizeof(s_devices));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return ret;
-}
-
-static esp_err_t save_valves(void)
-{
-    nvs_handle_t handle;
-    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
-
-    ret = nvs_set_blob(handle, NVS_KEY_VALVES, s_valves, sizeof(s_valves));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return ret;
-}
-
-static esp_err_t save_sensors(void)
-{
-    nvs_handle_t handle;
-    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
-
-    ret = nvs_set_blob(handle, NVS_KEY_SENSORS, s_sensors, sizeof(s_sensors));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return ret;
-}
-
-static esp_err_t save_zones(void)
-{
-    nvs_handle_t handle;
-    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    ESP_RETURN_ON_ERROR(ret, TAG, "nvs_open failed");
-
-    ret = nvs_set_blob(handle, NVS_KEY_ZONES, s_zones, sizeof(s_zones));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return ret;
 }
 
 /* ========== 初始化 ========== */
@@ -174,6 +346,11 @@ esp_err_t device_registry_init(void)
     int vlv_cnt = valve_registry_get_count();
     int sns_cnt = sensor_registry_get_count();
     int zn_cnt  = zone_registry_get_count();
+
+    /* 创建后台 NVS 持久化队列和任务（优先级 3，低于 LVGL） */
+    s_persist_queue = xQueueCreate(16, sizeof(persist_msg_t));
+    xTaskCreate(persist_task, "nvs_persist", 3072, NULL, 3, NULL);
+
     ESP_LOGI(TAG, "Initialized: %d devices, %d valves, %d sensors, %d zones",
              dev_cnt, vlv_cnt, sns_cnt, zn_cnt);
 
@@ -240,13 +417,9 @@ esp_err_t device_registry_add(const dev_device_info_t *dev)
     s_devices[slot].valid = 1;
     s_devices[slot].name[DEV_REG_NAME_LEN - 1] = '\0';
 
-    esp_err_t ret = save_devices();
     xSemaphoreGive(s_mutex);
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Save devices failed: %s", esp_err_to_name(ret));
-    }
-    return ret;
+    persist_post(0, slot);
+    return ESP_OK;
 }
 
 esp_err_t device_registry_remove(uint16_t id)
@@ -256,9 +429,9 @@ esp_err_t device_registry_remove(uint16_t id)
     for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
         if (s_devices[i].valid && s_devices[i].id == id) {
             memset(&s_devices[i], 0, sizeof(dev_device_info_t));
-            esp_err_t ret = save_devices();
             xSemaphoreGive(s_mutex);
-            return ret;
+            persist_post(0, i);
+            return ESP_OK;
         }
     }
 
@@ -277,9 +450,9 @@ esp_err_t device_registry_update(uint16_t id, const dev_device_info_t *dev)
             s_devices[i].port = dev->port;
             memcpy(s_devices[i].name, dev->name, DEV_REG_NAME_LEN);
             s_devices[i].name[DEV_REG_NAME_LEN - 1] = '\0';
-            esp_err_t ret = save_devices();
             xSemaphoreGive(s_mutex);
-            return ret;
+            persist_post(0, i);
+            return ESP_OK;
         }
     }
 
@@ -348,13 +521,9 @@ esp_err_t valve_registry_add(const dev_valve_info_t *valve)
     }
     s_valves[slot].id = max_id + 1;
 
-    esp_err_t ret = save_valves();
     xSemaphoreGive(s_mutex);
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Save valves failed: %s", esp_err_to_name(ret));
-    }
-    return ret;
+    persist_post(1, slot);
+    return ESP_OK;
 }
 
 esp_err_t valve_registry_remove(uint16_t id)
@@ -364,9 +533,9 @@ esp_err_t valve_registry_remove(uint16_t id)
     for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
         if (s_valves[i].valid && s_valves[i].id == id) {
             memset(&s_valves[i], 0, sizeof(dev_valve_info_t));
-            esp_err_t ret = save_valves();
             xSemaphoreGive(s_mutex);
-            return ret;
+            persist_post(1, i);
+            return ESP_OK;
         }
     }
 
@@ -386,9 +555,9 @@ esp_err_t valve_registry_update(uint16_t id, const dev_valve_info_t *valve)
             s_valves[i].parent_device_id = valve->parent_device_id;
             memcpy(s_valves[i].name, valve->name, DEV_REG_NAME_LEN);
             s_valves[i].name[DEV_REG_NAME_LEN - 1] = '\0';
-            esp_err_t ret = save_valves();
             xSemaphoreGive(s_mutex);
-            return ret;
+            persist_post(1, i);
+            return ESP_OK;
         }
     }
 
@@ -445,13 +614,9 @@ esp_err_t sensor_registry_add(const dev_sensor_info_t *sensor)
     s_sensors[slot].valid = 1;
     s_sensors[slot].name[DEV_REG_NAME_LEN - 1] = '\0';
 
-    esp_err_t ret = save_sensors();
     xSemaphoreGive(s_mutex);
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Save sensors failed: %s", esp_err_to_name(ret));
-    }
-    return ret;
+    persist_post(2, slot);
+    return ESP_OK;
 }
 
 esp_err_t sensor_registry_remove(uint32_t composed_id)
@@ -461,9 +626,9 @@ esp_err_t sensor_registry_remove(uint32_t composed_id)
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
         if (s_sensors[i].valid && s_sensors[i].composed_id == composed_id) {
             memset(&s_sensors[i], 0, sizeof(dev_sensor_info_t));
-            esp_err_t ret = save_sensors();
             xSemaphoreGive(s_mutex);
-            return ret;
+            persist_post(2, i);
+            return ESP_OK;
         }
     }
 
@@ -481,9 +646,9 @@ esp_err_t sensor_registry_update(uint32_t composed_id, const dev_sensor_info_t *
             s_sensors[i].type = sensor->type;
             memcpy(s_sensors[i].name, sensor->name, DEV_REG_NAME_LEN);
             s_sensors[i].name[DEV_REG_NAME_LEN - 1] = '\0';
-            esp_err_t ret = save_sensors();
             xSemaphoreGive(s_mutex);
-            return ret;
+            persist_post(2, i);
+            return ESP_OK;
         }
     }
 
@@ -553,13 +718,9 @@ esp_err_t zone_registry_add(const dev_zone_info_t *zone)
     s_zones[slot].valid = 1;
     s_zones[slot].name[DEV_REG_NAME_LEN - 1] = '\0';
 
-    esp_err_t ret = save_zones();
     xSemaphoreGive(s_mutex);
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Save zones failed: %s", esp_err_to_name(ret));
-    }
-    return ret;
+    persist_post(3, slot);
+    return ESP_OK;
 }
 
 esp_err_t zone_registry_remove(int slot_index)
@@ -574,9 +735,9 @@ esp_err_t zone_registry_remove(int slot_index)
     }
 
     memset(&s_zones[slot_index], 0, sizeof(dev_zone_info_t));
-    esp_err_t ret = save_zones();
     xSemaphoreGive(s_mutex);
-    return ret;
+    persist_post(3, slot_index);
+    return ESP_OK;
 }
 
 esp_err_t zone_registry_update(int slot_index, const dev_zone_info_t *zone)
@@ -594,9 +755,9 @@ esp_err_t zone_registry_update(int slot_index, const dev_zone_info_t *zone)
     s_zones[slot_index].valid = 1;
     s_zones[slot_index].name[DEV_REG_NAME_LEN - 1] = '\0';
 
-    esp_err_t ret = save_zones();
     xSemaphoreGive(s_mutex);
-    return ret;
+    persist_post(3, slot_index);
+    return ESP_OK;
 }
 
 /* ========== 辅助函数 ========== */
@@ -653,4 +814,60 @@ const char *valve_registry_type_name(valve_type_t type)
 {
     if (type < VALVE_TYPE_MAX) return s_valve_type_names[type];
     return "未知";
+}
+
+/* ========== 查重函数 ========== */
+
+bool device_registry_is_name_taken(const char *name)
+{
+    if (!name) return false;
+    for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+        if (s_devices[i].valid && strcmp(s_devices[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool device_registry_is_id_taken(uint16_t id)
+{
+    for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+        if (s_devices[i].valid && s_devices[i].id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool valve_registry_is_name_taken(const char *name)
+{
+    if (!name) return false;
+    for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+        if (s_valves[i].valid && strcmp(s_valves[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool sensor_registry_is_name_taken(const char *name)
+{
+    if (!name) return false;
+    for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
+        if (s_sensors[i].valid && strcmp(s_sensors[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool zone_registry_is_name_taken(const char *name)
+{
+    if (!name) return false;
+    for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
+        if (s_zones[i].valid && strcmp(s_zones[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }

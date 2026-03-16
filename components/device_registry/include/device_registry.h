@@ -179,6 +179,13 @@ esp_err_t zone_registry_add(const dev_zone_info_t *zone);
 esp_err_t zone_registry_remove(int slot_index);
 esp_err_t zone_registry_update(int slot_index, const dev_zone_info_t *zone);
 
+/* ---- 查重函数 ---- */
+bool device_registry_is_name_taken(const char *name);
+bool device_registry_is_id_taken(uint16_t id);
+bool valve_registry_is_name_taken(const char *name);
+bool sensor_registry_is_name_taken(const char *name);
+bool zone_registry_is_name_taken(const char *name);
+
 #ifdef __cplusplus
 }
 #endif
