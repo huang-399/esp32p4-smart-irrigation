@@ -124,8 +124,8 @@ static void btn_delete_program_confirm_cb(lv_event_t *e);
  **********************/
 static lv_obj_t *g_tab_program = NULL;                   /* 程序管理标签 */
 static lv_obj_t *g_tab_formula = NULL;                   /* 配方管理标签 */
-static lv_obj_t *g_add_dialog = NULL;                    /* 添加程序对话框 */
-static lv_obj_t *g_add_formula_dialog = NULL;            /* 添加配方对话框 */
+static bool g_add_dialog = false;                        /* 是否处于添加程序页面 */
+static lv_obj_t *g_add_formula_dialog = NULL;            /* 添加配方卡片引用（内容区对象） */
 static lv_obj_t *g_parent_container = NULL;              /* 父容器引用 */
 static lv_obj_t *g_table_area = NULL;                    /* 程序管理表格区域 */
 static lv_obj_t *g_formula_table_area = NULL;            /* 配方管理表格区域 */
@@ -388,6 +388,30 @@ void ui_program_close_zone_dialog(void)
     }
 }
 
+void ui_program_close_overlays(void)
+{
+    /* g_add_dialog 和 g_add_formula_dialog 属于内容区对象，
+       由 ui_switch_nav() 中的 lv_obj_clean(g_ui_main.content) 统一销毁 */
+    g_add_dialog = false;
+    g_add_formula_dialog = NULL;
+
+    if (g_uniform_dialog) {
+        lv_obj_del(g_uniform_dialog);
+        g_uniform_dialog = NULL;
+    }
+    if (g_warning_dialog) {
+        lv_obj_t *bg = lv_obj_get_parent(g_warning_dialog);
+        g_warning_dialog = NULL;
+        if (bg) {
+            lv_obj_del(bg);
+        }
+    }
+    if (g_delete_confirm_dialog) {
+        lv_obj_del(g_delete_confirm_dialog);
+        g_delete_confirm_dialog = NULL;
+    }
+}
+
 /**
  * @brief 创建程序管理界面
  * @param parent 父容器（主内容区）
@@ -408,7 +432,7 @@ void ui_program_create(lv_obj_t *parent)
     /* 重置静态指针（旧对象已被 ui_switch_nav 中的 lv_obj_clean 销毁） */
     g_tab_program = NULL;
     g_tab_formula = NULL;
-    g_add_dialog = NULL;
+    g_add_dialog = false;
     g_add_formula_dialog = NULL;
     g_parent_container = NULL;
     g_table_area = NULL;
@@ -866,18 +890,14 @@ static void create_add_program_dialog(void)
         }
     }
 
-    /* 如果对话框已存在，先删除 */
-    if (g_add_dialog != NULL)
-    {
-        lv_obj_del(g_add_dialog);
-        g_add_dialog = NULL;
-    }
+    /* 添加程序页面属于内容区重建流程，不单独删除内容区对象 */
+    g_add_dialog = false;
 
     /* 清空父容器 */
     lv_obj_clean(g_parent_container);
 
-    /* 标记对话框为打开状态（使用全局变量标识） */
-    g_add_dialog = g_parent_container;
+    /* 标记当前处于添加程序页面 */
+    g_add_dialog = true;
 
     /* 顶部元素 - 程序名称标签 */
     lv_obj_t *label_name_title = lv_label_create(g_parent_container);
@@ -2218,8 +2238,8 @@ static void create_add_formula_dialog(void)
     /* 清空父容器 */
     lv_obj_clean(g_parent_container);
 
-    /* 标记对话框为打开状态（使用全局变量标识） */
-    g_add_formula_dialog = g_parent_container;
+    /* 添加配方页面属于内容区重建流程，不纳入 screen 级 overlay 删除链路 */
+    g_add_formula_dialog = NULL;
 
     /* 配方名称标签 - 在父容器顶部 */
     lv_obj_t *label_name_title = lv_label_create(g_parent_container);

@@ -5,6 +5,7 @@
 
 #include "ui_common.h"
 #include "ui_numpad.h"
+#include "ui_keyboard.h"
 #include "ui_alarm.h"
 #include "ui_wifi.h"
 #include <stdio.h>
@@ -92,7 +93,11 @@ void ui_switch_nav(nav_item_t nav)
     ui_home_close_dialog();        /* 关闭首页的手动灌溉/程序弹窗 */
     ui_log_close_calendar();       /* 关闭日志页面的日历弹窗 */
     ui_program_close_calendar();   /* 关闭程序页面的日历弹窗 */
+    ui_program_close_overlays();   /* 关闭程序页面的屏幕级弹窗 */
     ui_program_close_zone_dialog(); /* 关闭程序页面的灌区选择对话框 */
+    ui_settings_close_overlays();  /* 关闭设置页面的屏幕级弹窗 */
+    ui_wifi_close_overlays();      /* 关闭WiFi相关对话框和键盘 */
+    ui_keyboard_close();           /* 关闭26键软键盘 */
     ui_numpad_close();             /* 关闭数字键盘 */
 
     /* 更新导航按钮状态 */

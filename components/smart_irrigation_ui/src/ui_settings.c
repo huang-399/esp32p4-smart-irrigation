@@ -156,6 +156,7 @@ static ui_get_device_dropdown_cb_t g_dev_dropdown_cb = NULL;
 static ui_get_channel_count_cb_t   g_ch_count_cb = NULL;
 static ui_is_sensor_added_cb_t     g_is_sensor_added_cb = NULL;
 static ui_next_sensor_index_cb_t   g_next_sensor_idx_cb = NULL;
+static ui_get_sensor_parent_zb_type_cb_t g_sensor_parent_zb_type_cb = NULL;
 static ui_parse_device_id_cb_t     g_parse_device_id_cb = NULL;
 
 /* ---- 查重回调指针 ---- */
@@ -2415,7 +2416,8 @@ static void show_add_sensor_dialog(void)
     lv_textarea_set_text(g_sensor_name_input, "#1空气湿度");
     lv_textarea_set_one_line(g_sensor_name_input, true);
     lv_obj_set_style_text_font(g_sensor_name_input, &my_font_cn_16, 0);
-    lv_obj_set_style_bg_color(g_sensor_name_input, lv_color_hex(0xf0f0f0), 0);
+    lv_obj_set_style_bg_color(g_sensor_name_input, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(g_sensor_name_input, lv_color_hex(0xf0f0f0), LV_STATE_DISABLED);
     lv_obj_set_style_border_width(g_sensor_name_input, 1, 0);
     lv_obj_set_style_border_color(g_sensor_name_input, lv_color_hex(0xcccccc), 0);
     lv_obj_add_event_cb(g_sensor_name_input, textarea_click_cb, LV_EVENT_CLICKED, NULL);
@@ -2469,7 +2471,8 @@ static void show_add_sensor_dialog(void)
     lv_textarea_set_one_line(g_sensor_index_input, true);
     lv_textarea_set_max_length(g_sensor_index_input, 2);
     lv_obj_set_style_text_font(g_sensor_index_input, &my_font_cn_16, 0);
-    lv_obj_set_style_bg_color(g_sensor_index_input, lv_color_hex(0xf0f0f0), 0);
+    lv_obj_set_style_bg_color(g_sensor_index_input, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(g_sensor_index_input, lv_color_hex(0xf0f0f0), LV_STATE_DISABLED);
     lv_obj_set_style_border_width(g_sensor_index_input, 1, 0);
     lv_obj_set_style_border_color(g_sensor_index_input, lv_color_hex(0xcccccc), 0);
     lv_obj_add_event_cb(g_sensor_index_input, textarea_click_cb, LV_EVENT_CLICKED, NULL);
@@ -2754,21 +2757,25 @@ static void add_device_confirm_cb(lv_event_t *e)
     if (!g_device_type_dropdown || !g_device_name_input ||
         !g_device_id_input || !g_device_port_dropdown) return;
 
-    ui_device_add_params_t params;
-    params.type = lv_dropdown_get_selected(g_device_type_dropdown);
+    ui_device_add_params_t add_params;
+    ui_device_edit_params_t edit_params;
+    add_params.type = lv_dropdown_get_selected(g_device_type_dropdown);
+    edit_params.type = add_params.type;
     const char *name = lv_textarea_get_text(g_device_name_input);
-    snprintf(params.name, sizeof(params.name), "%s", name ? name : "");
+    snprintf(add_params.name, sizeof(add_params.name), "%s", name ? name : "");
+    snprintf(edit_params.name, sizeof(edit_params.name), "%s", add_params.name);
     const char *id_str = lv_textarea_get_text(g_device_id_input);
-    params.id = (uint16_t)atoi(id_str ? id_str : "0");
-    params.port = lv_dropdown_get_selected(g_device_port_dropdown);
+    add_params.id = (uint16_t)atoi(id_str ? id_str : "0");
+    add_params.port = lv_dropdown_get_selected(g_device_port_dropdown);
+    edit_params.port = add_params.port;
 
     /* 新增模式下检查重复 */
     if (!g_is_editing_device) {
-        if (g_device_name_check_cb && strlen(params.name) > 0 && g_device_name_check_cb(params.name)) {
+        if (g_device_name_check_cb && strlen(add_params.name) > 0 && g_device_name_check_cb(add_params.name)) {
             show_settings_warning_dialog("添加失败", "已存在相同名称的设备");
             return;
         }
-        if (g_device_id_check_cb && params.id > 0 && g_device_id_check_cb(params.id)) {
+        if (g_device_id_check_cb && add_params.id > 0 && g_device_id_check_cb(add_params.id)) {
             show_settings_warning_dialog("添加失败", "已存在相同编号的设备");
             return;
         }
@@ -2777,9 +2784,9 @@ static void add_device_confirm_cb(lv_event_t *e)
     /* NVS 写入（对话框仍可见，flash 抖动被遮住） */
     bool ok = false;
     if (g_is_editing_device && g_device_edit_cb) {
-        ok = g_device_edit_cb(g_editing_device_id, &params);
+        ok = g_device_edit_cb(g_editing_device_id, &edit_params);
     } else if (g_device_add_cb) {
-        ok = g_device_add_cb(&params);
+        ok = g_device_add_cb(&add_params);
     }
     int64_t t1 = esp_timer_get_time();
 
@@ -2834,30 +2841,40 @@ static void add_sensor_confirm_cb(lv_event_t *e)
     if (!g_sensor_type_dropdown || !g_sensor_name_input ||
         !g_sensor_parent_dropdown || !g_sensor_index_input) return;
 
-    ui_sensor_add_params_t params;
-    memset(&params, 0, sizeof(params));
-    params.type = lv_dropdown_get_selected(g_sensor_type_dropdown);
+    ui_sensor_add_params_t add_params;
+    ui_sensor_edit_params_t edit_params;
+    memset(&add_params, 0, sizeof(add_params));
+    memset(&edit_params, 0, sizeof(edit_params));
+    add_params.type = lv_dropdown_get_selected(g_sensor_type_dropdown);
+    edit_params.type = add_params.type;
     const char *name = lv_textarea_get_text(g_sensor_name_input);
-    snprintf(params.name, sizeof(params.name), "%s", name ? name : "");
+    snprintf(add_params.name, sizeof(add_params.name), "%s", name ? name : "");
+    snprintf(edit_params.name, sizeof(edit_params.name), "%s", add_params.name);
 
-    /* 解析父设备 ID */
+    /* 解析父设备 ID / Zigbee 设备类型 */
     int parent_idx = lv_dropdown_get_selected(g_sensor_parent_dropdown);
-    params.parent_device_id = g_parse_device_id_cb ? g_parse_device_id_cb(parent_idx) : 0;
+    add_params.parent_device_id = g_parse_device_id_cb ? g_parse_device_id_cb(parent_idx) : 0;
+    add_params.zb_dev_type = g_sensor_parent_zb_type_cb ? g_sensor_parent_zb_type_cb(add_params.parent_device_id) : 0;
 
     const char *idx_str = lv_textarea_get_text(g_sensor_index_input);
-    params.sensor_index = (uint8_t)atoi(idx_str ? idx_str : "1");
+    add_params.sensor_index = (uint8_t)atoi(idx_str ? idx_str : "1");
+
+    if (!g_is_editing_sensor && add_params.zb_dev_type == 0) {
+        show_settings_warning_dialog("添加失败", "当前父设备不支持传感器编号生成");
+        return;
+    }
 
     /* 新增模式下检查重复 */
     if (!g_is_editing_sensor) {
-        if (g_sensor_name_check_cb && strlen(params.name) > 0 && g_sensor_name_check_cb(params.name)) {
+        if (g_sensor_name_check_cb && strlen(add_params.name) > 0 && g_sensor_name_check_cb(add_params.name)) {
             show_settings_warning_dialog("添加失败", "已存在相同名称的传感器");
             return;
         }
         /* composed_id 重复检查（已有回调） */
         if (g_is_sensor_added_cb) {
-            uint32_t composed_id = (uint32_t)params.zb_dev_type * 1000000
-                                 + (uint32_t)params.parent_device_id * 100
-                                 + params.sensor_index;
+            uint32_t composed_id = (uint32_t)add_params.zb_dev_type * 1000000
+                                 + (uint32_t)add_params.parent_device_id * 100
+                                 + add_params.sensor_index;
             if (g_is_sensor_added_cb(composed_id)) {
                 show_settings_warning_dialog("添加失败", "已存在相同编号的传感器");
                 return;
@@ -2868,9 +2885,9 @@ static void add_sensor_confirm_cb(lv_event_t *e)
     /* NVS 写入（对话框仍可见，flash 抖动被遮住） */
     bool ok = false;
     if (g_is_editing_sensor && g_sensor_edit_cb) {
-        ok = g_sensor_edit_cb(g_editing_sensor_composed_id, &params);
+        ok = g_sensor_edit_cb(g_editing_sensor_composed_id, &edit_params);
     } else if (g_sensor_add_cb) {
-        ok = g_sensor_add_cb(&params);
+        ok = g_sensor_add_cb(&add_params);
     }
     int64_t t1 = esp_timer_get_time();
 
@@ -4030,10 +4047,11 @@ void ui_settings_update_search_results(const ui_sensor_found_item_t *items, int 
 
         /* 传感器编号列 */
         char id_buf[16];
-        uint32_t cid = (uint32_t)items[i].dev_type * 1000000
-                      + (uint32_t)items[i].dev_id * 100
-                      + items[i].sensor_index;
-        snprintf(id_buf, sizeof(id_buf), "%07lu", (unsigned long)cid);
+        uint32_t display_id = (uint32_t)items[i].dev_id * 100 + items[i].sensor_index;
+        uint32_t cid = (uint32_t)items[i].dev_type * 1000000U
+                     + (uint32_t)items[i].dev_id * 100U
+                     + (uint32_t)items[i].sensor_index;
+        snprintf(id_buf, sizeof(id_buf), "%06lu", (unsigned long)display_id);
         lv_obj_t *id_label = lv_label_create(row);
         lv_label_set_text(id_label, id_buf);
         lv_obj_set_style_text_font(id_label, &lv_font_montserrat_14, 0);
@@ -4328,7 +4346,9 @@ void ui_settings_refresh_sensor_table(void)
         const char *stype = (rows[i].type < 11) ? stype_names[rows[i].type] : "未知";
         create_row_label(row_bg, stype, header_x[2], 12);
 
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)rows[i].composed_id);
+        snprintf(buf, sizeof(buf), "%u%02u",
+                 (unsigned int)rows[i].parent_device_id,
+                 (unsigned int)rows[i].sensor_index);
         create_row_label(row_bg, buf, header_x[3], 12);
 
         create_row_label(row_bg, rows[i].parent_name, header_x[4], 12);
@@ -4688,12 +4708,14 @@ static void sensor_edit_btn_cb(lv_event_t *e)
                         break;
                     }
                 }
+                lv_obj_add_state(g_sensor_parent_dropdown, LV_STATE_DISABLED);
             }
             if (g_sensor_index_input) {
                 char buf[8];
                 snprintf(buf, sizeof(buf), "%02d", g_cached_sensor_rows[i].sensor_index);
                 lv_textarea_set_text(g_sensor_index_input, buf);
                 sensor_index_changed_cb(NULL);
+                lv_obj_add_state(g_sensor_index_input, LV_STATE_DISABLED);
             }
             if (g_sensor_name_input)
                 lv_textarea_set_text(g_sensor_name_input, g_cached_sensor_rows[i].name);
@@ -4846,15 +4868,16 @@ static void sensor_parent_changed_cb(lv_event_t *e)
     snprintf(prefix_buf, sizeof(prefix_buf), "%d", dev_id);
     lv_label_set_text(g_sensor_id_prefix_label, prefix_buf);
 
-    /* 自动填入下一个可用序号 */
+    /* 自动填入下一个可用序号（取最小缺口） */
     uint8_t next_idx = g_next_sensor_idx_cb ? g_next_sensor_idx_cb(dev_id) : 1;
     char idx_buf[4];
     snprintf(idx_buf, sizeof(idx_buf), "%02d", next_idx);
     lv_textarea_set_text(g_sensor_index_input, idx_buf);
 
-    /* 更新组合编号 */
+    /* 更新对外显示编号：父设备ID + 2位序号 */
     char composed_buf[12];
-    snprintf(composed_buf, sizeof(composed_buf), "%d%02d", dev_id, next_idx);
+    snprintf(composed_buf, sizeof(composed_buf), "%u%02u",
+             (unsigned int)dev_id, (unsigned int)next_idx);
     lv_label_set_text(g_sensor_composed_label, composed_buf);
 }
 
@@ -4871,7 +4894,8 @@ static void sensor_index_changed_cb(lv_event_t *e)
     int idx = atoi(idx_str ? idx_str : "0");
 
     char composed_buf[12];
-    snprintf(composed_buf, sizeof(composed_buf), "%d%02d", dev_id, idx);
+    snprintf(composed_buf, sizeof(composed_buf), "%u%02d",
+             (unsigned int)dev_id, idx);
     lv_label_set_text(g_sensor_composed_label, composed_buf);
 }
 
@@ -4904,6 +4928,7 @@ void ui_settings_register_query_cbs(
     ui_get_channel_count_cb_t   ch_count_cb,
     ui_is_sensor_added_cb_t     is_added_cb,
     ui_next_sensor_index_cb_t   next_idx_cb,
+    ui_get_sensor_parent_zb_type_cb_t parent_zb_type_cb,
     ui_parse_device_id_cb_t     parse_id_cb)
 {
     g_dev_count_cb       = dev_count_cb;
@@ -4916,10 +4941,94 @@ void ui_settings_register_query_cbs(
     g_ch_count_cb        = ch_count_cb;
     g_is_sensor_added_cb = is_added_cb;
     g_next_sensor_idx_cb = next_idx_cb;
+    g_sensor_parent_zb_type_cb = parent_zb_type_cb;
     g_parse_device_id_cb = parse_id_cb;
 }
 
 /* ---- 灌区回调注册 ---- */
+
+void ui_settings_close_overlays(void)
+{
+    ui_keyboard_close();
+
+    if (g_add_device_bg) {
+        lv_obj_del(g_add_device_bg);
+        g_add_device_bg = NULL;
+        g_add_device_dialog = NULL;
+        g_device_type_dropdown = NULL;
+        g_device_name_input = NULL;
+        g_device_id_input = NULL;
+        g_device_port_dropdown = NULL;
+    }
+
+    if (g_add_sensor_bg) {
+        lv_obj_del(g_add_sensor_bg);
+        g_add_sensor_bg = NULL;
+        g_add_sensor_dialog = NULL;
+        g_sensor_type_dropdown = NULL;
+        g_sensor_name_input = NULL;
+        g_sensor_parent_dropdown = NULL;
+        g_sensor_id_input = NULL;
+        g_sensor_id_prefix_label = NULL;
+        g_sensor_index_input = NULL;
+        g_sensor_composed_label = NULL;
+    }
+
+    if (g_search_sensor_bg) {
+        lv_obj_del(g_search_sensor_bg);
+        g_search_sensor_bg = NULL;
+        g_search_sensor_dialog = NULL;
+        g_search_result_container = NULL;
+    }
+
+    if (g_add_valve_bg) {
+        lv_obj_del(g_add_valve_bg);
+        g_add_valve_bg = NULL;
+        g_add_valve_dialog = NULL;
+        g_valve_type_dropdown = NULL;
+        g_valve_name_input = NULL;
+        g_valve_parent_dropdown = NULL;
+        g_valve_channel_dropdown = NULL;
+    }
+
+    if (g_warning_dialog) {
+        lv_obj_del(g_warning_dialog);
+        g_warning_dialog = NULL;
+    }
+
+    if (g_delete_confirm_dialog) {
+        lv_obj_del(g_delete_confirm_dialog);
+        g_delete_confirm_dialog = NULL;
+        g_delete_confirm_action = NULL;
+        g_delete_confirm_data = NULL;
+    }
+
+    if (g_add_zone_view) {
+        lv_obj_del(g_add_zone_view);
+        g_add_zone_view = NULL;
+        g_zone_name_input = NULL;
+        g_zone_valve_select_all_cb = NULL;
+        g_zone_device_select_all_cb = NULL;
+        g_zone_valve_title_label = NULL;
+        g_zone_device_title_label = NULL;
+        g_zone_valve_total = 0;
+        g_zone_device_total = 0;
+    }
+
+    if (g_lora_status_view) {
+        lv_obj_del(g_lora_status_view);
+        g_lora_status_view = NULL;
+    }
+
+    g_is_editing_device = false;
+    g_editing_device_id = 0;
+    g_is_editing_valve = false;
+    g_editing_valve_id = 0;
+    g_is_editing_sensor = false;
+    g_editing_sensor_composed_id = 0;
+    g_is_editing_zone = false;
+    g_editing_zone_slot = -1;
+}
 
 void ui_settings_register_zone_add_cb(ui_zone_add_cb_t cb) { g_zone_add_cb = cb; }
 void ui_settings_register_zone_delete_cb(ui_zone_delete_cb_t cb) { g_zone_delete_cb = cb; }

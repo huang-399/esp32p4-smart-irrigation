@@ -522,12 +522,11 @@ static bool on_sensor_delete(uint32_t composed_id)
     return (ret == ESP_OK);
 }
 
-static bool on_device_edit(uint16_t id, const ui_device_add_params_t *params)
+static bool on_device_edit(uint16_t id, const ui_device_edit_params_t *params)
 {
     dev_device_info_t dev = {0};
     dev.type = params->type;
     dev.port = params->port;
-    dev.id = params->id;
     snprintf(dev.name, sizeof(dev.name), "%s", params->name);
     bool ok = device_registry_update(id, &dev) == ESP_OK;
     return ok;
@@ -544,7 +543,7 @@ static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
     return ok;
 }
 
-static bool on_sensor_edit(uint32_t composed_id, const ui_sensor_add_params_t *params)
+static bool on_sensor_edit(uint32_t composed_id, const ui_sensor_edit_params_t *params)
 {
     dev_sensor_info_t sensor = {0};
     sensor.type = params->type;
@@ -664,6 +663,21 @@ static bool on_is_sensor_added(uint32_t composed_id)
 static uint8_t on_next_sensor_index(uint16_t parent_device_id)
 {
     return sensor_registry_next_index(parent_device_id);
+}
+
+static uint8_t on_get_sensor_parent_zb_type(uint16_t parent_device_id)
+{
+    const dev_device_info_t *dev = device_registry_get_by_id(parent_device_id);
+    if (!dev) return 0;
+
+    switch ((dev_type_t)dev->type) {
+        case DEV_TYPE_ZB_SENSOR_NODE:
+            return ZB_DEV_FIELD;
+        case DEV_TYPE_ZB_CTRL_NODE:
+            return ZB_DEV_CONTROL;
+        default:
+            return 0;
+    }
 }
 
 static uint16_t on_parse_device_id(int dropdown_index)
@@ -943,6 +957,7 @@ void app_main(void)
         on_get_channel_count,
         on_is_sensor_added,
         on_next_sensor_index,
+        on_get_sensor_parent_zb_type,
         on_parse_device_id
     );
 

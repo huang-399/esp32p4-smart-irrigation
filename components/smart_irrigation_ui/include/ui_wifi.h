@@ -79,6 +79,12 @@ void ui_wifi_show_connect_failed(const char *ssid);
  */
 void ui_wifi_invalidate_objects(void);
 
+/**
+ * @brief Close all WiFi screen-level dialogs/overlays.
+ *        Must be called before page switching destroys related widgets.
+ */
+void ui_wifi_close_overlays(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -668,15 +668,24 @@ bool sensor_registry_is_id_taken(uint32_t composed_id)
 
 uint8_t sensor_registry_next_index(uint16_t parent_device_id)
 {
-    uint8_t max_idx = 0;
+    bool used[100] = {false};
+
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
         if (s_sensors[i].valid && s_sensors[i].parent_device_id == parent_device_id) {
-            if (s_sensors[i].sensor_index > max_idx) {
-                max_idx = s_sensors[i].sensor_index;
+            uint8_t idx = s_sensors[i].sensor_index;
+            if (idx >= 1 && idx <= 99) {
+                used[idx] = true;
             }
         }
     }
-    return (max_idx < 99) ? (max_idx + 1) : 99;
+
+    for (uint8_t idx = 1; idx <= 99; idx++) {
+        if (!used[idx]) {
+            return idx;
+        }
+    }
+
+    return 99;
 }
 
 /* ========== 灌区 CRUD ========== */

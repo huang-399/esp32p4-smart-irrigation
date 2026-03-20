@@ -170,9 +170,19 @@ void ui_maintenance_create(lv_obj_t *parent);
 void ui_log_close_calendar(void);
 
 /**
+ * @brief 关闭设置页面的屏幕级弹窗（如果存在）
+ */
+void ui_settings_close_overlays(void);
+
+/**
  * @brief 关闭程序页面的日历弹窗（如果存在）
  */
 void ui_program_close_calendar(void);
+
+/**
+ * @brief 关闭程序页面的屏幕级弹窗（如果存在）
+ */
+void ui_program_close_overlays(void);
 
 /**
  * @brief 关闭程序页面的灌区选择对话框（如果存在）
@@ -301,6 +311,12 @@ typedef struct {
 } ui_device_add_params_t;
 
 typedef struct {
+    uint8_t  type;       /* dev_type_t */
+    uint8_t  port;       /* dev_port_t */
+    char     name[32];
+} ui_device_edit_params_t;
+
+typedef struct {
     uint8_t  type;       /* valve_type_t */
     uint8_t  channel;
     uint16_t parent_device_id;
@@ -315,6 +331,12 @@ typedef struct {
     char     name[32];
 } ui_sensor_add_params_t;
 
+typedef struct {
+    uint8_t  type;       /* sensor_type_t */
+    char     name[32];
+} ui_sensor_edit_params_t;
+
+
 /* 添加/删除/编辑回调类型 */
 typedef bool (*ui_device_add_cb_t)(const ui_device_add_params_t *params);
 typedef bool (*ui_valve_add_cb_t)(const ui_valve_add_params_t *params);
@@ -322,9 +344,9 @@ typedef bool (*ui_sensor_add_cb_t)(const ui_sensor_add_params_t *params);
 typedef bool (*ui_device_delete_cb_t)(uint16_t device_id);
 typedef bool (*ui_valve_delete_cb_t)(uint16_t valve_id);
 typedef bool (*ui_sensor_delete_cb_t)(uint32_t composed_id);
-typedef bool (*ui_device_edit_cb_t)(uint16_t device_id, const ui_device_add_params_t *params);
+typedef bool (*ui_device_edit_cb_t)(uint16_t device_id, const ui_device_edit_params_t *params);
 typedef bool (*ui_valve_edit_cb_t)(uint16_t valve_id, const ui_valve_add_params_t *params);
-typedef bool (*ui_sensor_edit_cb_t)(uint32_t composed_id, const ui_sensor_add_params_t *params);
+typedef bool (*ui_sensor_edit_cb_t)(uint32_t composed_id, const ui_sensor_edit_params_t *params);
 
 /* 查重回调类型 */
 typedef bool (*ui_is_name_taken_cb_t)(const char *name);
@@ -368,6 +390,7 @@ typedef int  (*ui_get_device_dropdown_cb_t)(char *buf, int buf_size);
 typedef int  (*ui_get_channel_count_cb_t)(uint16_t device_id);
 typedef bool (*ui_is_sensor_added_cb_t)(uint32_t composed_id);
 typedef uint8_t (*ui_next_sensor_index_cb_t)(uint16_t parent_device_id);
+typedef uint8_t (*ui_get_sensor_parent_zb_type_cb_t)(uint16_t parent_device_id);
 
 /* 从下拉框选项解析出设备 ID */
 typedef uint16_t (*ui_parse_device_id_cb_t)(int dropdown_index);
@@ -401,6 +424,7 @@ void ui_settings_register_query_cbs(
     ui_get_channel_count_cb_t   ch_count_cb,
     ui_is_sensor_added_cb_t     is_added_cb,
     ui_next_sensor_index_cb_t   next_idx_cb,
+    ui_get_sensor_parent_zb_type_cb_t parent_zb_type_cb,
     ui_parse_device_id_cb_t     parse_id_cb
 );
 

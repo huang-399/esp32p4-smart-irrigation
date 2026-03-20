@@ -661,3 +661,11 @@ void ui_wifi_invalidate_objects(void)
     }
     s_wifi_row_count = 0;
 }
+
+void ui_wifi_close_overlays(void)
+{
+    ui_keyboard_close();
+    close_connect_dialog();
+    close_connecting_dialog();
+    close_fail_dialog();
+}
