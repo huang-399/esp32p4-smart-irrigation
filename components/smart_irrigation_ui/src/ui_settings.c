@@ -53,6 +53,7 @@ static void sensor_parent_changed_cb(lv_event_t *e);
 static void sensor_index_changed_cb(lv_event_t *e);
 static void device_type_changed_cb(lv_event_t *e);
 static void sensor_type_changed_cb(lv_event_t *e);
+static void update_sensor_default_name(void);
 static void device_page_cb(lv_event_t *e);
 static void valve_page_cb(lv_event_t *e);
 static void sensor_page_cb(lv_event_t *e);
@@ -2413,7 +2414,7 @@ static void show_add_sensor_dialog(void)
     g_sensor_name_input = lv_textarea_create(g_add_sensor_dialog);
     lv_obj_set_size(g_sensor_name_input, 420, 45);
     lv_obj_set_pos(g_sensor_name_input, 130, 125);
-    lv_textarea_set_text(g_sensor_name_input, "#1空气湿度");
+    lv_textarea_set_text(g_sensor_name_input, "氮(N)1");
     lv_textarea_set_one_line(g_sensor_name_input, true);
     lv_obj_set_style_text_font(g_sensor_name_input, &my_font_cn_16, 0);
     lv_obj_set_style_bg_color(g_sensor_name_input, lv_color_white(), 0);
@@ -2421,6 +2422,9 @@ static void show_add_sensor_dialog(void)
     lv_obj_set_style_border_width(g_sensor_name_input, 1, 0);
     lv_obj_set_style_border_color(g_sensor_name_input, lv_color_hex(0xcccccc), 0);
     lv_obj_add_event_cb(g_sensor_name_input, textarea_click_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 按当前默认类型初始化名称 */
+    sensor_type_changed_cb(NULL);
 
     /* 关联父设备 */
     lv_obj_t *label_parent = lv_label_create(g_add_sensor_dialog);
@@ -4840,18 +4844,65 @@ static void device_type_changed_cb(lv_event_t *e)
 static void sensor_type_changed_cb(lv_event_t *e)
 {
     (void)e;
-    if (!g_sensor_type_dropdown || !g_sensor_name_input) return;
+    update_sensor_default_name();
+}
+
+static void update_sensor_default_name(void)
+{
+    if (!g_sensor_type_dropdown || !g_sensor_name_input || g_is_editing_sensor) return;
 
     static const char *sensor_names[] = {
         "氮(N)", "磷(P)", "钾(K)", "温度", "湿度",
         "光照", "流量", "压力", "液位", "阀门状态", "开关状态"
     };
+
     int idx = lv_dropdown_get_selected(g_sensor_type_dropdown);
-    if (idx >= 0 && idx < 11) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "%s1", sensor_names[idx]);
-        lv_textarea_set_text(g_sensor_name_input, buf);
+    if (idx < 0 || idx >= 11) return;
+
+    const char *base_name = sensor_names[idx];
+    bool used_suffix[128] = {false};
+    int next_suffix = 1;
+
+    if (g_sensor_count_cb && g_sensor_list_cb) {
+        int total = g_sensor_count_cb();
+        ui_sensor_row_t rows[ROWS_PER_PAGE];
+        for (int offset = 0; offset < total; offset += ROWS_PER_PAGE) {
+            int count = g_sensor_list_cb(rows, ROWS_PER_PAGE, offset);
+            if (count <= 0) break;
+
+            for (int i = 0; i < count; i++) {
+                if (rows[i].type != idx) continue;
+
+                size_t base_len = strlen(base_name);
+                if (strncmp(rows[i].name, base_name, base_len) != 0) continue;
+
+                const char *suffix = rows[i].name + base_len;
+                int suffix_value = 0;
+
+                if (*suffix == '\0') {
+                    suffix_value = 1;
+                } else {
+                    char *endptr = NULL;
+                    long value = strtol(suffix, &endptr, 10);
+                    if (endptr && *endptr == '\0' && value > 0 && value < (long)(sizeof(used_suffix) / sizeof(used_suffix[0]))) {
+                        suffix_value = (int)value;
+                    }
+                }
+
+                if (suffix_value > 0) {
+                    used_suffix[suffix_value] = true;
+                }
+            }
+        }
     }
+
+    while (next_suffix < (int)(sizeof(used_suffix) / sizeof(used_suffix[0])) && used_suffix[next_suffix]) {
+        next_suffix++;
+    }
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s%d", base_name, next_suffix);
+    lv_textarea_set_text(g_sensor_name_input, buf);
 }
 
 /* ---- 传感器对话框辅助回调 ---- */
@@ -4879,6 +4930,8 @@ static void sensor_parent_changed_cb(lv_event_t *e)
     snprintf(composed_buf, sizeof(composed_buf), "%u%02u",
              (unsigned int)dev_id, (unsigned int)next_idx);
     lv_label_set_text(g_sensor_composed_label, composed_buf);
+
+    update_sensor_default_name();
 }
 
 static void sensor_index_changed_cb(lv_event_t *e)
