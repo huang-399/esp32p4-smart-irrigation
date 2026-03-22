@@ -80,14 +80,14 @@ typedef struct __attribute__((packed)) {
     char       name[DEV_REG_NAME_LEN];
 } dev_valve_info_t;         /* 40 bytes per entry, 32 * 40 = 1280 bytes total */
 
-/* ---- 传感器信息 ---- */
+/* ---- 传感器信息 / 业务点绑定 ---- */
 typedef struct __attribute__((packed)) {
     uint8_t    valid;
     uint8_t    type;        /* sensor_type_t */
-    uint8_t    sensor_index; /* 在父设备下的序号 (01-99) */
-    uint8_t    zb_dev_type; /* Zigbee 设备类型 (0x01=田地, 0x02=管道, 0x03=控制) */
+    uint8_t    point_no;    /* 点位号 (01-99) */
+    uint8_t    proto_type;  /* Zigbee 协议类型 (0x01=田地, 0x02=管道, 0x03=控制) */
     uint16_t   parent_device_id;
-    uint32_t   composed_id; /* zb_dev_type * 1000000 + parent_id * 100 + sensor_index */
+    uint32_t   point_id;    /* 业务点编号: node_id * 100 + point_no */
     char       name[DEV_REG_NAME_LEN];
 } dev_sensor_info_t;        /* 40 bytes per entry, 64 * 40 = 2560 bytes total */
 
@@ -133,18 +133,18 @@ esp_err_t valve_registry_update(uint16_t id, const dev_valve_info_t *valve);
 int sensor_registry_get_count(void);
 const dev_sensor_info_t *sensor_registry_get_all(void);
 esp_err_t sensor_registry_add(const dev_sensor_info_t *sensor);
-esp_err_t sensor_registry_remove(uint32_t composed_id);
-esp_err_t sensor_registry_update(uint32_t composed_id, const dev_sensor_info_t *sensor);
+esp_err_t sensor_registry_remove(uint32_t point_id);
+esp_err_t sensor_registry_update(uint32_t point_id, const dev_sensor_info_t *sensor);
 
 /**
- * @brief 判断传感器编号是否已被占用
+ * @brief 判断业务点编号是否已被占用
  */
-bool sensor_registry_is_id_taken(uint32_t composed_id);
+bool sensor_registry_is_id_taken(uint32_t point_id);
 
 /**
- * @brief 获取指定父设备下的下一个可用传感器序号
+ * @brief 获取指定父设备下的下一个可用点位号
  */
-uint8_t sensor_registry_next_index(uint16_t parent_device_id);
+uint8_t sensor_registry_next_point_no(uint16_t parent_device_id);
 
 /**
  * @brief 构建设备下拉选项字符串 (LVGL dropdown 格式, '\n' 分隔)

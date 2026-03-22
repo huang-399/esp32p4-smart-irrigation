@@ -10,9 +10,9 @@ extern "C" {
 
 /* 设备类型（与 CC2530 协议一致） */
 #define ZB_DEV_FIELD        0x01   /* 田地传感器（ID=1~6） */
-#define ZB_DEV_PIPE         0x02   /* 管道，全部打包（ID=0） */
-#define ZB_DEV_CONTROL      0x03   /* 控制系统，打包（ID=0） */
-#define ZB_DEV_MIXER        0x04   /* 独立设备控制（下行用） */
+#define ZB_DEV_PIPE         0x02   /* 管道，上行聚合；下行使用 ID=0~6 */
+#define ZB_DEV_CONTROL      0x03   /* 控制系统，上行聚合；下行使用 ID=1~3 */
+#define ZB_DEV_MIXER        0x04   /* 独立设备控制（下行用，ID=1~5） */
 #define ZB_DEV_HEARTBEAT    0xFE   /* 心跳 */
 
 #define ZB_MAX_FIELDS       6
@@ -60,6 +60,11 @@ typedef struct {
     bool           online;
 } zb_control_data_t;
 
+typedef struct {
+    uint8_t dev_type;
+    uint8_t dev_id;
+} zb_control_target_t;
+
 /* 回调：收到任意设备数据时触发（非 LVGL 线程） */
 typedef void (*zb_bridge_data_cb_t)(uint8_t dev_type, uint8_t dev_id, void *user_data);
 
@@ -97,6 +102,14 @@ typedef struct {
 int zigbee_bridge_get_discovered(zb_discovered_item_t *out_items, int max_items);
 
 /* ---- 下行控制接口 ---- */
+
+/**
+ * @brief 将业务点编号映射为 Zigbee 原始控制目标
+ * @param point_id   业务点编号（如 200101 / 300001 / 300006）
+ * @param out_target 输出 raw (type,id)
+ * @return true=支持的控制点, false=不支持
+ */
+bool zigbee_bridge_resolve_control_target(uint32_t point_id, zb_control_target_t *out_target);
 
 /**
  * @brief 发送控制指令给 CC2530

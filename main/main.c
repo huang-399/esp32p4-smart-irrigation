@@ -18,6 +18,7 @@
 #include "event_recorder.h"
 #include "zigbee_bridge.h"
 #include "device_registry.h"
+#include "irrigation_scheduler.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include <stdlib.h>
@@ -27,10 +28,14 @@
 
 static const char *TAG = "smart_irrigation";
 
+static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out);
+
 /* NTP time sync state */
 static bool s_time_synced = false;
 static bool s_ntp_started = false;
 static bool s_wifi_connected = false;
+static bool s_event_fix_scheduled = false;
+static bool s_event_fix_completed = false;
 
 /* ---- Time update task ---- */
 
@@ -75,12 +80,49 @@ static void refresh_alarm_records_async(void *arg)
     ui_alarm_rec_refresh_visible();
 }
 
+static void fix_event_timestamps_task(void *arg)
+{
+    (void)arg;
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    esp_err_t ret = event_recorder_fix_timestamps();
+    if (ret == ESP_OK) {
+        s_event_fix_completed = true;
+        lv_async_call(refresh_alarm_records_async, NULL);
+    } else {
+        ESP_LOGW(TAG, "Deferred event timestamp repair failed: %s", esp_err_to_name(ret));
+    }
+
+    s_event_fix_scheduled = false;
+    vTaskDelete(NULL);
+}
+
+static void schedule_event_timestamp_fix(void)
+{
+    if (s_event_fix_completed || s_event_fix_scheduled) {
+        return;
+    }
+
+    BaseType_t ok = xTaskCreate(fix_event_timestamps_task,
+                                "evt_ts_fix",
+                                4096,
+                                NULL,
+                                4,
+                                NULL);
+    if (ok == pdPASS) {
+        s_event_fix_scheduled = true;
+    } else {
+        ESP_LOGW(TAG, "Failed to create deferred timestamp repair task");
+    }
+}
+
 static void sntp_sync_cb(struct timeval *tv)
 {
     ESP_LOGI(TAG, "NTP time synchronized");
     s_time_synced = true;
-    event_recorder_fix_timestamps();
-    lv_async_call(refresh_alarm_records_async, NULL);
+    irrigation_scheduler_set_time_valid(true);
+    schedule_event_timestamp_fix();
 }
 
 static void start_ntp(void)
@@ -363,6 +405,233 @@ typedef struct {
 
 static int s_zb_frame_count = 0;         /* 收到的总帧数 */
 
+static bool is_sensor_point_registered(uint32_t point_id)
+{
+    const dev_sensor_info_t *all = sensor_registry_get_all();
+
+    for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
+        if (all[i].valid && all[i].point_id == point_id) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool is_pipe_valve_registered(int pipe_id)
+{
+    const dev_valve_info_t *all = valve_registry_get_all();
+
+    if (pipe_id <= 0 || pipe_id >= ZB_MAX_PIPES) {
+        return false;
+    }
+
+    for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+        if (all[i].valid && all[i].channel == (uint8_t)pipe_id) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static uint8_t get_field_registered_mask(uint8_t field_id)
+{
+    uint32_t node_id;
+    uint8_t mask = 0;
+
+    if (field_id < 1 || field_id > ZB_MAX_FIELDS) {
+        return 0;
+    }
+
+    node_id = 1000U + (uint32_t)field_id;
+    for (uint8_t point_no = 1; point_no <= 6; point_no++) {
+        uint32_t point_id = node_id * 100U + (uint32_t)point_no;
+        if (is_sensor_point_registered(point_id)) {
+            mask |= (uint8_t)(1U << (point_no - 1U));
+        }
+    }
+
+    return mask;
+}
+
+static int resolve_field_index_from_device_id(uint16_t device_id)
+{
+    if (device_id >= 1001U && device_id <= 1006U) {
+        uint8_t field_id = (uint8_t)(device_id - 1000U);
+        return get_field_registered_mask(field_id) ? ((int)field_id - 1) : -1;
+    }
+
+    const dev_sensor_info_t *sensors = sensor_registry_get_all();
+    uint8_t mask = 0;
+    int field_index = -1;
+
+    for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
+        if (!sensors[i].valid || sensors[i].parent_device_id != device_id) {
+            continue;
+        }
+        if (sensors[i].point_id < 100100U || sensors[i].point_id > 100699U) {
+            continue;
+        }
+
+        uint32_t node_id = sensors[i].point_id / 100U;
+        if (node_id < 1001U || node_id > 1006U) {
+            continue;
+        }
+
+        int candidate_index = (int)(node_id - 1001U);
+        uint32_t point_no = sensors[i].point_id % 100U;
+        if (point_no < 1U || point_no > 6U) {
+            continue;
+        }
+
+        if (field_index < 0) {
+            field_index = candidate_index;
+        }
+        if (field_index != candidate_index) {
+            return -1;
+        }
+
+        mask |= (uint8_t)(1U << (point_no - 1U));
+    }
+
+    return (mask != 0U) ? field_index : -1;
+}
+
+static int on_home_zone_field_resolve(int slot_index)
+{
+    ui_zone_add_params_t zone = {0};
+
+    if (!on_get_zone_detail(slot_index, &zone)) {
+        return -1;
+    }
+
+    for (int i = 0; i < zone.device_count; i++) {
+        int field_index = resolve_field_index_from_device_id(zone.device_ids[i]);
+        if (field_index >= 0) {
+            return field_index;
+        }
+    }
+
+    return -1;
+}
+
+static void get_pipe_binding_flags(int pipe_id,
+    bool *valve_bound, bool *flow_bound, bool *pressure_bound)
+{
+    uint32_t node_id;
+
+    if (valve_bound) {
+        *valve_bound = false;
+    }
+    if (flow_bound) {
+        *flow_bound = false;
+    }
+    if (pressure_bound) {
+        *pressure_bound = false;
+    }
+
+    if (pipe_id < 0 || pipe_id >= ZB_MAX_PIPES) {
+        return;
+    }
+
+    node_id = 2000U + (uint32_t)pipe_id;
+    if (valve_bound) {
+        *valve_bound = is_pipe_valve_registered(pipe_id) ||
+            is_sensor_point_registered(node_id * 100U + 11U);
+    }
+    if (flow_bound) {
+        *flow_bound = is_sensor_point_registered(node_id * 100U + 2U);
+    }
+    if (pressure_bound) {
+        *pressure_bound = is_sensor_point_registered(node_id * 100U + 3U);
+    }
+}
+
+static bool is_tank_level_bound(int tank_id)
+{
+    if (tank_id < 1 || tank_id > ZB_MAX_TANKS) {
+        return false;
+    }
+
+    return is_sensor_point_registered(3000U * 100U + 20U + (uint32_t)tank_id);
+}
+
+static void project_field_to_ui(uint8_t field_id)
+{
+    const zb_field_data_t *f;
+    uint8_t registered_mask;
+
+    if (field_id < 1 || field_id > ZB_MAX_FIELDS) {
+        return;
+    }
+
+    f = zigbee_bridge_get_field(field_id);
+    if (!f) {
+        return;
+    }
+
+    registered_mask = get_field_registered_mask(field_id);
+    ui_home_update_field(field_id, registered_mask,
+        f->nitrogen, f->phosphorus, f->potassium,
+        f->temperature, f->humidity, f->light);
+    ui_device_update_field(field_id, registered_mask,
+        f->nitrogen, f->phosphorus, f->potassium,
+        f->temperature, f->humidity, f->light);
+}
+
+static void project_pipe_to_ui(void)
+{
+    const zb_pipe_data_t *pd = zigbee_bridge_get_pipes();
+
+    if (!pd) {
+        return;
+    }
+
+    for (int i = 0; i < ZB_MAX_PIPES; i++) {
+        bool valve_bound;
+        bool flow_bound;
+        bool pressure_bound;
+
+        get_pipe_binding_flags(i, &valve_bound, &flow_bound, &pressure_bound);
+        ui_home_update_pipe(i,
+            valve_bound, pd->pipes[i].valve_on,
+            flow_bound, pd->pipes[i].flow,
+            pressure_bound, pd->pipes[i].pressure);
+        ui_device_update_pipe(i,
+            valve_bound, pd->pipes[i].valve_on,
+            flow_bound, pd->pipes[i].flow,
+            pressure_bound, pd->pipes[i].pressure);
+    }
+}
+
+static void project_control_to_ui(void)
+{
+    const zb_control_data_t *cd = zigbee_bridge_get_control();
+
+    if (!cd) {
+        return;
+    }
+
+    ui_home_update_control(cd->water_pump_on, cd->fert_pump_on,
+        cd->fert_valve_on, cd->water_valve_on, cd->mixer_on);
+    ui_home_update_mixer(cd->mixer_on);
+    ui_device_update_control(cd->water_pump_on, cd->fert_pump_on,
+        cd->fert_valve_on, cd->water_valve_on, cd->mixer_on);
+
+    for (int i = 0; i < ZB_MAX_TANKS; i++) {
+        bool level_bound = is_tank_level_bound(i + 1);
+        ui_home_update_tank(i + 1,
+            cd->tanks[i].switch_on,
+            level_bound,
+            cd->tanks[i].level);
+        ui_device_update_tank(i + 1,
+            cd->tanks[i].switch_on,
+            level_bound,
+            cd->tanks[i].level);
+    }
+}
+
 static void update_zb_ui_async(void *param)
 {
     zb_ui_msg_t *msg = (zb_ui_msg_t *)param;
@@ -372,30 +641,11 @@ static void update_zb_ui_async(void *param)
     ui_home_update_zigbee_status(true, s_zb_frame_count);
 
     if (msg->dev_type == ZB_DEV_FIELD) {
-        const zb_field_data_t *f = zigbee_bridge_get_field(msg->dev_id);
-        if (f) {
-            ui_home_update_field(msg->dev_id,
-                f->nitrogen, f->phosphorus, f->potassium,
-                f->temperature, f->humidity, f->light);
-        }
+        project_field_to_ui(msg->dev_id);
     } else if (msg->dev_type == ZB_DEV_PIPE) {
-        const zb_pipe_data_t *pd = zigbee_bridge_get_pipes();
-        if (pd) {
-            for (int i = 0; i < 7; i++) {
-                ui_home_update_pipe(i, pd->pipes[i].valve_on,
-                    pd->pipes[i].flow, pd->pipes[i].pressure);
-            }
-        }
+        project_pipe_to_ui();
     } else if (msg->dev_type == ZB_DEV_CONTROL) {
-        const zb_control_data_t *cd = zigbee_bridge_get_control();
-        if (cd) {
-            ui_home_update_control(cd->water_pump_on, cd->fert_pump_on,
-                cd->fert_valve_on, cd->water_valve_on, cd->mixer_on);
-            for (int i = 0; i < 3; i++) {
-                ui_home_update_tank(i + 1, cd->tanks[i].switch_on,
-                    cd->tanks[i].level);
-            }
-        }
+        project_control_to_ui();
     }
 
     free(msg);
@@ -411,11 +661,89 @@ static void on_zb_data(uint8_t dev_type, uint8_t dev_id, void *user_data)
     lv_async_call(update_zb_ui_async, msg);
 }
 
-/* 设备控制回调（UI → zigbee_bridge） */
-static void on_device_control(uint8_t dev_type, uint8_t dev_id, bool on)
+static void refresh_all_zb_ui(void)
 {
-    ESP_LOGI(TAG, "Device control: type=0x%02X id=%d on=%d", dev_type, dev_id, on);
-    zigbee_bridge_send_control(dev_type, dev_id, on);
+    const zb_pipe_data_t *pd = zigbee_bridge_get_pipes();
+    const zb_control_data_t *cd = zigbee_bridge_get_control();
+    bool any_online = false;
+
+    if (pd && pd->online) {
+        any_online = true;
+        project_pipe_to_ui();
+    }
+
+    if (cd && cd->online) {
+        any_online = true;
+        project_control_to_ui();
+    }
+
+    for (uint8_t field_id = 1; field_id <= ZB_MAX_FIELDS; field_id++) {
+        const zb_field_data_t *f = zigbee_bridge_get_field(field_id);
+        if (f && f->online) {
+            any_online = true;
+            project_field_to_ui(field_id);
+        }
+    }
+
+    ui_home_update_zigbee_status(any_online, s_zb_frame_count);
+}
+
+/* 设备控制回调（UI → zigbee_bridge） */
+static void on_device_control(uint32_t point_id, bool on)
+{
+    zb_control_target_t target;
+
+    if (!zigbee_bridge_resolve_control_target(point_id, &target)) {
+        ESP_LOGW(TAG, "Unsupported control point_id=%lu", (unsigned long)point_id);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Device control: point_id=%lu type=0x%02X id=%u on=%d",
+             (unsigned long)point_id, target.dev_type, target.dev_id, on);
+    zigbee_bridge_send_control(target.dev_type, target.dev_id, on);
+}
+
+
+static uint32_t discovered_item_to_point_id(const zb_discovered_item_t *item)
+{
+    if (!item) {
+        return 0;
+    }
+
+    if (item->dev_type == ZB_DEV_FIELD) {
+        if (item->dev_id >= 1 && item->dev_id <= 6 && item->sensor_index < 6) {
+            uint32_t node_id = 1000U + (uint32_t)item->dev_id;
+            uint8_t point_no = (uint8_t)(item->sensor_index + 1U);
+            return node_id * 100U + (uint32_t)point_no;
+        }
+        return 0;
+    }
+
+    if (item->dev_type == ZB_DEV_PIPE) {
+        if (item->dev_id <= 6) {
+            static const uint8_t pipe_point_map[] = {11U, 2U, 3U};
+            if ((unsigned)item->sensor_index < (sizeof(pipe_point_map) / sizeof(pipe_point_map[0]))) {
+                uint32_t node_id = 2000U + (uint32_t)item->dev_id;
+                return node_id * 100U + (uint32_t)pipe_point_map[item->sensor_index];
+            }
+        }
+        return 0;
+    }
+
+    if (item->dev_type == ZB_DEV_CONTROL) {
+        static const uint8_t control_point_map[] = {
+            11U, 12U, 13U, 14U, 15U,
+            16U, 21U,
+            17U, 22U,
+            18U, 23U
+        };
+        if ((unsigned)item->sensor_index < (sizeof(control_point_map) / sizeof(control_point_map[0]))) {
+            return 3000U * 100U + (uint32_t)control_point_map[item->sensor_index];
+        }
+        return 0;
+    }
+
+    return 0;
 }
 
 /* 搜索传感器回调（在 LVGL 任务中执行，不可使用大栈数组） */
@@ -440,11 +768,11 @@ static void on_search_sensor(void)
             return;
         }
         for (int i = 0; i < count; i++) {
-            strncpy(ui_items[i].name, items[i].name, 32);
-            strncpy(ui_items[i].type_name, items[i].type_name, 16);
-            ui_items[i].dev_type = items[i].dev_type;
-            ui_items[i].dev_id = items[i].dev_id;
-            ui_items[i].sensor_index = items[i].sensor_index;
+            strncpy(ui_items[i].name, items[i].name, sizeof(ui_items[i].name) - 1);
+            ui_items[i].name[sizeof(ui_items[i].name) - 1] = '\0';
+            strncpy(ui_items[i].type_name, items[i].type_name, sizeof(ui_items[i].type_name) - 1);
+            ui_items[i].type_name[sizeof(ui_items[i].type_name) - 1] = '\0';
+            ui_items[i].point_id = discovered_item_to_point_id(&items[i]);
         }
         /* 已在 LVGL 任务上下文，无需 bsp_display_lock */
         ui_settings_update_search_results(ui_items, count);
@@ -490,12 +818,12 @@ static bool on_sensor_add(const ui_sensor_add_params_t *params)
 {
     dev_sensor_info_t sensor = {0};
     sensor.type = params->type;
-    sensor.sensor_index = params->sensor_index;
-    sensor.zb_dev_type = params->zb_dev_type;
+    sensor.point_no = params->point_no;
     sensor.parent_device_id = params->parent_device_id;
-    sensor.composed_id = (uint32_t)params->zb_dev_type * 1000000
-                       + (uint32_t)params->parent_device_id * 100
-                       + params->sensor_index;
+    sensor.point_id = params->point_id;
+    sensor.proto_type = (params->point_id / 10000U == 1U) ? ZB_DEV_FIELD :
+                        (params->point_id / 10000U == 2U) ? ZB_DEV_PIPE :
+                        (params->point_id / 10000U == 3U) ? ZB_DEV_CONTROL : 0U;
     snprintf(sensor.name, sizeof(sensor.name), "%s", params->name);
     esp_err_t ret = sensor_registry_add(&sensor);
     if (ret != ESP_OK) {
@@ -516,9 +844,9 @@ static bool on_valve_delete(uint16_t valve_id)
     return (ret == ESP_OK);
 }
 
-static bool on_sensor_delete(uint32_t composed_id)
+static bool on_sensor_delete(uint32_t point_id)
 {
-    esp_err_t ret = sensor_registry_remove(composed_id);
+    esp_err_t ret = sensor_registry_remove(point_id);
     return (ret == ESP_OK);
 }
 
@@ -543,12 +871,12 @@ static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
     return ok;
 }
 
-static bool on_sensor_edit(uint32_t composed_id, const ui_sensor_edit_params_t *params)
+static bool on_sensor_edit(uint32_t point_id, const ui_sensor_edit_params_t *params)
 {
     dev_sensor_info_t sensor = {0};
     sensor.type = params->type;
     snprintf(sensor.name, sizeof(sensor.name), "%s", params->name);
-    bool ok = sensor_registry_update(composed_id, &sensor) == ESP_OK;
+    bool ok = sensor_registry_update(point_id, &sensor) == ESP_OK;
     return ok;
 }
 
@@ -624,10 +952,9 @@ static int on_get_sensor_list(ui_sensor_row_t *out, int max, int offset)
         if (!all[i].valid) continue;
         if (skipped < offset) { skipped++; continue; }
         out[filled].type = all[i].type;
-        out[filled].sensor_index = all[i].sensor_index;
-        out[filled].zb_dev_type = all[i].zb_dev_type;
+        out[filled].point_no = all[i].point_no;
         out[filled].parent_device_id = all[i].parent_device_id;
-        out[filled].composed_id = all[i].composed_id;
+        out[filled].point_id = all[i].point_id;
         snprintf(out[filled].name, sizeof(out[filled].name), "%s", all[i].name);
         /* 查找父设备名称 */
         out[filled].parent_name[0] = '\0';
@@ -655,29 +982,14 @@ static int on_get_channel_count(uint16_t device_id)
     return device_registry_get_channel_count(device_id);
 }
 
-static bool on_is_sensor_added(uint32_t composed_id)
+static bool on_is_sensor_added(uint32_t point_id)
 {
-    return sensor_registry_is_id_taken(composed_id);
+    return sensor_registry_is_id_taken(point_id);
 }
 
-static uint8_t on_next_sensor_index(uint16_t parent_device_id)
+static uint8_t on_next_sensor_point_no(uint16_t parent_device_id)
 {
-    return sensor_registry_next_index(parent_device_id);
-}
-
-static uint8_t on_get_sensor_parent_zb_type(uint16_t parent_device_id)
-{
-    const dev_device_info_t *dev = device_registry_get_by_id(parent_device_id);
-    if (!dev) return 0;
-
-    switch ((dev_type_t)dev->type) {
-        case DEV_TYPE_ZB_SENSOR_NODE:
-            return ZB_DEV_FIELD;
-        case DEV_TYPE_ZB_CTRL_NODE:
-            return ZB_DEV_CONTROL;
-        default:
-            return 0;
-    }
+    return sensor_registry_next_point_no(parent_device_id);
 }
 
 static uint16_t on_parse_device_id(int dropdown_index)
@@ -822,6 +1134,64 @@ static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out)
     return true;
 }
 
+static void on_irrigation_status_get(void *arg)
+{
+    ui_irrigation_runtime_status_t *status = (ui_irrigation_runtime_status_t *)arg;
+    irr_runtime_status_t runtime = {0};
+
+    irrigation_scheduler_get_runtime_status(&runtime);
+
+    status->auto_enabled = runtime.auto_enabled;
+    status->busy = runtime.busy;
+    status->program_active = runtime.program_active;
+    status->manual_irrigation_active = runtime.manual_irrigation_active;
+    status->active_program_index = runtime.active_program_index;
+    snprintf(status->active_name, sizeof(status->active_name), "%s", runtime.active_name);
+    snprintf(status->status_text, sizeof(status->status_text), "%s", runtime.status_text);
+    status->total_duration = runtime.total_duration;
+    status->elapsed_seconds = runtime.elapsed_seconds;
+}
+
+static bool on_home_auto_mode_set(bool enabled)
+{
+    return irrigation_scheduler_set_auto_enabled(enabled);
+}
+
+static bool on_home_auto_mode_get(void)
+{
+    return irrigation_scheduler_get_auto_enabled();
+}
+
+static bool on_home_program_start(int index)
+{
+    return irrigation_scheduler_start_program(index);
+}
+
+static bool on_home_manual_irrigation_start(const ui_manual_irrigation_request_t *req)
+{
+    if (!req) {
+        return false;
+    }
+
+    irr_manual_irrigation_request_t backend_req = {
+        .pre_water = req->pre_water,
+        .post_water = req->post_water,
+        .total_duration = req->total_duration,
+    };
+    snprintf(backend_req.formula, sizeof(backend_req.formula), "%s", req->formula);
+    return irrigation_scheduler_start_manual_irrigation(&backend_req);
+}
+
+static bool on_home_irrigation_status_get(ui_irrigation_runtime_status_t *out)
+{
+    if (!out) {
+        return false;
+    }
+
+    on_irrigation_status_get(out);
+    return true;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting Smart Irrigation System");
@@ -881,6 +1251,13 @@ void app_main(void)
         ESP_LOGE(TAG, "Device registry init failed: %s", esp_err_to_name(dr_ret));
     }
 
+    /* Initialize irrigation scheduler after NVS init */
+    esp_err_t irr_ret = irrigation_scheduler_init();
+    if (irr_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Irrigation scheduler init failed: %s", esp_err_to_name(irr_ret));
+    }
+    irrigation_scheduler_set_time_valid(s_time_synced);
+
     /* Load programs & formulas from NVS (before UI init so lists are populated) */
     ui_program_store_init();
 
@@ -916,6 +1293,20 @@ void app_main(void)
 
     bsp_display_unlock();
 
+    /* Register home irrigation callbacks */
+    ui_home_register_auto_mode_set_cb(on_home_auto_mode_set);
+    ui_home_register_auto_mode_get_cb(on_home_auto_mode_get);
+    ui_home_register_program_start_cb(on_home_program_start);
+    ui_home_register_manual_irrigation_start_cb(on_home_manual_irrigation_start);
+    ui_home_register_irrigation_status_get_cb(on_home_irrigation_status_get);
+    ui_home_register_runtime_refresh_cb(refresh_all_zb_ui);
+    ui_home_register_zone_query_cbs(
+        on_get_zone_count,
+        on_get_zone_list,
+        on_get_zone_detail
+    );
+    ui_home_register_zone_field_resolve_cb(on_home_zone_field_resolve);
+
     /* Register WiFi callbacks for UI (just function pointers, safe before WiFi init) */
     ui_wifi_register_scan_callback(request_wifi_scan);
     ui_wifi_register_connect_callback(request_wifi_connect);
@@ -932,6 +1323,16 @@ void app_main(void)
 
     /* Register device control callback (UI → zigbee_bridge) */
     ui_device_register_control_cb(on_device_control);
+
+    ui_device_register_query_cbs(
+        on_get_valve_count,
+        on_get_valve_list,
+        on_get_sensor_count,
+        on_get_sensor_list,
+        on_get_zone_count,
+        on_get_zone_list,
+        on_get_zone_detail
+    );
 
     /* Register sensor search callback */
     ui_settings_register_search_sensor_cb(on_search_sensor);
@@ -956,8 +1357,7 @@ void app_main(void)
         on_get_device_dropdown,
         on_get_channel_count,
         on_is_sensor_added,
-        on_next_sensor_index,
-        on_get_sensor_parent_zb_type,
+        on_next_sensor_point_no,
         on_parse_device_id
     );
 
@@ -973,6 +1373,13 @@ void app_main(void)
     ui_settings_register_zone_delete_cb(on_zone_delete);
     ui_settings_register_zone_edit_cb(on_zone_edit);
     ui_settings_register_zone_query_cbs(on_get_zone_count, on_get_zone_list, on_get_zone_detail);
+    ui_program_register_selection_query_cbs(
+        on_get_valve_count,
+        on_get_valve_list,
+        on_get_zone_count,
+        on_get_zone_list,
+        on_get_zone_detail
+    );
 
     /* Initialize Zigbee bridge (UART1: TX=GPIO49, RX=GPIO50) */
     esp_err_t zb_ret = zigbee_bridge_init(49, 50);

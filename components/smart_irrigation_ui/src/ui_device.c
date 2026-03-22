@@ -5,9 +5,18 @@
 
 #include "ui_common.h"
 #include "ui_numpad.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdbool.h>
+
+#define UI_DEVICE_MAX_SENSOR_ITEMS 64
+#define UI_DEVICE_MAX_VALVE_ROWS   32
+#define UI_DEVICE_MAX_ZONE_ROWS    16
+#define UI_DEVICE_MAX_ZONE_SWITCHES 64
+#define UI_DEVICE_CONTROL_CONFIRM_TIMEOUT_MS 7000U
+#define UI_DEVICE_CONTROL_CONFIRM_TIMER_MS   200U
+
 
 /*********************
  *  STATIC PROTOTYPES
@@ -15,6 +24,11 @@
 static void create_tab_buttons(lv_obj_t *parent);
 static void create_control_panel(lv_obj_t *parent);
 static void create_data_panel(lv_obj_t *parent);
+static void create_main_control_view(lv_obj_t *parent);
+static void create_valve_control_view(lv_obj_t *parent);
+static void create_zone_control_view(lv_obj_t *parent);
+static void create_sensor_monitor_view(lv_obj_t *parent);
+static void switch_to_tab(int tab_index);
 static void create_device_card(lv_obj_t *parent, const char *title, int x, int y, bool is_double);
 static void tab_btn_cb(lv_event_t *e);
 static void device_card_click_cb(lv_event_t *e);
@@ -24,6 +38,27 @@ static void show_device_confirm_dialog(const char *dev_name, bool to_on);
 static void device_dialog_confirm_cb(lv_event_t *e);
 static void device_dialog_cancel_cb(lv_event_t *e);
 static void update_valve_open_count(void);
+static void refresh_control_cards(void);
+static void refresh_main_data_panel(void);
+static void refresh_valve_card(int valve_idx);
+static void refresh_zone_field_card(int field_idx);
+static void refresh_tank_card(int tank_idx);
+static void refresh_sensor_field_card(int field_idx);
+static void refresh_sensor_pipe_label(int pipe_idx);
+static void set_switch_checked(lv_obj_t *sw, bool checked);
+static void clear_view_object_refs(void);
+static uint32_t valve_index_to_point_id(int valve_idx);
+static uint32_t valve_channel_to_point_id(uint8_t channel);
+static const char *sensor_type_name(uint8_t type);
+static const char *zone_switch_title_for_point(uint32_t point_id, char *buf, size_t buf_size);
+static int point_id_to_pipe_index(uint32_t point_id);
+static bool format_runtime_point_value(uint32_t point_id, char *buf, size_t buf_size);
+static void refresh_dynamic_valve_items(void);
+static void refresh_dynamic_zone_switches(void);
+static void refresh_dynamic_sensor_items(void);
+static void control_confirm_timer_cb(lv_timer_t *timer);
+static void start_control_confirm(uint32_t point_id, bool target_on);
+static void resolve_control_confirm(uint32_t point_id, bool actual_on);
 
 /* 全局变量 */
 static lv_obj_t *g_left_panel = NULL;   /* 左侧白色面板（主机控制视图） */
@@ -32,14 +67,48 @@ static lv_obj_t *g_view_container = NULL; /* 视图容器（懒加载） */
 static lv_obj_t *g_tab_buttons[4] = {NULL};   /* 标签按钮数组 */
 static int g_active_tab = 0;             /* 当前活动标签页 */
 
+/* 设备页查询回调 */
+static ui_get_valve_count_cb_t  g_get_valve_count_cb = NULL;
+static ui_get_valve_list_cb_t   g_get_valve_list_cb = NULL;
+static ui_get_sensor_count_cb_t g_get_sensor_count_cb = NULL;
+static ui_get_sensor_list_cb_t  g_get_sensor_list_cb = NULL;
+static ui_get_zone_count_cb_t   g_get_zone_count_cb = NULL;
+static ui_get_zone_list_cb_t    g_get_zone_list_cb = NULL;
+static ui_get_zone_detail_cb_t  g_get_zone_detail_cb = NULL;
+
+/* 主机/阀门/灌区控制确认状态 */
+typedef enum {
+    DEV_CONFIRM_IDLE = 0,
+    DEV_CONFIRM_PENDING,
+    DEV_CONFIRM_TIMEOUT,
+} device_confirm_state_t;
+
+/* 灌区页动态开关映射 */
+static lv_obj_t *g_zone_dynamic_info_labels[UI_DEVICE_MAX_ZONE_SWITCHES] = {NULL};
+static lv_obj_t *g_zone_dynamic_switches[UI_DEVICE_MAX_ZONE_SWITCHES] = {NULL};
+static uint32_t  g_zone_dynamic_point_ids[UI_DEVICE_MAX_ZONE_SWITCHES] = {0};
+static int       g_zone_dynamic_switch_count = 0;
+static device_confirm_state_t g_zone_confirm_states[UI_DEVICE_MAX_ZONE_SWITCHES] = {DEV_CONFIRM_IDLE};
+static bool      g_zone_confirm_targets[UI_DEVICE_MAX_ZONE_SWITCHES] = {false};
+static uint32_t  g_zone_confirm_deadlines[UI_DEVICE_MAX_ZONE_SWITCHES] = {0};
+
+/* 传感监测页动态标签映射 */
+static lv_obj_t *g_sensor_dynamic_value_labels[UI_DEVICE_MAX_SENSOR_ITEMS] = {NULL};
+static uint32_t  g_sensor_dynamic_point_ids[UI_DEVICE_MAX_SENSOR_ITEMS] = {0};
+static int       g_sensor_dynamic_item_count = 0;
 /* 设备控制回调 */
 static ui_device_control_cb_t g_device_control_cb = NULL;
 
-/* 主机控制视图：设备状态标签 */
+/* 主机控制状态标签 */
 static lv_obj_t *g_dev_status_labels[5] = {NULL};  /* 主水泵/施肥泵/出肥阀/注水阀/搅拌机 */
+static device_confirm_state_t g_dev_confirm_states[5] = {DEV_CONFIRM_IDLE, DEV_CONFIRM_IDLE, DEV_CONFIRM_IDLE, DEV_CONFIRM_IDLE, DEV_CONFIRM_IDLE};
+static bool g_dev_confirm_targets[5] = {false, false, false, false, false};
+static uint32_t g_dev_confirm_deadlines[5] = {0};
+static lv_timer_t *g_control_confirm_timer = NULL;
 
-/* 右侧数据面板值标签 */
-static lv_obj_t *g_main_data_vals[8] = {NULL};  /* EC1/PH1/EC2/PH2 + 流量/压力等 */
+/* 右侧运行态摘要值标签 */
+static lv_obj_t *g_main_data_vals[9] = {NULL};  /* 主管道阀门/流量/压力 + N/P/K罐开关与液位 */
+static lv_obj_t *g_main_pipe_labels[6] = {NULL}; /* 副管道1~6摘要 */
 
 /* 阀门控制视图标签 */
 static lv_obj_t *g_valve_total_label = NULL;
@@ -48,17 +117,54 @@ static lv_obj_t *g_valve_container = NULL;
 
 /* 灌区控制视图标签 */
 static lv_obj_t *g_zone_container = NULL;
+static lv_obj_t *g_zone_field_info_labels[6] = {NULL};
+static lv_obj_t *g_zone_field_switches[6] = {NULL};
+static lv_obj_t *g_tank_info_labels[3] = {NULL};
+static lv_obj_t *g_tank_switches[3] = {NULL};
 
 /* 传感监测视图标签 */
 static lv_obj_t *g_sensor_container = NULL;
+static lv_obj_t *g_sensor_field_labels[6][6] = {{NULL}};
+static lv_obj_t *g_sensor_pipe_labels[7] = {NULL};
+
+/* 运行时缓存 */
+typedef struct {
+    bool valid;
+    uint8_t registered_mask;
+    float n;
+    float p;
+    float k;
+    float temp;
+    float humi;
+    float light;
+} device_field_cache_t;
+
+typedef struct {
+    bool valid;
+    bool valve_bound;
+    bool valve_on;
+    bool flow_bound;
+    float flow;
+    bool pressure_bound;
+    float pressure;
+} device_pipe_cache_t;
+
+typedef struct {
+    bool valid;
+    bool switch_on;
+    bool level_bound;
+    float level;
+} device_tank_cache_t;
+
+static device_field_cache_t s_field_cache[6] = {0};
+static device_pipe_cache_t s_pipe_cache[7] = {0};
+static device_tank_cache_t s_tank_cache[3] = {0};
+static bool g_syncing_switch_state = false;
 
 /* 确认对话框 */
 static lv_obj_t *g_device_dialog = NULL;
-static uint8_t g_pending_dev_type = 0;
-static uint8_t g_pending_dev_id = 0;
+static uint32_t g_pending_point_id = 0;
 static bool g_pending_on = false;
-static int g_pending_label_type = 0;  /* 0=设备卡片, 1=阀门卡片 */
-static int g_pending_label_idx = 0;
 
 /* 设备开关状态 */
 static bool g_dev_states[5] = {false, false, false, false, false};
@@ -68,47 +174,327 @@ static bool g_valve_states[7] = {false, false, false, false, false, false, false
 static lv_obj_t *g_valve_status_labels[7] = {NULL};
 static lv_obj_t *g_valve_btns[7] = {NULL};       /* 阀门开关按钮 */
 static lv_obj_t *g_valve_btn_labels[7] = {NULL};  /* 按钮上的文字 */
+static lv_obj_t *g_valve_dynamic_state_labels[UI_DEVICE_MAX_VALVE_ROWS] = {NULL};
+static lv_obj_t *g_valve_dynamic_flow_labels[UI_DEVICE_MAX_VALVE_ROWS] = {NULL};
+static lv_obj_t *g_valve_dynamic_pressure_labels[UI_DEVICE_MAX_VALVE_ROWS] = {NULL};
+static lv_obj_t *g_valve_dynamic_btns[UI_DEVICE_MAX_VALVE_ROWS] = {NULL};
+static lv_obj_t *g_valve_dynamic_btn_labels[UI_DEVICE_MAX_VALVE_ROWS] = {NULL};
+static uint32_t  g_valve_dynamic_point_ids[UI_DEVICE_MAX_VALVE_ROWS] = {0};
+static int       g_valve_dynamic_count = 0;
+static device_confirm_state_t g_valve_confirm_states[UI_DEVICE_MAX_VALVE_ROWS] = {DEV_CONFIRM_IDLE};
+static bool      g_valve_confirm_targets[UI_DEVICE_MAX_VALVE_ROWS] = {false};
+static uint32_t  g_valve_confirm_deadlines[UI_DEVICE_MAX_VALVE_ROWS] = {0};
 
-/* 设备名称/ID 映射 */
-static const uint8_t s_dev_id_map[5] = {2, 3, 4, 5, 1};
+/* 设备名称/业务点编号映射 */
+static const uint32_t s_dev_point_id_map[5] = {300001U, 300002U, 300003U, 300004U, 300005U};
 static const char *s_dev_name_map[5] = {"主水泵", "施肥泵", "出肥阀", "注水阀", "搅拌机"};
 
-/* 前向声明 */
-static void create_main_control_view(lv_obj_t *parent);
-static void create_valve_control_view(lv_obj_t *parent);
-static void create_zone_control_view(lv_obj_t *parent);
-static void create_sensor_monitor_view(lv_obj_t *parent);
-static void switch_to_tab(int tab_index);
+static const char *sensor_type_name(uint8_t type)
+{
+    switch (type) {
+    case 0: return "氮";
+    case 1: return "磷";
+    case 2: return "钾";
+    case 3: return "温度";
+    case 4: return "湿度";
+    case 5: return "光照";
+    case 6: return "流量";
+    case 7: return "压力";
+    case 8: return "液位";
+    case 9: return "阀门状态";
+    case 10: return "开关状态";
+    default: return "未知";
+    }
+}
 
-/**********************
- *   GLOBAL FUNCTIONS
- **********************/
+static int point_id_to_pipe_index(uint32_t point_id)
+{
+    uint32_t node_id = point_id / 100U;
+    uint32_t point_no = point_id % 100U;
 
-/**
- * @brief 创建设备控制页面
- */
+    if (node_id < 2000U || node_id > 2006U) {
+        return -1;
+    }
+    if (point_no != 1U && point_no != 2U && point_no != 3U && point_no != 11U) {
+        return -1;
+    }
+    return (int)(node_id - 2000U);
+}
+
+static uint32_t valve_channel_to_point_id(uint8_t channel)
+{
+    if (channel == 0U || channel > 6U) {
+        return 0;
+    }
+    return (2000U + (uint32_t)channel) * 100U + 1U;
+}
+
+static uint32_t valve_index_to_point_id(int valve_idx)
+{
+    if (valve_idx < 0 || valve_idx > 6) {
+        return 0;
+    }
+    return (2000U + (uint32_t)valve_idx) * 100U + 1U;
+}
+
+static const char *zone_switch_title_for_point(uint32_t point_id, char *buf, size_t buf_size)
+{
+    if (point_id >= 300006U && point_id <= 300008U) {
+        static const char *tank_names[] = {"储料罐N", "储料罐P", "储料罐K"};
+        return tank_names[point_id - 300006U];
+    }
+
+    if (point_id >= 200001U && point_id <= 200601U && (point_id % 100U) == 1U) {
+        int pipe_idx = point_id_to_pipe_index(point_id);
+        if (pipe_idx == 0) {
+            return "主管道阀";
+        }
+        if (pipe_idx > 0) {
+            snprintf(buf, buf_size, "副管道%d阀", pipe_idx);
+            return buf;
+        }
+    }
+
+    snprintf(buf, buf_size, "点位%lu", (unsigned long)point_id);
+    return buf;
+}
+
+static bool format_runtime_point_value(uint32_t point_id, char *buf, size_t buf_size)
+{
+    uint32_t node_id = point_id / 100U;
+    uint32_t point_no = point_id % 100U;
+
+    if (node_id >= 1001U && node_id <= 1006U) {
+        const device_field_cache_t *field = &s_field_cache[node_id - 1001U];
+        int bit_index = -1;
+        float value = 0.0f;
+
+        switch (point_no) {
+        case 1: bit_index = 0; value = field->n; break;
+        case 2: bit_index = 1; value = field->p; break;
+        case 3: bit_index = 2; value = field->k; break;
+        case 4: bit_index = 3; value = field->temp; break;
+        case 5: bit_index = 4; value = field->humi; break;
+        case 6: bit_index = 5; value = field->light; break;
+        default: return false;
+        }
+
+        if (!field->valid || !(field->registered_mask & (1U << bit_index))) {
+            return false;
+        }
+        snprintf(buf, buf_size, "%.1f", value);
+        return true;
+    }
+
+    if (node_id >= 2000U && node_id <= 2006U) {
+        const device_pipe_cache_t *pipe = &s_pipe_cache[node_id - 2000U];
+        switch (point_no) {
+        case 1:
+        case 11:
+            if (!pipe->valid || !pipe->valve_bound) {
+                return false;
+            }
+            snprintf(buf, buf_size, "%s", pipe->valve_on ? "开启" : "关闭");
+            return true;
+        case 2:
+            if (!pipe->valid || !pipe->flow_bound) {
+                return false;
+            }
+            snprintf(buf, buf_size, "%.2f", pipe->flow);
+            return true;
+        case 3:
+            if (!pipe->valid || !pipe->pressure_bound) {
+                return false;
+            }
+            snprintf(buf, buf_size, "%.2f", pipe->pressure);
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (node_id == 3000U) {
+        if (point_no >= 11U && point_no <= 15U) {
+            int dev_idx = (int)(point_no - 11U);
+            snprintf(buf, buf_size, "%s", g_dev_states[dev_idx] ? "开启" : "关闭");
+            return true;
+        }
+        if (point_no >= 16U && point_no <= 18U) {
+            const device_tank_cache_t *tank = &s_tank_cache[point_no - 16U];
+            if (!tank->valid) {
+                return false;
+            }
+            snprintf(buf, buf_size, "%s", tank->switch_on ? "开启" : "关闭");
+            return true;
+        }
+        if (point_no >= 6U && point_no <= 8U) {
+            const device_tank_cache_t *tank = &s_tank_cache[point_no - 6U];
+            if (!tank->valid) {
+                return false;
+            }
+            snprintf(buf, buf_size, "%s", tank->switch_on ? "开启" : "关闭");
+            return true;
+        }
+        if (point_no >= 21U && point_no <= 23U) {
+            const device_tank_cache_t *tank = &s_tank_cache[point_no - 21U];
+            if (!tank->valid || !tank->level_bound) {
+                return false;
+            }
+            snprintf(buf, buf_size, "%.1f", tank->level);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void refresh_dynamic_valve_items(void)
+{
+    for (int i = 0; i < g_valve_dynamic_count; i++) {
+        uint32_t point_id = g_valve_dynamic_point_ids[i];
+        int pipe_idx = point_id_to_pipe_index(point_id);
+        const device_pipe_cache_t *pipe;
+        char buf[96];
+        const char *state_text;
+        const char *flow_text = "---";
+        const char *pressure_text = "---";
+        const char *btn_text;
+        lv_color_t btn_color;
+        char flow_buf[24];
+        char pressure_buf[24];
+        bool is_on;
+
+        if (pipe_idx < 0) {
+            continue;
+        }
+
+        pipe = &s_pipe_cache[pipe_idx];
+        is_on = pipe->valid && pipe->valve_on;
+        g_valve_states[pipe_idx] = is_on;
+
+        if (pipe->valid && pipe->flow_bound) {
+            snprintf(flow_buf, sizeof(flow_buf), "%.2f", pipe->flow);
+            flow_text = flow_buf;
+        }
+        if (pipe->valid && pipe->pressure_bound) {
+            snprintf(pressure_buf, sizeof(pressure_buf), "%.2f", pipe->pressure);
+            pressure_text = pressure_buf;
+        }
+
+        state_text = is_on ? "开启" : "关闭";
+        btn_text = is_on ? "关闭" : "开启";
+        btn_color = is_on ? lv_color_hex(0xE53935) : lv_color_hex(0x4CAF50);
+
+        if (g_valve_confirm_states[i] == DEV_CONFIRM_PENDING) {
+            state_text = "执行中...";
+        } else if (g_valve_confirm_states[i] == DEV_CONFIRM_TIMEOUT) {
+            state_text = "未确认";
+        }
+
+        if (g_valve_dynamic_state_labels[i]) {
+            lv_label_set_text(g_valve_dynamic_state_labels[i], state_text);
+        }
+        if (g_valve_dynamic_flow_labels[i]) {
+            lv_label_set_text_fmt(g_valve_dynamic_flow_labels[i], "流量:%s", flow_text);
+        }
+        if (g_valve_dynamic_pressure_labels[i]) {
+            lv_label_set_text_fmt(g_valve_dynamic_pressure_labels[i], "压力:%s", pressure_text);
+        }
+
+        if (g_valve_dynamic_btns[i]) {
+            lv_obj_set_style_bg_color(g_valve_dynamic_btns[i], btn_color, 0);
+        }
+        if (g_valve_dynamic_btn_labels[i]) {
+            lv_label_set_text(g_valve_dynamic_btn_labels[i], btn_text);
+        }
+    }
+}
+
+static void refresh_dynamic_zone_switches(void)
+{
+    char info_buf[192];
+    char name_buf[32];
+
+    for (int i = 0; i < g_zone_dynamic_switch_count; i++) {
+        uint32_t point_id = g_zone_dynamic_point_ids[i];
+        lv_obj_t *sw = g_zone_dynamic_switches[i];
+        bool checked = false;
+
+        if (!sw) {
+            continue;
+        }
+
+        if (point_id >= 300006U && point_id <= 300008U) {
+            const device_tank_cache_t *tank = &s_tank_cache[point_id - 300006U];
+            checked = tank->valid && tank->switch_on;
+        } else {
+            int pipe_idx = point_id_to_pipe_index(point_id);
+            if (pipe_idx >= 0) {
+                const device_pipe_cache_t *pipe = &s_pipe_cache[pipe_idx];
+                checked = pipe->valid && pipe->valve_bound && pipe->valve_on;
+            }
+        }
+
+        if (g_zone_confirm_states[i] == DEV_CONFIRM_PENDING ||
+            g_zone_confirm_states[i] == DEV_CONFIRM_TIMEOUT) {
+            checked = g_zone_confirm_targets[i];
+        }
+
+        set_switch_checked(sw, checked);
+    }
+
+    for (int i = 0; i < g_zone_dynamic_switch_count; i++) {
+        if (!g_zone_dynamic_info_labels[i]) {
+            continue;
+        }
+
+        if (g_zone_confirm_states[i] == DEV_CONFIRM_PENDING) {
+            lv_label_set_text(g_zone_dynamic_info_labels[i], "执行中...");
+            continue;
+        }
+        if (g_zone_confirm_states[i] == DEV_CONFIRM_TIMEOUT) {
+            lv_label_set_text(g_zone_dynamic_info_labels[i], "未确认");
+            continue;
+        }
+
+        if (format_runtime_point_value(g_zone_dynamic_point_ids[i], info_buf, sizeof(info_buf))) {
+            lv_label_set_text(g_zone_dynamic_info_labels[i], info_buf);
+            continue;
+        }
+
+        zone_switch_title_for_point(g_zone_dynamic_point_ids[i], name_buf, sizeof(name_buf));
+        lv_label_set_text_fmt(g_zone_dynamic_info_labels[i], "%s: ---", name_buf);
+    }
+}
+
+static void refresh_dynamic_sensor_items(void)
+{
+    char value_buf[32];
+
+    for (int i = 0; i < g_sensor_dynamic_item_count; i++) {
+        if (!g_sensor_dynamic_value_labels[i]) {
+            continue;
+        }
+        if (format_runtime_point_value(g_sensor_dynamic_point_ids[i], value_buf, sizeof(value_buf))) {
+            lv_label_set_text(g_sensor_dynamic_value_labels[i], value_buf);
+        } else {
+            lv_label_set_text(g_sensor_dynamic_value_labels[i], "---");
+        }
+    }
+}
+
+
 void ui_device_create(lv_obj_t *parent)
 {
-    /* 重置静态指针（旧对象已被 ui_switch_nav 中的 lv_obj_clean 销毁） */
-    g_left_panel = NULL;
-    g_right_panel = NULL;
-    g_view_container = NULL;
-    for (int i = 0; i < 4; i++) g_tab_buttons[i] = NULL;
-    for (int i = 0; i < 5; i++) g_dev_status_labels[i] = NULL;
-    for (int i = 0; i < 8; i++) g_main_data_vals[i] = NULL;
-    g_valve_total_label = NULL;
-    g_valve_open_label = NULL;
-    g_valve_container = NULL;
-    g_zone_container = NULL;
-    g_sensor_container = NULL;
+    clear_view_object_refs();
     g_active_tab = 0;
-    for (int i = 0; i < 7; i++) g_valve_status_labels[i] = NULL;
-    if (g_device_dialog) { lv_obj_del(g_device_dialog); g_device_dialog = NULL; }
+    if (g_device_dialog) {
+        lv_obj_del(g_device_dialog);
+        g_device_dialog = NULL;
+    }
 
-    /* 顶部标签页按钮 */
     create_tab_buttons(parent);
 
-    /* 创建主容器 - 用于懒加载不同的视图 */
     g_view_container = lv_obj_create(parent);
     lv_obj_set_size(g_view_container, 1168, 660);
     lv_obj_set_pos(g_view_container, 5, 70);
@@ -117,13 +503,509 @@ void ui_device_create(lv_obj_t *parent)
     lv_obj_set_style_pad_all(g_view_container, 0, 0);
     lv_obj_clear_flag(g_view_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 懒加载：只创建默认视图（主机控制） */
     create_main_control_view(g_view_container);
 }
 
-/**********************
- *   STATIC FUNCTIONS
- **********************/
+static void clear_view_object_refs(void)
+{
+    g_left_panel = NULL;
+    g_right_panel = NULL;
+    g_valve_total_label = NULL;
+    g_valve_open_label = NULL;
+    g_valve_container = NULL;
+    g_zone_container = NULL;
+    g_sensor_container = NULL;
+    for (int i = 0; i < 5; i++) {
+        g_dev_status_labels[i] = NULL;
+        g_dev_confirm_states[i] = DEV_CONFIRM_IDLE;
+        g_dev_confirm_targets[i] = false;
+        g_dev_confirm_deadlines[i] = 0;
+    }
+    for (int i = 0; i < 9; i++) {
+        g_main_data_vals[i] = NULL;
+    }
+    for (int i = 0; i < 6; i++) {
+        g_main_pipe_labels[i] = NULL;
+    }
+    for (int i = 0; i < UI_DEVICE_MAX_ZONE_SWITCHES; i++) {
+        g_zone_dynamic_info_labels[i] = NULL;
+        g_zone_dynamic_switches[i] = NULL;
+        g_zone_dynamic_point_ids[i] = 0;
+        g_zone_confirm_states[i] = DEV_CONFIRM_IDLE;
+        g_zone_confirm_targets[i] = false;
+        g_zone_confirm_deadlines[i] = 0;
+    }
+    g_zone_dynamic_switch_count = 0;
+    for (int i = 0; i < UI_DEVICE_MAX_SENSOR_ITEMS; i++) {
+        g_sensor_dynamic_value_labels[i] = NULL;
+        g_sensor_dynamic_point_ids[i] = 0;
+    }
+    g_sensor_dynamic_item_count = 0;
+    for (int i = 0; i < 7; i++) {
+        g_valve_status_labels[i] = NULL;
+        g_valve_btns[i] = NULL;
+        g_valve_btn_labels[i] = NULL;
+        g_sensor_pipe_labels[i] = NULL;
+    }
+    for (int i = 0; i < UI_DEVICE_MAX_VALVE_ROWS; i++) {
+        g_valve_dynamic_state_labels[i] = NULL;
+        g_valve_dynamic_flow_labels[i] = NULL;
+        g_valve_dynamic_pressure_labels[i] = NULL;
+        g_valve_dynamic_btns[i] = NULL;
+        g_valve_dynamic_btn_labels[i] = NULL;
+        g_valve_dynamic_point_ids[i] = 0;
+        g_valve_confirm_states[i] = DEV_CONFIRM_IDLE;
+        g_valve_confirm_targets[i] = false;
+        g_valve_confirm_deadlines[i] = 0;
+    }
+    g_valve_dynamic_count = 0;
+    for (int i = 0; i < 6; i++) {
+        g_zone_field_info_labels[i] = NULL;
+        g_zone_field_switches[i] = NULL;
+        for (int j = 0; j < 6; j++) {
+            g_sensor_field_labels[i][j] = NULL;
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        g_tank_info_labels[i] = NULL;
+        g_tank_switches[i] = NULL;
+    }
+
+    g_pending_point_id = 0;
+    g_pending_on = false;
+
+    if (g_control_confirm_timer) {
+        lv_timer_del(g_control_confirm_timer);
+        g_control_confirm_timer = NULL;
+    }
+}
+
+
+static void start_control_confirm(uint32_t point_id, bool target_on)
+{
+    if (point_id >= 300001U && point_id <= 300005U) {
+        int idx = (int)(point_id - 300001U);
+        if (idx >= 0 && idx < 5) {
+            g_dev_confirm_states[idx] = DEV_CONFIRM_PENDING;
+            g_dev_confirm_targets[idx] = target_on;
+            g_dev_confirm_deadlines[idx] = lv_tick_get() + UI_DEVICE_CONTROL_CONFIRM_TIMEOUT_MS;
+        }
+    }
+
+    for (int i = 0; i < g_valve_dynamic_count; i++) {
+        if (g_valve_dynamic_point_ids[i] != point_id) {
+            continue;
+        }
+        g_valve_confirm_states[i] = DEV_CONFIRM_PENDING;
+        g_valve_confirm_targets[i] = target_on;
+        g_valve_confirm_deadlines[i] = lv_tick_get() + UI_DEVICE_CONTROL_CONFIRM_TIMEOUT_MS;
+    }
+
+    for (int i = 0; i < g_zone_dynamic_switch_count; i++) {
+        if (g_zone_dynamic_point_ids[i] != point_id) {
+            continue;
+        }
+        g_zone_confirm_states[i] = DEV_CONFIRM_PENDING;
+        g_zone_confirm_targets[i] = target_on;
+        g_zone_confirm_deadlines[i] = lv_tick_get() + UI_DEVICE_CONTROL_CONFIRM_TIMEOUT_MS;
+        if (g_zone_dynamic_switches[i]) {
+            set_switch_checked(g_zone_dynamic_switches[i], target_on);
+        }
+    }
+
+    if (!g_control_confirm_timer) {
+        g_control_confirm_timer = lv_timer_create(control_confirm_timer_cb,
+            UI_DEVICE_CONTROL_CONFIRM_TIMER_MS, NULL);
+    }
+
+    refresh_control_cards();
+    refresh_dynamic_valve_items();
+    refresh_dynamic_zone_switches();
+}
+
+static void resolve_control_confirm(uint32_t point_id, bool actual_on)
+{
+    if (point_id >= 300001U && point_id <= 300005U) {
+        int idx = (int)(point_id - 300001U);
+        if (idx >= 0 && idx < 5 &&
+            (g_dev_confirm_states[idx] == DEV_CONFIRM_PENDING ||
+             g_dev_confirm_states[idx] == DEV_CONFIRM_TIMEOUT) &&
+            g_dev_confirm_targets[idx] == actual_on) {
+            g_dev_confirm_states[idx] = DEV_CONFIRM_IDLE;
+        }
+    }
+
+    for (int i = 0; i < g_valve_dynamic_count; i++) {
+        if (g_valve_dynamic_point_ids[i] != point_id) {
+            continue;
+        }
+        if ((g_valve_confirm_states[i] == DEV_CONFIRM_PENDING ||
+             g_valve_confirm_states[i] == DEV_CONFIRM_TIMEOUT) &&
+            g_valve_confirm_targets[i] == actual_on) {
+            g_valve_confirm_states[i] = DEV_CONFIRM_IDLE;
+        }
+    }
+
+    for (int i = 0; i < g_zone_dynamic_switch_count; i++) {
+        if (g_zone_dynamic_point_ids[i] != point_id) {
+            continue;
+        }
+        if ((g_zone_confirm_states[i] == DEV_CONFIRM_PENDING ||
+             g_zone_confirm_states[i] == DEV_CONFIRM_TIMEOUT) &&
+            g_zone_confirm_targets[i] == actual_on) {
+            g_zone_confirm_states[i] = DEV_CONFIRM_IDLE;
+        }
+    }
+}
+
+static void set_switch_checked(lv_obj_t *sw, bool checked)
+{
+    if (!sw) {
+        return;
+    }
+
+    g_syncing_switch_state = true;
+    if (checked) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_remove_state(sw, LV_STATE_CHECKED);
+    }
+    g_syncing_switch_state = false;
+}
+
+static void refresh_control_cards(void)
+{
+    for (int i = 0; i < 5; i++) {
+        if (g_dev_status_labels[i]) {
+            const char *text = g_dev_states[i] ? "开启" : "关闭";
+            if (g_dev_confirm_states[i] == DEV_CONFIRM_PENDING) {
+                text = "执行中...";
+            } else if (g_dev_confirm_states[i] == DEV_CONFIRM_TIMEOUT) {
+                text = "未确认";
+            }
+            lv_label_set_text(g_dev_status_labels[i], text);
+        }
+    }
+}
+
+static void control_confirm_timer_cb(lv_timer_t *timer)
+{
+    bool has_pending = false;
+    uint32_t now = lv_tick_get();
+
+    (void)timer;
+
+    for (int i = 0; i < 5; i++) {
+        if (g_dev_confirm_states[i] != DEV_CONFIRM_PENDING) {
+            continue;
+        }
+        if ((int32_t)(now - g_dev_confirm_deadlines[i]) >= 0) {
+            g_dev_confirm_states[i] = DEV_CONFIRM_TIMEOUT;
+        } else {
+            has_pending = true;
+        }
+    }
+
+    for (int i = 0; i < g_valve_dynamic_count; i++) {
+        if (g_valve_confirm_states[i] != DEV_CONFIRM_PENDING) {
+            continue;
+        }
+        if ((int32_t)(now - g_valve_confirm_deadlines[i]) >= 0) {
+            g_valve_confirm_states[i] = DEV_CONFIRM_TIMEOUT;
+        } else {
+            has_pending = true;
+        }
+    }
+
+    for (int i = 0; i < g_zone_dynamic_switch_count; i++) {
+        if (g_zone_confirm_states[i] != DEV_CONFIRM_PENDING) {
+            continue;
+        }
+        if ((int32_t)(now - g_zone_confirm_deadlines[i]) >= 0) {
+            g_zone_confirm_states[i] = DEV_CONFIRM_TIMEOUT;
+        } else {
+            has_pending = true;
+        }
+    }
+
+    refresh_control_cards();
+    refresh_dynamic_valve_items();
+    refresh_dynamic_zone_switches();
+
+    if (!has_pending && g_control_confirm_timer) {
+        lv_timer_del(g_control_confirm_timer);
+        g_control_confirm_timer = NULL;
+    }
+}
+
+static void refresh_main_data_panel(void)
+{
+    static const char *unknown = "---";
+    const device_pipe_cache_t *main_pipe = &s_pipe_cache[0];
+    char buf[32];
+
+    if (!g_main_data_vals[0] || !g_main_data_vals[1] || !g_main_data_vals[2] ||
+        !g_main_data_vals[3] || !g_main_data_vals[4] || !g_main_data_vals[5] ||
+        !g_main_data_vals[6] || !g_main_data_vals[7] || !g_main_data_vals[8]) {
+        return;
+    }
+
+    lv_label_set_text(g_main_data_vals[0],
+        (main_pipe->valid && main_pipe->valve_bound) ? (main_pipe->valve_on ? "开启" : "关闭") : unknown);
+
+    if (main_pipe->valid && main_pipe->flow_bound) {
+        snprintf(buf, sizeof(buf), "%.2f", main_pipe->flow);
+        lv_label_set_text(g_main_data_vals[1], buf);
+    } else {
+        lv_label_set_text(g_main_data_vals[1], unknown);
+    }
+
+    if (main_pipe->valid && main_pipe->pressure_bound) {
+        snprintf(buf, sizeof(buf), "%.2f", main_pipe->pressure);
+        lv_label_set_text(g_main_data_vals[2], buf);
+    } else {
+        lv_label_set_text(g_main_data_vals[2], unknown);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        const device_tank_cache_t *tank = &s_tank_cache[i];
+        int state_idx = 3 + i * 2;
+        int level_idx = state_idx + 1;
+
+        lv_label_set_text(g_main_data_vals[state_idx],
+            (tank->valid) ? (tank->switch_on ? "开启" : "关闭") : unknown);
+
+        if (tank->valid && tank->level_bound) {
+            snprintf(buf, sizeof(buf), "%.1f", tank->level);
+            lv_label_set_text(g_main_data_vals[level_idx], buf);
+        } else {
+            lv_label_set_text(g_main_data_vals[level_idx], unknown);
+        }
+    }
+
+    for (int i = 0; i < 6; i++) {
+        device_pipe_cache_t *pipe = &s_pipe_cache[i + 1];
+        const char *flow_text = unknown;
+        const char *pressure_text = unknown;
+        char flow_buf[24];
+        char pressure_buf[24];
+        char summary[96];
+
+        if (!g_main_pipe_labels[i]) {
+            continue;
+        }
+
+        if (pipe->valid && pipe->flow_bound) {
+            snprintf(flow_buf, sizeof(flow_buf), "%.2f", pipe->flow);
+            flow_text = flow_buf;
+        }
+        if (pipe->valid && pipe->pressure_bound) {
+            snprintf(pressure_buf, sizeof(pressure_buf), "%.2f", pipe->pressure);
+            pressure_text = pressure_buf;
+        }
+
+        snprintf(summary, sizeof(summary), "阀:%s  流:%s  压:%s",
+                 (pipe->valid && pipe->valve_bound) ? (pipe->valve_on ? "开" : "关") : unknown,
+                 flow_text,
+                 pressure_text);
+        lv_label_set_text(g_main_pipe_labels[i], summary);
+    }
+}
+
+static void refresh_valve_card(int valve_idx)
+{
+    char buf[96];
+    device_pipe_cache_t *pipe;
+
+    if (valve_idx < 0 || valve_idx >= 7) {
+        return;
+    }
+
+    pipe = &s_pipe_cache[valve_idx];
+    g_valve_states[valve_idx] = pipe->valid && pipe->valve_on;
+
+    if (g_valve_status_labels[valve_idx]) {
+        const char *flow_text = "---";
+        const char *pressure_text = "---";
+        char flow_buf[24];
+        char pressure_buf[24];
+
+        if (pipe->valid && pipe->flow_bound) {
+            snprintf(flow_buf, sizeof(flow_buf), "%.2f", pipe->flow);
+            flow_text = flow_buf;
+        }
+        if (pipe->valid && pipe->pressure_bound) {
+            snprintf(pressure_buf, sizeof(pressure_buf), "%.2f", pipe->pressure);
+            pressure_text = pressure_buf;
+        }
+
+        snprintf(buf, sizeof(buf), "%s  流量:%s  压力:%s",
+                 g_valve_states[valve_idx] ? "开启" : "关闭",
+                 flow_text,
+                 pressure_text);
+        lv_label_set_text(g_valve_status_labels[valve_idx], buf);
+    }
+
+    if (g_valve_btns[valve_idx]) {
+        lv_obj_set_style_bg_color(g_valve_btns[valve_idx],
+                                  g_valve_states[valve_idx] ? lv_color_hex(0xE53935) : lv_color_hex(0x4CAF50), 0);
+    }
+    if (g_valve_btn_labels[valve_idx]) {
+        lv_label_set_text(g_valve_btn_labels[valve_idx], g_valve_states[valve_idx] ? "关闭" : "开启");
+    }
+}
+
+static void refresh_zone_field_card(int field_idx)
+{
+    static const char *unknown = "---";
+    device_field_cache_t *field;
+    char n_buf[16], p_buf[16], k_buf[16], t_buf[16], h_buf[16], l_buf[16];
+    const char *n_text = unknown;
+    const char *p_text = unknown;
+    const char *k_text = unknown;
+    const char *t_text = unknown;
+    const char *h_text = unknown;
+    const char *l_text = unknown;
+    bool valve_on;
+
+    if (field_idx < 0 || field_idx >= 6) {
+        return;
+    }
+
+    field = &s_field_cache[field_idx];
+    valve_on = s_pipe_cache[field_idx + 1].valid && s_pipe_cache[field_idx + 1].valve_bound && s_pipe_cache[field_idx + 1].valve_on;
+
+    if (field->valid && (field->registered_mask & (1U << 0))) {
+        snprintf(n_buf, sizeof(n_buf), "%.1f", field->n);
+        n_text = n_buf;
+    }
+    if (field->valid && (field->registered_mask & (1U << 1))) {
+        snprintf(p_buf, sizeof(p_buf), "%.1f", field->p);
+        p_text = p_buf;
+    }
+    if (field->valid && (field->registered_mask & (1U << 2))) {
+        snprintf(k_buf, sizeof(k_buf), "%.1f", field->k);
+        k_text = k_buf;
+    }
+    if (field->valid && (field->registered_mask & (1U << 3))) {
+        snprintf(t_buf, sizeof(t_buf), "%.1f", field->temp);
+        t_text = t_buf;
+    }
+    if (field->valid && (field->registered_mask & (1U << 4))) {
+        snprintf(h_buf, sizeof(h_buf), "%.1f", field->humi);
+        h_text = h_buf;
+    }
+    if (field->valid && (field->registered_mask & (1U << 5))) {
+        snprintf(l_buf, sizeof(l_buf), "%.1f", field->light);
+        l_text = l_buf;
+    }
+
+    if (g_zone_field_info_labels[field_idx]) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "N:%s P:%s K:%s\n温:%s 湿:%s 光:%s",
+                 n_text, p_text, k_text, t_text, h_text, l_text);
+        lv_label_set_text(g_zone_field_info_labels[field_idx], buf);
+    }
+    if (g_zone_field_switches[field_idx]) {
+        set_switch_checked(g_zone_field_switches[field_idx], valve_on);
+    }
+}
+
+static void refresh_tank_card(int tank_idx)
+{
+    device_tank_cache_t *tank;
+    const char *level_text = "---";
+    char level_buf[24];
+    char buf[64];
+
+    if (tank_idx < 0 || tank_idx >= 3) {
+        return;
+    }
+
+    tank = &s_tank_cache[tank_idx];
+    if (tank->valid && tank->level_bound) {
+        snprintf(level_buf, sizeof(level_buf), "%.1f", tank->level);
+        level_text = level_buf;
+    }
+
+    if (g_tank_info_labels[tank_idx]) {
+        snprintf(buf, sizeof(buf), "液位: %sL  状态: %s",
+                 level_text,
+                 (tank->valid && tank->switch_on) ? "开启" : "关闭");
+        lv_label_set_text(g_tank_info_labels[tank_idx], buf);
+    }
+    if (g_tank_switches[tank_idx]) {
+        set_switch_checked(g_tank_switches[tank_idx], tank->valid && tank->switch_on);
+    }
+}
+
+static void refresh_sensor_field_card(int field_idx)
+{
+    static const char *sensor_labels[] = {"N", "P", "K", "温", "湿", "光"};
+    static const char *unknown = "---";
+    const float values[6] = {
+        s_field_cache[field_idx].n,
+        s_field_cache[field_idx].p,
+        s_field_cache[field_idx].k,
+        s_field_cache[field_idx].temp,
+        s_field_cache[field_idx].humi,
+        s_field_cache[field_idx].light,
+    };
+    for (int i = 0; i < 6; i++) {
+        char buf[32];
+        const char *value_text = unknown;
+        char value_buf[16];
+
+        if (!g_sensor_field_labels[field_idx][i]) {
+            continue;
+        }
+        if (s_field_cache[field_idx].valid && (s_field_cache[field_idx].registered_mask & (1U << i))) {
+            snprintf(value_buf, sizeof(value_buf), "%.1f", values[i]);
+            value_text = value_buf;
+        }
+        snprintf(buf, sizeof(buf), "%s:%s", sensor_labels[i], value_text);
+        lv_label_set_text(g_sensor_field_labels[field_idx][i], buf);
+    }
+}
+
+static void refresh_sensor_pipe_label(int pipe_idx)
+{
+    device_pipe_cache_t *pipe;
+    const char *prefix;
+    const char *flow_text = "---";
+    const char *pressure_text = "---";
+    char buf[96];
+    char flow_buf[24];
+    char pressure_buf[24];
+
+    if (pipe_idx < 0 || pipe_idx >= 7 || !g_sensor_pipe_labels[pipe_idx]) {
+        return;
+    }
+
+    pipe = &s_pipe_cache[pipe_idx];
+    prefix = (pipe_idx == 0) ? "主" :
+             (pipe_idx == 1) ? "P1" :
+             (pipe_idx == 2) ? "P2" :
+             (pipe_idx == 3) ? "P3" :
+             (pipe_idx == 4) ? "P4" :
+             (pipe_idx == 5) ? "P5" : "P6";
+
+    if (pipe->valid && pipe->flow_bound) {
+        snprintf(flow_buf, sizeof(flow_buf), "%.2f", pipe->flow);
+        flow_text = flow_buf;
+    }
+    if (pipe->valid && pipe->pressure_bound) {
+        snprintf(pressure_buf, sizeof(pressure_buf), "%.2f", pipe->pressure);
+        pressure_text = pressure_buf;
+    }
+
+    snprintf(buf, sizeof(buf), "%s:阀%s 流%s 压%s",
+             prefix,
+             (pipe->valid && pipe->valve_bound) ? (pipe->valve_on ? "开" : "关") : "---",
+             flow_text,
+             pressure_text);
+    lv_label_set_text(g_sensor_pipe_labels[pipe_idx], buf);
+}
 
 /**
  * @brief 创建顶部标签页按钮
@@ -189,10 +1071,10 @@ static void create_control_panel(lv_obj_t *parent)
     create_device_card(parent, "主水泵", 0, 0, true);
     create_device_card(parent, "施肥泵", 150, 0, true);
 
-    /* 第二行：1号出肥阀 + 1号注水阀 + 1号搅拌机 */
-    create_device_card(parent, "1号出肥阀", 0, 75, false);
-    create_device_card(parent, "1号注水阀", 150, 75, false);
-    create_device_card(parent, "1号搅拌机", 300, 75, false);
+    /* 第二行：出肥阀 + 注水阀 + 搅拌机 */
+    create_device_card(parent, "出肥阀", 0, 75, false);
+    create_device_card(parent, "注水阀", 150, 75, false);
+    create_device_card(parent, "搅拌机", 300, 75, false);
 }
 
 /**
@@ -204,11 +1086,8 @@ static void device_card_click_cb(lv_event_t *e)
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= 5) return;
 
-    g_pending_dev_type = 0x04;
-    g_pending_dev_id = s_dev_id_map[idx];
+    g_pending_point_id = s_dev_point_id_map[idx];
     g_pending_on = !g_dev_states[idx];
-    g_pending_label_type = 0;
-    g_pending_label_idx = idx;
 
     show_device_confirm_dialog(s_dev_name_map[idx], g_pending_on);
 }
@@ -225,11 +1104,8 @@ static void valve_btn_cb(lv_event_t *e)
     static const char *valve_names[] = {"主管道阀", "副管道1阀", "副管道2阀", "副管道3阀",
                                          "副管道4阀", "副管道5阀", "副管道6阀"};
 
-    g_pending_dev_type = 0x02;
-    g_pending_dev_id = (uint8_t)valve_idx;
+    g_pending_point_id = valve_index_to_point_id(valve_idx);
     g_pending_on = !g_valve_states[valve_idx];
-    g_pending_label_type = 1;
-    g_pending_label_idx = valve_idx;
 
     show_device_confirm_dialog(valve_names[valve_idx], g_pending_on);
 }
@@ -302,120 +1178,92 @@ static void create_device_card(lv_obj_t *parent, const char *title, int x, int y
  */
 static void create_data_panel(lv_obj_t *parent)
 {
-    /* 主通道数据标题 */
+    static const char *summary_labels[] = {
+        "主管道阀门", "主管道流量(m³/h)", "主管道压力(MPa)",
+        "N罐开关", "N罐液位(L)",
+        "P罐开关", "P罐液位(L)",
+        "K罐开关", "K罐液位(L)"
+    };
+
     lv_obj_t *main_data_label = lv_label_create(parent);
-    lv_label_set_text(main_data_label, "主通道数据");
+    lv_label_set_text(main_data_label, "主机运行态");
     lv_obj_set_pos(main_data_label, 0, 0);
     lv_obj_set_style_text_font(main_data_label, &my_font_cn_16, 0);
     lv_obj_set_style_text_color(main_data_label, lv_color_hex(0x333333), 0);
 
-    /* 主通道数据容器 - 不需要额外的卡片，直接在白色面板上显示 */
-    int y_pos = 35;
+    lv_obj_t *summary_card = lv_obj_create(parent);
+    lv_obj_set_size(summary_card, 650, 235);
+    lv_obj_set_pos(summary_card, 0, 35);
+    lv_obj_set_style_bg_color(summary_card, lv_color_hex(0xf7fbfd), 0);
+    lv_obj_set_style_border_width(summary_card, 1, 0);
+    lv_obj_set_style_border_color(summary_card, lv_color_hex(0xd8e6ee), 0);
+    lv_obj_set_style_radius(summary_card, 10, 0);
+    lv_obj_set_style_pad_all(summary_card, 12, 0);
+    lv_obj_clear_flag(summary_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 第一行数据：EC1, PH1, EC2, PH2 */
-    const char *row1_labels[] = {"EC1(ms/cm)", "PH1酸碱度", "EC2(ms/cm)", "PH2酸碱度"};
-    int col_width = 160;
-    for (int i = 0; i < 4; i++) {
-        /* 数值 */
-        lv_obj_t *value = lv_label_create(parent);
-        lv_label_set_text(value, "---");
-        lv_obj_set_pos(value, i * col_width + 10, y_pos);
-        lv_obj_set_style_text_font(value, &my_font_cn_16, 0);
-        lv_obj_set_style_text_color(value, lv_color_hex(0x333333), 0);
+    for (int i = 0; i < 9; i++) {
+        int col = i / 3;
+        int row = i % 3;
+        int x = 15 + col * 205;
+        int y = 15 + row * 66;
 
-        /* 标签 */
-        lv_obj_t *label = lv_label_create(parent);
-        lv_label_set_text(label, row1_labels[i]);
-        lv_obj_set_pos(label, i * col_width + 10, y_pos + 30);
+        lv_obj_t *label = lv_label_create(summary_card);
+        lv_label_set_text(label, summary_labels[i]);
+        lv_obj_set_pos(label, x, y);
         lv_obj_set_style_text_font(label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(0x666666), 0);
-    }
 
-    /* 分隔线 */
-    y_pos += 80;
-    lv_obj_t *line1 = lv_obj_create(parent);
-    lv_obj_set_size(line1, 650, 1);
-    lv_obj_set_pos(line1, 0, y_pos);
-    lv_obj_set_style_bg_color(line1, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(line1, 0, 0);
-    lv_obj_clear_flag(line1, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* 第二行数据：本次用水, 瞬时流量, 累计流量, 肥管压力 */
-    y_pos += 20;
-    const char *row2_labels[] = {"本次用水(m³)", "瞬时流量(m³/h)", "累计流量(m³)", "肥管压力 (Mpa)"};
-    for (int i = 0; i < 4; i++) {
-        /* 数值 */
-        lv_obj_t *value = lv_label_create(parent);
+        lv_obj_t *value = lv_label_create(summary_card);
         lv_label_set_text(value, "---");
-        lv_obj_set_pos(value, i * col_width + 10, y_pos);
+        lv_obj_set_pos(value, x, y + 28);
         lv_obj_set_style_text_font(value, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(value, lv_color_hex(0x333333), 0);
-
-        /* 标签 */
-        lv_obj_t *label = lv_label_create(parent);
-        lv_label_set_text(label, row2_labels[i]);
-        lv_obj_set_pos(label, i * col_width + 10, y_pos + 30);
-        lv_obj_set_style_text_font(label, &my_font_cn_16, 0);
-        lv_obj_set_style_text_color(label, lv_color_hex(0x666666), 0);
+        g_main_data_vals[i] = value;
     }
 
-    /* 注肥通道数据标题 */
-    y_pos += 90;
-    lv_obj_t *fert_data_label = lv_label_create(parent);
-    lv_label_set_text(fert_data_label, "注肥通道数据");
-    lv_obj_set_pos(fert_data_label, 0, y_pos);
-    lv_obj_set_style_text_font(fert_data_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(fert_data_label, lv_color_hex(0x333333), 0);
+    lv_obj_t *pipe_title = lv_label_create(parent);
+    lv_label_set_text(pipe_title, "副管道实时摘要");
+    lv_obj_set_pos(pipe_title, 0, 290);
+    lv_obj_set_style_text_font(pipe_title, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(pipe_title, lv_color_hex(0x333333), 0);
 
-    /* 注肥通道数据表格 */
-    y_pos += 30;
-    lv_obj_t *fert_table = lv_obj_create(parent);
-    lv_obj_set_size(fert_table, 650, 280);
-    lv_obj_set_pos(fert_table, 0, y_pos);
-    lv_obj_set_style_bg_color(fert_table, lv_color_hex(0xf5f5f5), 0);
-    lv_obj_set_style_border_width(fert_table, 1, 0);
-    lv_obj_set_style_border_color(fert_table, lv_color_hex(0xcccccc), 0);
-    lv_obj_set_style_radius(fert_table, 10, 0);
-    lv_obj_set_style_pad_all(fert_table, 0, 0);
-    lv_obj_clear_flag(fert_table, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* 表头 */
-    lv_obj_t *table_header = lv_obj_create(fert_table);
-    lv_obj_set_size(table_header, 650, 45);
-    lv_obj_set_pos(table_header, 0, 0);
-    lv_obj_set_style_bg_color(table_header, lv_color_hex(0xe8f4f8), 0);
-    lv_obj_set_style_border_width(table_header, 0, 0);
-    lv_obj_set_style_radius(table_header, 0, 0);
-    lv_obj_set_style_pad_all(table_header, 0, 0);
-    lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
-
-    const char *headers[] = {"管道", "液位(m)", "剩余容量(L)", "瞬时流量(L/h)", "本次用肥(L)", "累计流量(L)"};
-    int header_x[] = {20, 90, 180, 300, 430, 550};
+    lv_obj_t *pipe_panel = lv_obj_create(parent);
+    lv_obj_set_size(pipe_panel, 650, 325);
+    lv_obj_set_pos(pipe_panel, 0, 325);
+    lv_obj_set_style_bg_color(pipe_panel, lv_color_hex(0xf5f5f5), 0);
+    lv_obj_set_style_border_width(pipe_panel, 1, 0);
+    lv_obj_set_style_border_color(pipe_panel, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_radius(pipe_panel, 10, 0);
+    lv_obj_set_style_pad_all(pipe_panel, 10, 0);
+    lv_obj_set_style_pad_row(pipe_panel, 10, 0);
+    lv_obj_set_style_pad_column(pipe_panel, 10, 0);
+    lv_obj_set_flex_flow(pipe_panel, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_clear_flag(pipe_panel, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int i = 0; i < 6; i++) {
-        lv_obj_t *h_label = lv_label_create(table_header);
-        lv_label_set_text(h_label, headers[i]);
-        lv_obj_set_pos(h_label, header_x[i], 15);
-        lv_obj_set_style_text_font(h_label, &my_font_cn_16, 0);
-        lv_obj_set_style_text_color(h_label, lv_color_hex(0x333333), 0);
-    }
+        char title_buf[24];
+        lv_obj_t *card = lv_obj_create(pipe_panel);
+        lv_obj_set_size(card, 305, 90);
+        lv_obj_set_style_bg_color(card, lv_color_white(), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0xd9e3ea), 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 10, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 数据行 - 1号通道 */
-    int row_y = 55;
+        snprintf(title_buf, sizeof(title_buf), "副管道%d", i + 1);
+        lv_obj_t *title = lv_label_create(card);
+        lv_label_set_text(title, title_buf);
+        lv_obj_set_pos(title, 5, 5);
+        lv_obj_set_style_text_font(title, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(0x333333), 0);
 
-    /* 管道 */
-    lv_obj_t *label_pipe = lv_label_create(fert_table);
-    lv_label_set_text(label_pipe, "1号");
-    lv_obj_set_pos(label_pipe, 30, row_y);
-    lv_obj_set_style_text_font(label_pipe, &my_font_cn_16, 0);
-
-    /* 其他数据列 - 都显示 --- */
-    const int data_x[] = {100, 210, 330, 460, 570};
-    for (int i = 0; i < 5; i++) {
-        lv_obj_t *label_data = lv_label_create(fert_table);
-        lv_label_set_text(label_data, "---");
-        lv_obj_set_pos(label_data, data_x[i], row_y);
-        lv_obj_set_style_text_font(label_data, &my_font_cn_16, 0);
+        lv_obj_t *info = lv_label_create(card);
+        lv_label_set_text(info, "阀:---  流:---  压:---");
+        lv_obj_set_pos(info, 5, 42);
+        lv_obj_set_style_text_font(info, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(info, lv_color_hex(0x333333), 0);
+        g_main_pipe_labels[i] = info;
     }
 }
 
@@ -451,6 +1299,9 @@ static void create_main_control_view(lv_obj_t *parent)
 
     /* 创建右侧数据显示面板内容 */
     create_data_panel(g_right_panel);
+
+    refresh_control_cards();
+    refresh_main_data_panel();
 }
 
 /**
@@ -462,8 +1313,7 @@ static void switch_to_tab(int tab_index)
 
     /* 清空视图容器（销毁当前视图的所有子对象） */
     lv_obj_clean(g_view_container);
-    g_left_panel = NULL;
-    g_right_panel = NULL;
+    clear_view_object_refs();
     g_active_tab = tab_index;
 
     /* 根据选中的标签创建对应的视图 */
@@ -483,7 +1333,20 @@ static void switch_to_tab(int tab_index)
  */
 static void create_valve_control_view(lv_obj_t *parent)
 {
-    /* 创建白色背景面板 */
+    ui_valve_row_t valve_rows[UI_DEVICE_MAX_VALVE_ROWS] = {0};
+    int valve_count = g_get_valve_count_cb ? g_get_valve_count_cb() : 0;
+    int fetch_count = 0;
+
+    if (valve_count > UI_DEVICE_MAX_VALVE_ROWS) {
+        valve_count = UI_DEVICE_MAX_VALVE_ROWS;
+    }
+    if (valve_count > 0 && g_get_valve_list_cb) {
+        fetch_count = g_get_valve_list_cb(valve_rows, valve_count, 0);
+        if (fetch_count < 0) {
+            fetch_count = 0;
+        }
+    }
+
     lv_obj_t *panel = lv_obj_create(parent);
     lv_obj_set_size(panel, 1168, 660);
     lv_obj_set_pos(panel, 0, 0);
@@ -493,30 +1356,28 @@ static void create_valve_control_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(panel, 15, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 顶部统计 */
     lv_obj_t *label1 = lv_label_create(panel);
     lv_label_set_text(label1, "全部阀门个数: ");
-    lv_obj_set_style_text_font(label1, &my_fontbd_16, 0);
+    lv_obj_set_style_text_font(label1, &my_font_cn_16, 0);
     lv_obj_set_pos(label1, 10, 10);
 
     g_valve_total_label = lv_label_create(panel);
-    lv_label_set_text(g_valve_total_label, "7");
-    lv_obj_set_style_text_font(g_valve_total_label, &my_fontbd_16, 0);
+    lv_label_set_text_fmt(g_valve_total_label, "%d", fetch_count);
+    lv_obj_set_style_text_font(g_valve_total_label, &my_font_cn_16, 0);
     lv_obj_set_style_text_color(g_valve_total_label, lv_color_hex(0x2196F3), 0);
     lv_obj_set_pos(g_valve_total_label, 150, 10);
 
     lv_obj_t *label3 = lv_label_create(panel);
     lv_label_set_text(label3, "    开启阀门个数: ");
-    lv_obj_set_style_text_font(label3, &my_fontbd_16, 0);
+    lv_obj_set_style_text_font(label3, &my_font_cn_16, 0);
     lv_obj_set_pos(label3, 180, 10);
 
     g_valve_open_label = lv_label_create(panel);
     lv_label_set_text(g_valve_open_label, "0");
-    lv_obj_set_style_text_font(g_valve_open_label, &my_fontbd_16, 0);
+    lv_obj_set_style_text_font(g_valve_open_label, &my_font_cn_16, 0);
     lv_obj_set_style_text_color(g_valve_open_label, lv_color_hex(0x4CAF50), 0);
     lv_obj_set_pos(g_valve_open_label, 350, 10);
 
-    /* 阀门网格：7 个阀门卡片 */
     g_valve_container = lv_obj_create(panel);
     lv_obj_set_size(g_valve_container, 1138, 580);
     lv_obj_set_pos(g_valve_container, 0, 50);
@@ -528,16 +1389,8 @@ static void create_valve_control_view(lv_obj_t *parent)
     lv_obj_set_style_pad_row(g_valve_container, 10, 0);
     lv_obj_set_style_pad_column(g_valve_container, 10, 0);
 
-    /* 重置阀门状态标签和按钮 */
-    for (int i = 0; i < 7; i++) {
-        g_valve_status_labels[i] = NULL;
-        g_valve_btns[i] = NULL;
-        g_valve_btn_labels[i] = NULL;
-    }
-
-    const char *valve_names[] = {"主管道阀", "副管道1阀", "副管道2阀", "副管道3阀",
-                                  "副管道4阀", "副管道5阀", "副管道6阀"};
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < fetch_count; i++) {
+        uint32_t point_id = valve_channel_to_point_id(valve_rows[i].channel);
         lv_obj_t *card = lv_obj_create(g_valve_container);
         lv_obj_set_size(card, 260, 100);
         lv_obj_set_style_bg_color(card, lv_color_hex(0xf0f8ff), 0);
@@ -548,37 +1401,49 @@ static void create_valve_control_view(lv_obj_t *parent)
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *name = lv_label_create(card);
-        lv_label_set_text(name, valve_names[i]);
-        lv_obj_set_style_text_font(name, &my_fontbd_16, 0);
+        lv_label_set_text(name, valve_rows[i].name);
+        lv_obj_set_style_text_font(name, &my_font_cn_16, 0);
         lv_obj_set_pos(name, 5, 5);
 
-        /* 状态标签（根据当前状态显示） */
-        lv_obj_t *status = lv_label_create(card);
-        lv_label_set_text(status, g_valve_states[i] ? "开启  流量:---  压力:---" : "关闭  流量:---  压力:---");
-        lv_obj_set_style_text_font(status, &my_font_cn_16, 0);
-        lv_obj_set_pos(status, 5, 40);
-        g_valve_status_labels[i] = status;
+        lv_obj_t *state = lv_label_create(card);
+        lv_label_set_text(state, "关闭");
+        lv_obj_set_style_text_font(state, &my_font_cn_16, 0);
+        lv_obj_set_pos(state, 5, 40);
+        g_valve_dynamic_state_labels[i] = state;
 
-        /* 单个切换按钮：关闭时红色显示"关闭"，开启时绿色显示"开启" */
+        lv_obj_t *flow = lv_label_create(card);
+        lv_label_set_text(flow, "流量:---");
+        lv_obj_set_style_text_font(flow, &my_font_cn_16, 0);
+        lv_obj_set_pos(flow, 70, 40);
+        g_valve_dynamic_flow_labels[i] = flow;
+
+        lv_obj_t *pressure = lv_label_create(card);
+        lv_label_set_text(pressure, "压力:---");
+        lv_obj_set_style_text_font(pressure, &my_font_cn_16, 0);
+        lv_obj_set_pos(pressure, 150, 40);
+        g_valve_dynamic_pressure_labels[i] = pressure;
+        g_valve_dynamic_point_ids[i] = point_id;
+
         lv_obj_t *btn = lv_btn_create(card);
         lv_obj_set_size(btn, 55, 26);
         lv_obj_set_pos(btn, 180, 5);
-        lv_obj_set_style_bg_color(btn, g_valve_states[i] ? lv_color_hex(0xE53935) : lv_color_hex(0x4CAF50), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x4CAF50), 0);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_set_style_radius(btn, 4, 0);
         lv_obj_set_style_pad_all(btn, 0, 0);
-        lv_obj_add_event_cb(btn, valve_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        g_valve_btns[i] = btn;
+        lv_obj_add_event_cb(btn, valve_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)valve_rows[i].channel);
+        g_valve_dynamic_btns[i] = btn;
 
         lv_obj_t *btn_label = lv_label_create(btn);
-        lv_label_set_text(btn_label, g_valve_states[i] ? "关闭" : "开启");
+        lv_label_set_text(btn_label, "开启");
         lv_obj_set_style_text_font(btn_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(btn_label, lv_color_white(), 0);
         lv_obj_center(btn_label);
-        g_valve_btn_labels[i] = btn_label;
+        g_valve_dynamic_btn_labels[i] = btn_label;
     }
 
-    /* 刷新开启计数 */
+    g_valve_dynamic_count = fetch_count;
+    refresh_dynamic_valve_items();
     update_valve_open_count();
 }
 
@@ -604,39 +1469,14 @@ static void device_dialog_confirm_cb(lv_event_t *e)
 {
     (void)e;
 
-    /* 发送控制指令 */
-    if (g_device_control_cb) {
-        g_device_control_cb(g_pending_dev_type, g_pending_dev_id, g_pending_on);
+    if (g_pending_point_id != 0) {
+        start_control_confirm(g_pending_point_id, g_pending_on);
     }
 
-    /* 更新 UI 状态 */
-    if (g_pending_label_type == 0 && g_pending_label_idx >= 0 && g_pending_label_idx < 5) {
-        /* 设备卡片 */
-        g_dev_states[g_pending_label_idx] = g_pending_on;
-        if (g_dev_status_labels[g_pending_label_idx]) {
-            lv_label_set_text(g_dev_status_labels[g_pending_label_idx],
-                              g_pending_on ? "开启" : "关闭");
-        }
-    } else if (g_pending_label_type == 1 && g_pending_label_idx >= 0 && g_pending_label_idx < 7) {
-        /* 阀门卡片 */
-        g_valve_states[g_pending_label_idx] = g_pending_on;
-        if (g_valve_status_labels[g_pending_label_idx]) {
-            lv_label_set_text(g_valve_status_labels[g_pending_label_idx],
-                              g_pending_on ? "开启  流量:---  压力:---" : "关闭  流量:---  压力:---");
-        }
-        /* 更新按钮颜色和文字 */
-        if (g_valve_btns[g_pending_label_idx]) {
-            lv_obj_set_style_bg_color(g_valve_btns[g_pending_label_idx],
-                                      g_pending_on ? lv_color_hex(0xE53935) : lv_color_hex(0x4CAF50), 0);
-        }
-        if (g_valve_btn_labels[g_pending_label_idx]) {
-            lv_label_set_text(g_valve_btn_labels[g_pending_label_idx],
-                              g_pending_on ? "关闭" : "开启");
-        }
-        update_valve_open_count();
+    if (g_device_control_cb && g_pending_point_id != 0) {
+        g_device_control_cb(g_pending_point_id, g_pending_on);
     }
 
-    /* 关闭对话框 */
     if (g_device_dialog) {
         lv_obj_del(g_device_dialog);
         g_device_dialog = NULL;
@@ -689,7 +1529,7 @@ static void show_device_confirm_dialog(const char *dev_name, bool to_on)
     /* 标题 */
     lv_obj_t *title = lv_label_create(content);
     lv_label_set_text(title, "操作确认");
-    lv_obj_set_style_text_font(title, &my_fontbd_16, 0);
+    lv_obj_set_style_text_font(title, &my_font_cn_16, 0);
     lv_obj_set_style_text_color(title, lv_color_black(), 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
@@ -736,19 +1576,27 @@ static void show_device_confirm_dialog(const char *dev_name, bool to_on)
 }
 
 /**
- * @brief 灌区视图中的开关回调（直接发送控制指令）
- * user_data 编码: (dev_type << 8) | dev_id
+ * @brief 灌区视图中的开关回调（直接发送业务点控制指令）
+ * user_data = point_id
  */
 static void zone_switch_cb(lv_event_t *e)
 {
-    uint32_t code = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
-    uint8_t dev_type = (code >> 8) & 0xFF;
-    uint8_t dev_id   = code & 0xFF;
+    uint32_t point_id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
     lv_obj_t *sw = lv_event_get_target(e);
-    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    bool on;
 
-    if (g_device_control_cb) {
-        g_device_control_cb(dev_type, dev_id, on);
+    if (g_syncing_switch_state) {
+        return;
+    }
+
+    on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+
+    if (point_id != 0) {
+        start_control_confirm(point_id, on);
+    }
+
+    if (g_device_control_cb && point_id != 0) {
+        g_device_control_cb(point_id, on);
     }
 }
 
@@ -757,6 +1605,20 @@ static void zone_switch_cb(lv_event_t *e)
  */
 static void create_zone_control_view(lv_obj_t *parent)
 {
+    ui_zone_row_t zone_rows[UI_DEVICE_MAX_ZONE_ROWS] = {0};
+    int zone_count = g_get_zone_count_cb ? g_get_zone_count_cb() : 0;
+    int fetch_count = 0;
+
+    if (zone_count > UI_DEVICE_MAX_ZONE_ROWS) {
+        zone_count = UI_DEVICE_MAX_ZONE_ROWS;
+    }
+    if (zone_count > 0 && g_get_zone_list_cb) {
+        fetch_count = g_get_zone_list_cb(zone_rows, zone_count, 0);
+        if (fetch_count < 0) {
+            fetch_count = 0;
+        }
+    }
+
     lv_obj_t *panel = lv_obj_create(parent);
     lv_obj_set_size(panel, 1168, 660);
     lv_obj_set_pos(panel, 0, 0);
@@ -766,10 +1628,9 @@ static void create_zone_control_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(panel, 15, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 标题 */
     lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "灌区概览（6 田地 + 3 储料罐）");
-    lv_obj_set_style_text_font(title, &my_fontbd_16, 0);
+    lv_label_set_text(title, "灌区控制与储料罐状态");
+    lv_obj_set_style_text_font(title, &my_font_cn_16, 0);
     lv_obj_set_pos(title, 10, 10);
 
     g_zone_container = lv_obj_create(panel);
@@ -782,10 +1643,12 @@ static void create_zone_control_view(lv_obj_t *parent)
     lv_obj_set_style_pad_row(g_zone_container, 10, 0);
     lv_obj_set_style_pad_column(g_zone_container, 10, 0);
 
-    /* 6 个田地卡片 */
-    for (int i = 0; i < 6; i++) {
+    g_zone_dynamic_switch_count = 0;
+
+    for (int i = 0; i < fetch_count && g_zone_dynamic_switch_count < UI_DEVICE_MAX_ZONE_SWITCHES; i++) {
+        ui_zone_add_params_t detail = {0};
         lv_obj_t *card = lv_obj_create(g_zone_container);
-        lv_obj_set_size(card, 360, 100);
+        lv_obj_set_size(card, 360, 110);
         lv_obj_set_style_bg_color(card, lv_color_hex(0xf0fff0), 0);
         lv_obj_set_style_border_width(card, 1, 0);
         lv_obj_set_style_border_color(card, lv_color_hex(0xc3e6cb), 0);
@@ -793,30 +1656,59 @@ static void create_zone_control_view(lv_obj_t *parent)
         lv_obj_set_style_pad_all(card, 8, 0);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-        char buf[32];
-        snprintf(buf, sizeof(buf), "田地%d", i + 1);
         lv_obj_t *name = lv_label_create(card);
-        lv_label_set_text(name, buf);
-        lv_obj_set_style_text_font(name, &my_fontbd_16, 0);
+        lv_label_set_text(name, zone_rows[i].name);
+        lv_obj_set_style_text_font(name, &my_font_cn_16, 0);
         lv_obj_set_pos(name, 5, 5);
 
-        lv_obj_t *info = lv_label_create(card);
-        lv_label_set_text(info, "N:--- P:--- K:---\n温:--- 湿:--- 光:---");
-        lv_obj_set_style_text_font(info, &my_font_cn_16, 0);
-        lv_obj_set_style_text_line_space(info, 6, 0);
-        lv_obj_set_pos(info, 5, 35);
+        lv_obj_t *summary = lv_label_create(card);
+        lv_label_set_text_fmt(summary, "阀门:%d  设备:%d", zone_rows[i].valve_count, zone_rows[i].device_count);
+        lv_obj_set_style_text_font(summary, &my_font_cn_16, 0);
+        lv_obj_set_pos(summary, 5, 32);
 
-        /* 副管道阀门开关 */
-        lv_obj_t *sw = lv_switch_create(card);
-        lv_obj_set_size(sw, 45, 22);
-        lv_obj_set_pos(sw, 295, 5);
-        uint32_t cb_code = (0x02 << 8) | (uint8_t)(i + 1);
-        lv_obj_add_event_cb(sw, zone_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)cb_code);
+        if (g_get_zone_detail_cb && g_get_zone_detail_cb(zone_rows[i].slot_index, &detail) && detail.valve_count > 0) {
+            uint16_t valve_id = detail.valve_ids[0];
+            uint8_t channel = 0;
+            uint32_t point_id = 0;
+
+            for (int v = 0; v < UI_DEVICE_MAX_VALVE_ROWS; v++) {
+                ui_valve_row_t valve_row;
+                if (!g_get_valve_list_cb) {
+                    break;
+                }
+                if (g_get_valve_list_cb(&valve_row, 1, v) != 1) {
+                    break;
+                }
+                if (valve_row.id == valve_id) {
+                    channel = valve_row.channel;
+                    break;
+                }
+            }
+
+            point_id = valve_channel_to_point_id(channel);
+            if (point_id != 0) {
+                int idx = g_zone_dynamic_switch_count++;
+                lv_obj_t *info = lv_label_create(card);
+                lv_label_set_text(info, "---");
+                lv_obj_set_style_text_font(info, &my_font_cn_16, 0);
+                lv_obj_set_pos(info, 5, 62);
+                g_zone_dynamic_info_labels[idx] = info;
+                g_zone_dynamic_point_ids[idx] = point_id;
+
+                lv_obj_t *sw = lv_switch_create(card);
+                lv_obj_set_size(sw, 45, 22);
+                lv_obj_set_pos(sw, 295, 5);
+                lv_obj_add_event_cb(sw, zone_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)point_id);
+                g_zone_dynamic_switches[idx] = sw;
+            }
+        }
     }
 
-    /* 3 个储料罐卡片 */
-    const char *tank_names[] = {"储料罐N", "储料罐P", "储料罐K"};
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3 && g_zone_dynamic_switch_count < UI_DEVICE_MAX_ZONE_SWITCHES; i++) {
+        uint32_t point_id = 300006U + (uint32_t)i;
+        int idx = g_zone_dynamic_switch_count++;
+        static const char *tank_names[] = {"储料罐N", "储料罐P", "储料罐K"};
+
         lv_obj_t *card = lv_obj_create(g_zone_container);
         lv_obj_set_size(card, 360, 80);
         lv_obj_set_style_bg_color(card, lv_color_hex(0xfff8e1), 0);
@@ -828,21 +1720,24 @@ static void create_zone_control_view(lv_obj_t *parent)
 
         lv_obj_t *name = lv_label_create(card);
         lv_label_set_text(name, tank_names[i]);
-        lv_obj_set_style_text_font(name, &my_fontbd_16, 0);
+        lv_obj_set_style_text_font(name, &my_font_cn_16, 0);
         lv_obj_set_pos(name, 5, 5);
 
         lv_obj_t *info = lv_label_create(card);
-        lv_label_set_text(info, "液位: ---L  状态: 关闭");
+        lv_label_set_text(info, "---");
         lv_obj_set_style_text_font(info, &my_font_cn_16, 0);
         lv_obj_set_pos(info, 5, 40);
+        g_zone_dynamic_info_labels[idx] = info;
+        g_zone_dynamic_point_ids[idx] = point_id;
 
         lv_obj_t *sw = lv_switch_create(card);
         lv_obj_set_size(sw, 45, 22);
         lv_obj_set_pos(sw, 295, 5);
-        /* dev_type=0x03(控制系统/储料罐), dev_id=1~3 */
-        uint32_t cb_code = (0x03 << 8) | (uint8_t)(i + 1);
-        lv_obj_add_event_cb(sw, zone_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)cb_code);
+        lv_obj_add_event_cb(sw, zone_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)point_id);
+        g_zone_dynamic_switches[idx] = sw;
     }
+
+    refresh_dynamic_zone_switches();
 }
 
 /**
@@ -850,6 +1745,20 @@ static void create_zone_control_view(lv_obj_t *parent)
  */
 static void create_sensor_monitor_view(lv_obj_t *parent)
 {
+    ui_sensor_row_t sensor_rows[UI_DEVICE_MAX_SENSOR_ITEMS] = {0};
+    int sensor_count = g_get_sensor_count_cb ? g_get_sensor_count_cb() : 0;
+    int fetch_count = 0;
+
+    if (sensor_count > UI_DEVICE_MAX_SENSOR_ITEMS) {
+        sensor_count = UI_DEVICE_MAX_SENSOR_ITEMS;
+    }
+    if (sensor_count > 0 && g_get_sensor_list_cb) {
+        fetch_count = g_get_sensor_list_cb(sensor_rows, sensor_count, 0);
+        if (fetch_count < 0) {
+            fetch_count = 0;
+        }
+    }
+
     lv_obj_t *panel = lv_obj_create(parent);
     lv_obj_set_size(panel, 1168, 660);
     lv_obj_set_pos(panel, 0, 0);
@@ -861,10 +1770,9 @@ static void create_sensor_monitor_view(lv_obj_t *parent)
 
     lv_obj_t *title = lv_label_create(panel);
     lv_label_set_text(title, "传感器实时监测");
-    lv_obj_set_style_text_font(title, &my_fontbd_16, 0);
+    lv_obj_set_style_text_font(title, &my_font_cn_16, 0);
     lv_obj_set_pos(title, 10, 10);
 
-    /* 可滚动的传感器列表容器 */
     g_sensor_container = lv_obj_create(panel);
     lv_obj_set_size(g_sensor_container, 1138, 590);
     lv_obj_set_pos(g_sensor_container, 0, 45);
@@ -875,61 +1783,38 @@ static void create_sensor_monitor_view(lv_obj_t *parent)
     lv_obj_set_style_pad_row(g_sensor_container, 8, 0);
     lv_obj_set_style_pad_column(g_sensor_container, 8, 0);
 
-    /* 6 个田地传感器组 */
-    static const char *sensor_labels[] = {"N", "P", "K", "温", "湿", "光"};
-    for (int f = 0; f < 6; f++) {
+    g_sensor_dynamic_item_count = 0;
+
+    for (int i = 0; i < fetch_count && i < UI_DEVICE_MAX_SENSOR_ITEMS; i++) {
         lv_obj_t *card = lv_obj_create(g_sensor_container);
-        lv_obj_set_size(card, 555, 80);
+        lv_obj_set_size(card, 360, 80);
         lv_obj_set_style_bg_color(card, lv_color_hex(0xf5f5f5), 0);
         lv_obj_set_style_border_width(card, 1, 0);
         lv_obj_set_style_border_color(card, lv_color_hex(0xe0e0e0), 0);
         lv_obj_set_style_radius(card, 6, 0);
-        lv_obj_set_style_pad_all(card, 6, 0);
+        lv_obj_set_style_pad_all(card, 8, 0);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-        char buf[16];
-        snprintf(buf, sizeof(buf), "田地%d", f + 1);
         lv_obj_t *name = lv_label_create(card);
-        lv_label_set_text(name, buf);
-        lv_obj_set_style_text_font(name, &my_fontbd_16, 0);
+        lv_label_set_text(name, sensor_rows[i].name);
+        lv_obj_set_style_text_font(name, &my_font_cn_16, 0);
         lv_obj_set_pos(name, 5, 5);
 
-        for (int s = 0; s < 6; s++) {
-            int sx = 5 + s * 88;
-            lv_obj_t *slabel = lv_label_create(card);
-            snprintf(buf, sizeof(buf), "%s:---", sensor_labels[s]);
-            lv_label_set_text(slabel, buf);
-            lv_obj_set_style_text_font(slabel, &my_font_cn_16, 0);
-            lv_obj_set_pos(slabel, sx, 45);
-        }
+        lv_obj_t *meta = lv_label_create(card);
+        lv_label_set_text_fmt(meta, "%s | %s", sensor_type_name(sensor_rows[i].type), sensor_rows[i].parent_name);
+        lv_obj_set_style_text_font(meta, &my_font_cn_16, 0);
+        lv_obj_set_pos(meta, 5, 32);
+
+        lv_obj_t *value = lv_label_create(card);
+        lv_label_set_text(value, "---");
+        lv_obj_set_style_text_font(value, &my_font_cn_16, 0);
+        lv_obj_set_pos(value, 250, 24);
+        g_sensor_dynamic_value_labels[g_sensor_dynamic_item_count] = value;
+        g_sensor_dynamic_point_ids[g_sensor_dynamic_item_count] = sensor_rows[i].point_id;
+        g_sensor_dynamic_item_count++;
     }
 
-    /* 管道传感器 */
-    lv_obj_t *pipe_card = lv_obj_create(g_sensor_container);
-    lv_obj_set_size(pipe_card, 1130, 80);
-    lv_obj_set_style_bg_color(pipe_card, lv_color_hex(0xf0f8ff), 0);
-    lv_obj_set_style_border_width(pipe_card, 1, 0);
-    lv_obj_set_style_border_color(pipe_card, lv_color_hex(0xd0e0f0), 0);
-    lv_obj_set_style_radius(pipe_card, 6, 0);
-    lv_obj_set_style_pad_all(pipe_card, 6, 0);
-    lv_obj_clear_flag(pipe_card, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *pipe_title = lv_label_create(pipe_card);
-    lv_label_set_text(pipe_title, "管道传感器");
-    lv_obj_set_style_text_font(pipe_title, &my_fontbd_16, 0);
-    lv_obj_set_pos(pipe_title, 5, 5);
-
-    for (int p = 0; p < 7; p++) {
-        char buf[32];
-        lv_obj_t *plabel = lv_label_create(pipe_card);
-        if (p == 0)
-            snprintf(buf, sizeof(buf), "主:---");
-        else
-            snprintf(buf, sizeof(buf), "P%d:---", p);
-        lv_label_set_text(plabel, buf);
-        lv_obj_set_style_text_font(plabel, &my_font_cn_16, 0);
-        lv_obj_set_pos(plabel, 5 + p * 155, 45);
-    }
+    refresh_dynamic_sensor_items();
 }
 
 /**
@@ -969,6 +1854,130 @@ static void tab_btn_cb(lv_event_t *e)
 }
 
 /* ---- 公开 API ---- */
+
+void ui_device_update_control(bool water_pump, bool fert_pump,
+    bool fert_valve, bool water_valve, bool mixer)
+{
+    bool new_states[5] = {water_pump, fert_pump, fert_valve, water_valve, mixer};
+
+    for (int i = 0; i < 5; i++) {
+        g_dev_states[i] = new_states[i];
+        resolve_control_confirm(s_dev_point_id_map[i], new_states[i]);
+    }
+
+    refresh_control_cards();
+    refresh_dynamic_sensor_items();
+}
+
+void ui_device_update_pipe(int pipe_id,
+    bool valve_bound, bool valve_on,
+    bool flow_bound, float flow,
+    bool pressure_bound, float pressure)
+{
+    device_pipe_cache_t *pipe;
+
+    if (pipe_id < 0 || pipe_id >= 7) {
+        return;
+    }
+
+    pipe = &s_pipe_cache[pipe_id];
+    pipe->valid = true;
+    pipe->valve_bound = valve_bound;
+    pipe->valve_on = valve_on;
+    pipe->flow_bound = flow_bound;
+    pipe->flow = flow;
+    pipe->pressure_bound = pressure_bound;
+    pipe->pressure = pressure;
+
+    resolve_control_confirm(valve_index_to_point_id(pipe_id), valve_on);
+
+    refresh_main_data_panel();
+    refresh_valve_card(pipe_id);
+    refresh_dynamic_valve_items();
+    update_valve_open_count();
+    if (pipe_id >= 1 && pipe_id <= 6) {
+        refresh_zone_field_card(pipe_id - 1);
+    }
+    refresh_dynamic_zone_switches();
+    refresh_sensor_pipe_label(pipe_id);
+    refresh_dynamic_sensor_items();
+}
+
+void ui_device_update_tank(int tank_id, bool switch_on, bool level_bound, float level)
+{
+    device_tank_cache_t *tank;
+    uint32_t point_id;
+
+    if (tank_id < 1 || tank_id > 3) {
+        return;
+    }
+
+    tank = &s_tank_cache[tank_id - 1];
+    tank->valid = true;
+    tank->switch_on = switch_on;
+    tank->level_bound = level_bound;
+    tank->level = level;
+
+    point_id = 300006U + (uint32_t)(tank_id - 1);
+    resolve_control_confirm(point_id, switch_on);
+
+    refresh_main_data_panel();
+    refresh_tank_card(tank_id - 1);
+    refresh_dynamic_zone_switches();
+    refresh_dynamic_sensor_items();
+}
+
+void ui_device_update_field(int field_id, uint8_t registered_mask,
+    float n, float p, float k, float temp, float humi, float light)
+{
+    device_field_cache_t *field;
+
+    if (field_id < 1 || field_id > 6) {
+        return;
+    }
+
+    field = &s_field_cache[field_id - 1];
+    field->valid = true;
+    field->registered_mask = registered_mask;
+    field->n = n;
+    field->p = p;
+    field->k = k;
+    field->temp = temp;
+    field->humi = humi;
+    field->light = light;
+
+    refresh_zone_field_card(field_id - 1);
+    refresh_sensor_field_card(field_id - 1);
+    refresh_dynamic_sensor_items();
+}
+
+void ui_device_invalidate_objects(void)
+{
+    if (g_device_dialog) {
+        lv_obj_del(g_device_dialog);
+        g_device_dialog = NULL;
+    }
+    g_view_container = NULL;
+    clear_view_object_refs();
+}
+
+void ui_device_register_query_cbs(
+    ui_get_valve_count_cb_t  valve_count_cb,
+    ui_get_valve_list_cb_t   valve_list_cb,
+    ui_get_sensor_count_cb_t sensor_count_cb,
+    ui_get_sensor_list_cb_t  sensor_list_cb,
+    ui_get_zone_count_cb_t   zone_count_cb,
+    ui_get_zone_list_cb_t    zone_list_cb,
+    ui_get_zone_detail_cb_t  zone_detail_cb)
+{
+    g_get_valve_count_cb = valve_count_cb;
+    g_get_valve_list_cb = valve_list_cb;
+    g_get_sensor_count_cb = sensor_count_cb;
+    g_get_sensor_list_cb = sensor_list_cb;
+    g_get_zone_count_cb = zone_count_cb;
+    g_get_zone_list_cb = zone_list_cb;
+    g_get_zone_detail_cb = zone_detail_cb;
+}
 
 void ui_device_register_control_cb(ui_device_control_cb_t cb)
 {

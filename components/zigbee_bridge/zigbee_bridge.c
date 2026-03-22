@@ -51,6 +51,41 @@ static uint16_t read_u16_be(const uint8_t *p)
     return ((uint16_t)p[0] << 8) | p[1];
 }
 
+bool zigbee_bridge_resolve_control_target(uint32_t point_id, zb_control_target_t *out_target)
+{
+    uint32_t node_id;
+    uint8_t point_no;
+
+    if (!out_target || point_id == 0U) {
+        return false;
+    }
+
+    node_id = point_id / 100U;
+    point_no = (uint8_t)(point_id % 100U);
+
+    if (node_id >= 2000U && node_id <= 2006U && point_no == 1U) {
+        out_target->dev_type = ZB_DEV_PIPE;
+        out_target->dev_id = (uint8_t)(node_id - 2000U);
+        return true;
+    }
+
+    if (node_id == 3000U) {
+        if (point_no >= 1U && point_no <= 5U) {
+            out_target->dev_type = ZB_DEV_MIXER;
+            out_target->dev_id = point_no;
+            return true;
+        }
+
+        if (point_no >= 6U && point_no <= 8U) {
+            out_target->dev_type = ZB_DEV_CONTROL;
+            out_target->dev_id = (uint8_t)(point_no - 5U);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /* ---- 帧解析 ---- */
 
 static void process_field_frame(uint8_t id, const uint8_t *data, uint8_t len)

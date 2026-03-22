@@ -6,8 +6,7 @@
 #include "ui_common.h"
 #include "ui_numpad.h"
 #include "ui_keyboard.h"
-#include "nvs_flash.h"
-#include "nvs.h"
+#include "irrigation_scheduler.h"
 #include "esp_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +59,7 @@ typedef struct
 /*********************
  *  STATIC PROTOTYPES
  *********************/
+static void clear_program_form_widget_refs(void);
 static void create_tab_buttons(lv_obj_t *parent);
 static void create_table_area(lv_obj_t *parent);
 static void create_formula_table_area(lv_obj_t *parent);
@@ -103,6 +103,7 @@ static void btn_uniform_confirm_cb(lv_event_t *e);
 static void period_checkbox_cb(lv_event_t *e);
 static void refresh_program_table(void);
 static void refresh_formula_table(void);
+static void refresh_irrigation_zone_table(void);
 static void btn_edit_program_cb(lv_event_t *e);
 static void btn_delete_program_cb(lv_event_t *e);
 static void btn_edit_formula_cb(lv_event_t *e);
@@ -118,6 +119,13 @@ static void btn_delete_formula_confirm_cb(lv_event_t *e);
 static void show_delete_program_confirm_dialog(int index);
 static void btn_delete_program_cancel_cb(lv_event_t *e);
 static void btn_delete_program_confirm_cb(lv_event_t *e);
+static void zone_selection_checkbox_cb(lv_event_t *e);
+static void btn_delete_selected_target_cb(lv_event_t *e);
+static void show_delete_selected_target_confirm_dialog(bool is_zone, int index);
+static void btn_delete_selected_target_cancel_cb(lv_event_t *e);
+static void btn_delete_selected_target_confirm_cb(lv_event_t *e);
+static void ensure_program_selection_cache_loaded(void);
+static void find_zone_name_for_valve(uint16_t valve_id, char *buf, int buf_size);
 
 /*********************
  *  STATIC VARIABLES
@@ -146,10 +154,13 @@ static lv_obj_t *g_zone_tab_zone = NULL;                 /* 灌区标签 */
 static lv_obj_t *g_zone_content = NULL;                  /* 灌区对话框内容区域 */
 static lv_obj_t *g_uniform_dialog = NULL;                /* 统一设置对话框 */
 static lv_obj_t *g_table_bg = NULL;                      /* 表格背景引用 */
+static lv_obj_t *g_zone_table_bg = NULL;                 /* 灌区选择表格背景引用 */
 static lv_obj_t *g_warning_dialog = NULL;                /* 警告对话框 */
 static lv_obj_t *g_delete_confirm_dialog = NULL;         /* 删除确认对话框 */
 static int g_delete_formula_index = -1;                  /* 待删除的配方索引 */
 static int g_delete_program_index = -1;                  /* 待删除的程序索引 */
+static bool g_delete_target_is_zone = false;             /* 待删除目标类型 */
+static int g_delete_target_index = -1;                   /* 待删除目标索引 */
 static bool g_is_editing_program = false;                /* 是否处于编辑程序模式 */
 static int g_editing_program_index = -1;                 /* 正在编辑的程序索引 */
 static program_data_t g_temp_program;                    /* 临时程序数据（用于编辑） */
@@ -191,6 +202,21 @@ static char g_temp_formula[32] = "无";            /* 临时保存关联配方 *
 static char g_temp_mode[32] = "每天执行";         /* 临时保存灌溉模式 */
 static char g_temp_condition[16] = "定时";        /* 临时保存启动条件 */
 
+static lv_obj_t *g_zone_valve_checkboxes[10] = {NULL};
+static lv_obj_t *g_zone_zone_checkboxes[10] = {NULL};
+
+/* 程序页真实数据查询回调 */
+static ui_get_valve_count_cb_t g_program_valve_count_cb = NULL;
+static ui_get_valve_list_cb_t  g_program_valve_list_cb = NULL;
+static ui_get_zone_count_cb_t  g_program_zone_count_cb = NULL;
+static ui_get_zone_list_cb_t   g_program_zone_list_cb = NULL;
+static ui_get_zone_detail_cb_t g_program_zone_detail_cb = NULL;
+
+static int g_program_cached_valve_count = 0;
+static ui_valve_row_t g_program_cached_valves[10];
+static int g_program_cached_zone_count = 0;
+static ui_zone_row_t g_program_cached_zones[10];
+
 /* 临时保存当前正在编辑的配方数据（完整数据） */
 static formula_data_t g_current_editing_formula = {0};
 
@@ -210,117 +236,241 @@ static lv_obj_t *g_dropdown_condition = NULL;
 static lv_obj_t *g_dropdown_formula = NULL;
 static lv_obj_t *g_dropdown_mode = NULL;
 
-/* ---- NVS persistence for programs & formulas ---- */
+/* ---- Backend persistence bridge for programs & formulas ---- */
 
-#define PROG_NVS_NS  "prog_nvs"
-#define FORM_NVS_NS  "form_nvs"
 static const char *PROG_TAG = "prog_store";
+
+static void copy_program_to_backend(const program_data_t *src, irr_program_t *dst)
+{
+    if (!src || !dst) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst->name, src->name, sizeof(dst->name));
+    dst->name[sizeof(dst->name) - 1] = '\0';
+    dst->auto_enabled = src->auto_enabled;
+    memcpy(dst->start_date, src->start_date, sizeof(dst->start_date));
+    dst->start_date[sizeof(dst->start_date) - 1] = '\0';
+    memcpy(dst->end_date, src->end_date, sizeof(dst->end_date));
+    dst->end_date[sizeof(dst->end_date) - 1] = '\0';
+    memcpy(dst->condition, src->condition, sizeof(dst->condition));
+    dst->condition[sizeof(dst->condition) - 1] = '\0';
+    memcpy(dst->formula, src->formula, sizeof(dst->formula));
+    dst->formula[sizeof(dst->formula) - 1] = '\0';
+    dst->pre_water = src->pre_water;
+    dst->post_water = src->post_water;
+    memcpy(dst->mode, src->mode, sizeof(dst->mode));
+    dst->mode[sizeof(dst->mode) - 1] = '\0';
+    memcpy(dst->next_start, src->next_start, sizeof(dst->next_start));
+    dst->next_start[sizeof(dst->next_start) - 1] = '\0';
+    dst->total_duration = src->total_duration;
+    dst->period_count = src->period_count;
+
+    if (dst->period_count > IRR_MAX_PERIODS) {
+        dst->period_count = IRR_MAX_PERIODS;
+    }
+
+    for (int i = 0; i < dst->period_count; i++) {
+        dst->periods[i].enabled = src->periods[i].enabled;
+        memcpy(dst->periods[i].time, src->periods[i].time, sizeof(dst->periods[i].time));
+        dst->periods[i].time[sizeof(dst->periods[i].time) - 1] = '\0';
+    }
+
+    for (int i = 0; i < 10; i++) {
+        dst->selected_valves[i] = src->selected_valves[i];
+        dst->selected_zones[i] = src->selected_zones[i];
+    }
+}
+
+static void copy_program_from_backend(const irr_program_t *src, program_data_t *dst)
+{
+    if (!src || !dst) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst->name, src->name, sizeof(dst->name));
+    dst->name[sizeof(dst->name) - 1] = '\0';
+    dst->auto_enabled = src->auto_enabled;
+    memcpy(dst->start_date, src->start_date, sizeof(dst->start_date));
+    dst->start_date[sizeof(dst->start_date) - 1] = '\0';
+    memcpy(dst->end_date, src->end_date, sizeof(dst->end_date));
+    dst->end_date[sizeof(dst->end_date) - 1] = '\0';
+    memcpy(dst->condition, src->condition, sizeof(dst->condition));
+    dst->condition[sizeof(dst->condition) - 1] = '\0';
+    memcpy(dst->formula, src->formula, sizeof(dst->formula));
+    dst->formula[sizeof(dst->formula) - 1] = '\0';
+    dst->pre_water = src->pre_water;
+    dst->post_water = src->post_water;
+    memcpy(dst->mode, src->mode, sizeof(dst->mode));
+    dst->mode[sizeof(dst->mode) - 1] = '\0';
+    memcpy(dst->next_start, src->next_start, sizeof(dst->next_start));
+    dst->next_start[sizeof(dst->next_start) - 1] = '\0';
+    dst->total_duration = src->total_duration;
+    dst->period_count = src->period_count;
+
+    if (dst->period_count > MAX_PERIODS) {
+        dst->period_count = MAX_PERIODS;
+    }
+
+    for (int i = 0; i < dst->period_count; i++) {
+        dst->periods[i].enabled = src->periods[i].enabled;
+        memcpy(dst->periods[i].time, src->periods[i].time, sizeof(dst->periods[i].time));
+        dst->periods[i].time[sizeof(dst->periods[i].time) - 1] = '\0';
+    }
+
+    for (int i = 0; i < 10; i++) {
+        dst->selected_valves[i] = src->selected_valves[i];
+        dst->selected_zones[i] = src->selected_zones[i];
+    }
+}
+
+static void copy_formula_to_backend(const formula_data_t *src, irr_formula_t *dst)
+{
+    if (!src || !dst) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst->name, src->name, sizeof(dst->name));
+    dst->name[sizeof(dst->name) - 1] = '\0';
+    dst->method = src->method;
+    dst->dilution = src->dilution;
+    dst->ec = src->ec;
+    dst->ph = src->ph;
+    dst->valve_opening = src->valve_opening;
+    dst->stir_time = src->stir_time;
+    dst->channel_count = src->channel_count;
+}
+
+static void copy_formula_from_backend(const irr_formula_t *src, formula_data_t *dst)
+{
+    if (!src || !dst) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst->name, src->name, sizeof(dst->name));
+    dst->name[sizeof(dst->name) - 1] = '\0';
+    dst->method = src->method;
+    dst->dilution = src->dilution;
+    dst->ec = src->ec;
+    dst->ph = src->ph;
+    dst->valve_opening = src->valve_opening;
+    dst->stir_time = src->stir_time;
+    dst->channel_count = src->channel_count;
+}
+
+static esp_err_t persist_all_programs_to_backend(void)
+{
+    if (g_program_count < 0 || g_program_count > IRR_MAX_PROGRAMS) {
+        ESP_LOGE(PROG_TAG, "Program count out of range: %d", g_program_count);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    irr_program_t backend_programs[IRR_MAX_PROGRAMS] = {0};
+    for (int i = 0; i < g_program_count; i++) {
+        copy_program_to_backend(&g_programs[i], &backend_programs[i]);
+    }
+
+    esp_err_t ret = irrigation_scheduler_replace_programs(backend_programs, g_program_count);
+    if (ret != ESP_OK) {
+        ESP_LOGE(PROG_TAG, "Persist programs failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t persist_all_formulas_to_backend(void)
+{
+    if (g_formula_count < 0 || g_formula_count > IRR_MAX_FORMULAS) {
+        ESP_LOGE(PROG_TAG, "Formula count out of range: %d", g_formula_count);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    irr_formula_t backend_formulas[IRR_MAX_FORMULAS] = {0};
+    for (int i = 0; i < g_formula_count; i++) {
+        copy_formula_to_backend(&g_formulas[i], &backend_formulas[i]);
+    }
+
+    esp_err_t ret = irrigation_scheduler_replace_formulas(backend_formulas, g_formula_count);
+    if (ret != ESP_OK) {
+        ESP_LOGE(PROG_TAG, "Persist formulas failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
 
 static void nvs_save_program(int index)
 {
-    if (index < 0 || index >= g_program_count) return;
-    nvs_handle_t h;
-    if (nvs_open(PROG_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    char key[16];
-    snprintf(key, sizeof(key), "p%d", index);
-    nvs_set_blob(h, key, &g_programs[index], sizeof(program_data_t));
-    nvs_set_u8(h, "cnt", (uint8_t)g_program_count);
-    nvs_commit(h);
-    nvs_close(h);
+    (void)index;
+    persist_all_programs_to_backend();
 }
 
 static void nvs_save_all_programs(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(PROG_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    /* Erase old keys beyond current count */
-    for (int i = 0; i < MAX_PROGRAMS; i++) {
-        char key[8];
-        snprintf(key, sizeof(key), "p%d", i);
-        if (i < g_program_count) {
-            nvs_set_blob(h, key, &g_programs[i], sizeof(program_data_t));
-        } else {
-            nvs_erase_key(h, key);  /* ignore error if key doesn't exist */
-        }
-    }
-    nvs_set_u8(h, "cnt", (uint8_t)g_program_count);
-    nvs_commit(h);
-    nvs_close(h);
+    persist_all_programs_to_backend();
 }
 
 static void nvs_save_formula(int index)
 {
-    if (index < 0 || index >= g_formula_count) return;
-    nvs_handle_t h;
-    if (nvs_open(FORM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    char key[16];
-    snprintf(key, sizeof(key), "f%d", index);
-    nvs_set_blob(h, key, &g_formulas[index], sizeof(formula_data_t));
-    nvs_set_u8(h, "cnt", (uint8_t)g_formula_count);
-    nvs_commit(h);
-    nvs_close(h);
+    (void)index;
+    persist_all_formulas_to_backend();
 }
 
 static void nvs_save_all_formulas(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(FORM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    for (int i = 0; i < MAX_FORMULAS; i++) {
-        char key[8];
-        snprintf(key, sizeof(key), "f%d", i);
-        if (i < g_formula_count) {
-            nvs_set_blob(h, key, &g_formulas[i], sizeof(formula_data_t));
-        } else {
-            nvs_erase_key(h, key);
+    persist_all_formulas_to_backend();
+}
+
+static void reload_programs_from_backend(void)
+{
+    g_program_count = irrigation_scheduler_get_program_count();
+    if (g_program_count > MAX_PROGRAMS) {
+        g_program_count = MAX_PROGRAMS;
+    }
+
+    memset(g_programs, 0, sizeof(g_programs));
+    for (int i = 0; i < g_program_count; i++) {
+        irr_program_t backend_program = {0};
+        if (irrigation_scheduler_get_program(i, &backend_program)) {
+            copy_program_from_backend(&backend_program, &g_programs[i]);
         }
     }
-    nvs_set_u8(h, "cnt", (uint8_t)g_formula_count);
-    nvs_commit(h);
-    nvs_close(h);
 }
 
 void ui_program_store_init(void)
 {
-    nvs_handle_t h;
+    reload_programs_from_backend();
+    ESP_LOGI(PROG_TAG, "Loaded %d programs from backend store", g_program_count);
 
-    /* Load programs */
-    if (nvs_open(PROG_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t cnt = 0;
-        nvs_get_u8(h, "cnt", &cnt);
-        if (cnt > MAX_PROGRAMS) cnt = MAX_PROGRAMS;
-        g_program_count = 0;
-        for (int i = 0; i < cnt; i++) {
-            char key[8];
-            snprintf(key, sizeof(key), "p%d", i);
-            size_t len = sizeof(program_data_t);
-            if (nvs_get_blob(h, key, &g_programs[i], &len) == ESP_OK) {
-                g_program_count++;
-            }
-        }
-        nvs_close(h);
-        ESP_LOGI(PROG_TAG, "Loaded %d programs from NVS", g_program_count);
+    g_formula_count = irrigation_scheduler_get_formula_count();
+    if (g_formula_count > MAX_FORMULAS) {
+        g_formula_count = MAX_FORMULAS;
     }
 
-    /* Load formulas */
-    if (nvs_open(FORM_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t cnt = 0;
-        nvs_get_u8(h, "cnt", &cnt);
-        if (cnt > MAX_FORMULAS) cnt = MAX_FORMULAS;
-        g_formula_count = 0;
-        for (int i = 0; i < cnt; i++) {
-            char key[8];
-            snprintf(key, sizeof(key), "f%d", i);
-            size_t len = sizeof(formula_data_t);
-            if (nvs_get_blob(h, key, &g_formulas[i], &len) == ESP_OK) {
-                g_formula_count++;
-            }
+    memset(g_formulas, 0, sizeof(g_formulas));
+    for (int i = 0; i < g_formula_count; i++) {
+        irr_formula_t backend_formula = {0};
+        if (irrigation_scheduler_get_formula(i, &backend_formula)) {
+            copy_formula_from_backend(&backend_formula, &g_formulas[i]);
         }
-        nvs_close(h);
-        ESP_LOGI(PROG_TAG, "Loaded %d formulas from NVS", g_formula_count);
     }
+    ESP_LOGI(PROG_TAG, "Loaded %d formulas from backend store", g_formula_count);
 }
 
 /* ---- Date helpers (same as ui_alarm.c) ---- */
+
+static void clear_program_form_widget_refs(void)
+{
+    g_checkbox_auto = NULL;
+    g_input_start_date = NULL;
+    g_input_end_date = NULL;
+    g_input_pre_water = NULL;
+    g_input_post_water = NULL;
+    g_dropdown_condition = NULL;
+    g_dropdown_formula = NULL;
+    g_dropdown_mode = NULL;
+}
 
 static void get_today_str(char *buf, int buf_size)
 {
@@ -333,6 +483,51 @@ static void get_today_str(char *buf, int buf_size)
     } else {
         snprintf(buf, buf_size, "%04d-%02d-%02d",
                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+    }
+}
+
+static int program_get_display_duration(const program_data_t *prog)
+{
+    if (!prog) {
+        return 0;
+    }
+
+    if (prog->total_duration > 0) {
+        return prog->total_duration;
+    }
+
+    return prog->pre_water + prog->post_water;
+}
+
+static void format_program_period_text(const program_data_t *prog, char *buf, int buf_size)
+{
+    if (!buf || buf_size <= 0) {
+        return;
+    }
+
+    buf[0] = '\0';
+
+    if (!prog || prog->period_count <= 0) {
+        snprintf(buf, buf_size, "--");
+        return;
+    }
+
+    for (int i = 0; i < prog->period_count; i++) {
+        if (prog->periods[i].time[0] == '\0') {
+            continue;
+        }
+
+        size_t used = strlen(buf);
+        if (used >= (size_t)(buf_size - 1)) {
+            break;
+        }
+
+        snprintf(buf + used, buf_size - (int)used, "%s%s",
+                 used > 0 ? " / " : "", prog->periods[i].time);
+    }
+
+    if (buf[0] == '\0') {
+        snprintf(buf, buf_size, "--");
     }
 }
 
@@ -412,6 +607,20 @@ void ui_program_close_overlays(void)
     }
 }
 
+void ui_program_register_selection_query_cbs(
+    ui_get_valve_count_cb_t valve_count_cb,
+    ui_get_valve_list_cb_t  valve_list_cb,
+    ui_get_zone_count_cb_t  zone_count_cb,
+    ui_get_zone_list_cb_t   zone_list_cb,
+    ui_get_zone_detail_cb_t zone_detail_cb)
+{
+    g_program_valve_count_cb = valve_count_cb;
+    g_program_valve_list_cb = valve_list_cb;
+    g_program_zone_count_cb = zone_count_cb;
+    g_program_zone_list_cb = zone_list_cb;
+    g_program_zone_detail_cb = zone_detail_cb;
+}
+
 /**
  * @brief 创建程序管理界面
  * @param parent 父容器（主内容区）
@@ -456,6 +665,9 @@ void ui_program_create(lv_obj_t *parent)
     g_table_bg = NULL;
     g_warning_dialog = NULL;
     g_delete_confirm_dialog = NULL;
+    g_zone_table_bg = NULL;
+    memset(g_zone_valve_checkboxes, 0, sizeof(g_zone_valve_checkboxes));
+    memset(g_zone_zone_checkboxes, 0, sizeof(g_zone_zone_checkboxes));
     g_input_program_name = NULL;
     g_checkbox_auto = NULL;
     g_formula_name_input = NULL;
@@ -1124,7 +1336,11 @@ static void btn_confirm_add_cb(lv_event_t *e)
 
     /* 设置其他默认值 */
     snprintf(prog->next_start, sizeof(prog->next_start), "--");
-    prog->total_duration = 0;
+    int min_total_duration = prog->pre_water + prog->post_water;
+    if (g_is_editing_program && prog->total_duration > min_total_duration) {
+        min_total_duration = prog->total_duration;
+    }
+    prog->total_duration = min_total_duration;
 
     /* 保存到NVS */
     int save_idx = g_is_editing_program ? g_editing_program_index : (g_program_count - 1);
@@ -1542,10 +1758,7 @@ static void menu_irrigation_date_cb(lv_event_t *e)
     if (g_form_area)
     {
         lv_obj_clean(g_form_area);
-        /* 重置指针,因为对象已被删除 */
-        g_checkbox_auto = NULL;
-        g_input_start_date = NULL;
-        g_input_end_date = NULL;
+        clear_program_form_widget_refs();
         create_irrigation_date_panel(g_form_area);
     }
 }
@@ -1590,10 +1803,7 @@ static void menu_irrigation_period_cb(lv_event_t *e)
     if (g_form_area)
     {
         lv_obj_clean(g_form_area);
-        /* 重置指针,因为对象已被删除 */
-        g_checkbox_auto = NULL;
-        g_input_start_date = NULL;
-        g_input_end_date = NULL;
+        clear_program_form_widget_refs();
         create_irrigation_period_panel(g_form_area);
     }
 }
@@ -1638,10 +1848,7 @@ static void menu_irrigation_zone_cb(lv_event_t *e)
     if (g_form_area)
     {
         lv_obj_clean(g_form_area);
-        /* 重置指针,因为对象已被删除 */
-        g_checkbox_auto = NULL;
-        g_input_start_date = NULL;
-        g_input_end_date = NULL;
+        clear_program_form_widget_refs();
         create_irrigation_zone_panel(g_form_area);
     }
 }
@@ -2014,17 +2221,17 @@ static void create_irrigation_date_panel(lv_obj_t *parent)
 static void create_irrigation_zone_panel(lv_obj_t *parent)
 {
     /* 创建表格区域 */
-    lv_obj_t *table_bg = lv_obj_create(parent);
-    lv_obj_set_size(table_bg, 883, 520);
-    lv_obj_set_pos(table_bg, 10, 10);
-    lv_obj_set_style_bg_color(table_bg, lv_color_white(), 0);
-    lv_obj_set_style_border_width(table_bg, 0, 0);
-    lv_obj_set_style_pad_all(table_bg, 0, 0);
-    lv_obj_set_style_radius(table_bg, 0, 0);
-    lv_obj_clear_flag(table_bg, LV_OBJ_FLAG_SCROLLABLE);
+    g_zone_table_bg = lv_obj_create(parent);
+    lv_obj_set_size(g_zone_table_bg, 883, 520);
+    lv_obj_set_pos(g_zone_table_bg, 10, 10);
+    lv_obj_set_style_bg_color(g_zone_table_bg, lv_color_white(), 0);
+    lv_obj_set_style_border_width(g_zone_table_bg, 0, 0);
+    lv_obj_set_style_pad_all(g_zone_table_bg, 0, 0);
+    lv_obj_set_style_radius(g_zone_table_bg, 0, 0);
+    lv_obj_clear_flag(g_zone_table_bg, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 表头背景 */
-    lv_obj_t *header_bg = lv_obj_create(table_bg);
+    lv_obj_t *header_bg = lv_obj_create(g_zone_table_bg);
     lv_obj_set_size(header_bg, 883, 50);
     lv_obj_set_pos(header_bg, 0, 0);
     lv_obj_set_style_bg_color(header_bg, lv_color_hex(0xf0f0f0), 0);
@@ -2046,6 +2253,8 @@ static void create_irrigation_zone_panel(lv_obj_t *parent)
         lv_obj_set_pos(header_label, x_pos + 20, 17);
         x_pos += header_widths[i];
     }
+
+    refresh_irrigation_zone_table();
 
     /* 底部按钮区域 - 距离白色底边20px */
     int btn_height = 45;               /* 按钮高度 */
@@ -3020,6 +3229,9 @@ static void create_zone_selection_dialog(void)
     {
         lv_obj_del(g_zone_dialog);
         g_zone_dialog = NULL;
+        g_zone_tab_valve = NULL;
+        g_zone_tab_zone = NULL;
+        g_zone_content = NULL;
     }
 
     /* 创建对话框背景 - 只覆盖内容区域，不覆盖左侧菜单栏和底部状态栏 */
@@ -3119,6 +3331,9 @@ static void btn_zone_cancel_cb(lv_event_t *e)
     {
         lv_obj_del(g_zone_dialog);
         g_zone_dialog = NULL;
+        g_zone_tab_valve = NULL;
+        g_zone_tab_zone = NULL;
+        g_zone_content = NULL;
     }
 }
 
@@ -3128,11 +3343,14 @@ static void btn_zone_cancel_cb(lv_event_t *e)
 static void btn_zone_confirm_cb(lv_event_t *e)
 {
     (void)e;
-    /* TODO: 保存选择的灌区/阀门 */
+    refresh_irrigation_zone_table();
     if (g_zone_dialog)
     {
         lv_obj_del(g_zone_dialog);
         g_zone_dialog = NULL;
+        g_zone_tab_valve = NULL;
+        g_zone_tab_zone = NULL;
+        g_zone_content = NULL;
     }
 }
 
@@ -3142,7 +3360,6 @@ static void btn_zone_confirm_cb(lv_event_t *e)
 static void tab_valve_cb(lv_event_t *e)
 {
     (void)e;
-    /* 切换到阀门标签 */
     lv_obj_set_style_bg_color(g_zone_tab_valve, COLOR_PRIMARY, 0);
     lv_obj_set_style_bg_color(g_zone_tab_zone, lv_color_white(), 0);
     lv_obj_set_style_border_width(g_zone_tab_valve, 0, 0);
@@ -3150,17 +3367,20 @@ static void tab_valve_cb(lv_event_t *e)
 
     lv_obj_t *label_valve = lv_obj_get_child(g_zone_tab_valve, 0);
     lv_obj_t *label_zone = lv_obj_get_child(g_zone_tab_zone, 0);
-    if (label_valve)
+    if (label_valve) {
         lv_obj_set_style_text_color(label_valve, lv_color_white(), 0);
-    if (label_zone)
+    }
+    if (label_zone) {
         lv_obj_set_style_text_color(label_zone, lv_color_black(), 0);
+    }
 
-    /* 更新内容区域显示阀门列表 */
+    memset(g_zone_valve_checkboxes, 0, sizeof(g_zone_valve_checkboxes));
+    ensure_program_selection_cache_loaded();
+
     if (g_zone_content)
     {
         lv_obj_clean(g_zone_content);
 
-        /* 创建阀门列表表格 */
         lv_obj_t *table_bg = lv_obj_create(g_zone_content);
         lv_obj_set_size(table_bg, 1148, 575);
         lv_obj_set_pos(table_bg, 0, 0);
@@ -3170,7 +3390,6 @@ static void tab_valve_cb(lv_event_t *e)
         lv_obj_set_style_radius(table_bg, 0, 0);
         lv_obj_clear_flag(table_bg, LV_OBJ_FLAG_SCROLLABLE);
 
-        /* 表头背景 */
         lv_obj_t *header_bg = lv_obj_create(table_bg);
         lv_obj_set_size(header_bg, 1148, 50);
         lv_obj_set_pos(header_bg, 0, 0);
@@ -3179,7 +3398,6 @@ static void tab_valve_cb(lv_event_t *e)
         lv_obj_set_style_radius(header_bg, 0, 0);
         lv_obj_set_style_pad_all(header_bg, 0, 0);
 
-        /* 表头列 */
         const char *headers[] = {"勾选", "序号", "阀门名称", "所属灌区"};
         int header_widths[] = {100, 100, 400, 548};
         int x_pos = 0;
@@ -3194,119 +3412,44 @@ static void tab_valve_cb(lv_event_t *e)
             x_pos += header_widths[i];
         }
 
-        /* 示例数据行 - 阀门1 */
-        int row_y = 60;
+        if (g_program_cached_valve_count == 0) {
+            lv_obj_t *empty_label = lv_label_create(table_bg);
+            lv_label_set_text(empty_label, "暂无阀门数据");
+            lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
+            lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
+            lv_obj_set_pos(empty_label, 20, 70);
+            return;
+        }
 
-        /* 复选框 */
-        lv_obj_t *checkbox1 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox1, 30, row_y);
-        lv_checkbox_set_text(checkbox1, "");
+        for (int i = 0; i < g_program_cached_valve_count && i < 10; i++) {
+            int row_y = 60 + i * 50;
+            char zone_name[32];
+            find_zone_name_for_valve(g_program_cached_valves[i].id, zone_name, sizeof(zone_name));
 
-        /* 序号 */
-        lv_obj_t *label_no1 = lv_label_create(table_bg);
-        lv_label_set_text(label_no1, "1");
-        lv_obj_set_pos(label_no1, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no1, &my_font_cn_16, 0);
+            lv_obj_t *checkbox = lv_checkbox_create(table_bg);
+            lv_obj_set_pos(checkbox, 30, row_y);
+            lv_checkbox_set_text(checkbox, "");
+            if (g_temp_selected_valves[i]) {
+                lv_obj_add_state(checkbox, LV_STATE_CHECKED);
+            }
+            lv_obj_add_event_cb(checkbox, zone_selection_checkbox_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
+            g_zone_valve_checkboxes[i] = checkbox;
 
-        /* 阀门名称 */
-        lv_obj_t *label_name1 = lv_label_create(table_bg);
-        lv_label_set_text(label_name1, "1号阀门");
-        lv_obj_set_pos(label_name1, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name1, &my_font_cn_16, 0);
+            lv_obj_t *label_no = lv_label_create(table_bg);
+            lv_label_set_text_fmt(label_no, "%d", i + 1);
+            lv_obj_set_pos(label_no, 120, row_y + 5);
+            lv_obj_set_style_text_font(label_no, &my_font_cn_16, 0);
 
-        /* 所属灌区 */
-        lv_obj_t *label_zone1 = lv_label_create(table_bg);
-        lv_label_set_text(label_zone1, "1号灌区");
-        lv_obj_set_pos(label_zone1, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_zone1, &my_font_cn_16, 0);
+            lv_obj_t *label_name = lv_label_create(table_bg);
+            lv_label_set_text(label_name, g_program_cached_valves[i].name[0] ? g_program_cached_valves[i].name : "--");
+            lv_obj_set_pos(label_name, 220, row_y + 5);
+            lv_obj_set_style_text_font(label_name, &my_font_cn_16, 0);
 
-        /* 示例数据行 - 阀门2 */
-        row_y = 110;
-
-        lv_obj_t *checkbox2 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox2, 30, row_y);
-        lv_checkbox_set_text(checkbox2, "");
-
-        lv_obj_t *label_no2 = lv_label_create(table_bg);
-        lv_label_set_text(label_no2, "2");
-        lv_obj_set_pos(label_no2, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no2, &my_font_cn_16, 0);
-
-        lv_obj_t *label_name2 = lv_label_create(table_bg);
-        lv_label_set_text(label_name2, "2号阀门");
-        lv_obj_set_pos(label_name2, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name2, &my_font_cn_16, 0);
-
-        lv_obj_t *label_zone2 = lv_label_create(table_bg);
-        lv_label_set_text(label_zone2, "1号灌区");
-        lv_obj_set_pos(label_zone2, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_zone2, &my_font_cn_16, 0);
-
-        /* 示例数据行 - 阀门3 */
-        row_y = 160;
-
-        lv_obj_t *checkbox3 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox3, 30, row_y);
-        lv_checkbox_set_text(checkbox3, "");
-
-        lv_obj_t *label_no3 = lv_label_create(table_bg);
-        lv_label_set_text(label_no3, "3");
-        lv_obj_set_pos(label_no3, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no3, &my_font_cn_16, 0);
-
-        lv_obj_t *label_name3 = lv_label_create(table_bg);
-        lv_label_set_text(label_name3, "3号阀门");
-        lv_obj_set_pos(label_name3, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name3, &my_font_cn_16, 0);
-
-        lv_obj_t *label_zone3 = lv_label_create(table_bg);
-        lv_label_set_text(label_zone3, "1号灌区");
-        lv_obj_set_pos(label_zone3, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_zone3, &my_font_cn_16, 0);
-
-        /* 示例数据行 - 阀门4 */
-        row_y = 210;
-
-        lv_obj_t *checkbox4 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox4, 30, row_y);
-        lv_checkbox_set_text(checkbox4, "");
-
-        lv_obj_t *label_no4 = lv_label_create(table_bg);
-        lv_label_set_text(label_no4, "4");
-        lv_obj_set_pos(label_no4, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no4, &my_font_cn_16, 0);
-
-        lv_obj_t *label_name4 = lv_label_create(table_bg);
-        lv_label_set_text(label_name4, "4号阀门");
-        lv_obj_set_pos(label_name4, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name4, &my_font_cn_16, 0);
-
-        lv_obj_t *label_zone4 = lv_label_create(table_bg);
-        lv_label_set_text(label_zone4, "2号灌区");
-        lv_obj_set_pos(label_zone4, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_zone4, &my_font_cn_16, 0);
-
-        /* 示例数据行 - 阀门5 */
-        row_y = 260;
-
-        lv_obj_t *checkbox5 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox5, 30, row_y);
-        lv_checkbox_set_text(checkbox5, "");
-
-        lv_obj_t *label_no5 = lv_label_create(table_bg);
-        lv_label_set_text(label_no5, "5");
-        lv_obj_set_pos(label_no5, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no5, &my_font_cn_16, 0);
-
-        lv_obj_t *label_name5 = lv_label_create(table_bg);
-        lv_label_set_text(label_name5, "5号阀门");
-        lv_obj_set_pos(label_name5, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name5, &my_font_cn_16, 0);
-
-        lv_obj_t *label_zone5 = lv_label_create(table_bg);
-        lv_label_set_text(label_zone5, "2号灌区");
-        lv_obj_set_pos(label_zone5, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_zone5, &my_font_cn_16, 0);
+            lv_obj_t *label_zone_name = lv_label_create(table_bg);
+            lv_label_set_text(label_zone_name, zone_name);
+            lv_obj_set_pos(label_zone_name, 620, row_y + 5);
+            lv_obj_set_style_text_font(label_zone_name, &my_font_cn_16, 0);
+        }
     }
 }
 
@@ -3316,7 +3459,6 @@ static void tab_valve_cb(lv_event_t *e)
 static void tab_zone_cb(lv_event_t *e)
 {
     (void)e;
-    /* 切换到灌区标签 */
     lv_obj_set_style_bg_color(g_zone_tab_zone, COLOR_PRIMARY, 0);
     lv_obj_set_style_bg_color(g_zone_tab_valve, lv_color_white(), 0);
     lv_obj_set_style_border_width(g_zone_tab_zone, 0, 0);
@@ -3324,17 +3466,20 @@ static void tab_zone_cb(lv_event_t *e)
 
     lv_obj_t *label_zone = lv_obj_get_child(g_zone_tab_zone, 0);
     lv_obj_t *label_valve = lv_obj_get_child(g_zone_tab_valve, 0);
-    if (label_zone)
+    if (label_zone) {
         lv_obj_set_style_text_color(label_zone, lv_color_white(), 0);
-    if (label_valve)
+    }
+    if (label_valve) {
         lv_obj_set_style_text_color(label_valve, lv_color_black(), 0);
+    }
 
-    /* 更新内容区域显示灌区列表 */
+    memset(g_zone_zone_checkboxes, 0, sizeof(g_zone_zone_checkboxes));
+    ensure_program_selection_cache_loaded();
+
     if (g_zone_content)
     {
         lv_obj_clean(g_zone_content);
 
-        /* 创建灌区列表表格 */
         lv_obj_t *table_bg = lv_obj_create(g_zone_content);
         lv_obj_set_size(table_bg, 1148, 575);
         lv_obj_set_pos(table_bg, 0, 0);
@@ -3344,7 +3489,6 @@ static void tab_zone_cb(lv_event_t *e)
         lv_obj_set_style_radius(table_bg, 0, 0);
         lv_obj_clear_flag(table_bg, LV_OBJ_FLAG_SCROLLABLE);
 
-        /* 表头背景 */
         lv_obj_t *header_bg = lv_obj_create(table_bg);
         lv_obj_set_size(header_bg, 1148, 50);
         lv_obj_set_pos(header_bg, 0, 0);
@@ -3353,7 +3497,6 @@ static void tab_zone_cb(lv_event_t *e)
         lv_obj_set_style_radius(header_bg, 0, 0);
         lv_obj_set_style_pad_all(header_bg, 0, 0);
 
-        /* 表头列 */
         const char *headers[] = {"勾选", "序号", "灌区名称", "包含阀门"};
         int header_widths[] = {100, 100, 400, 548};
         int x_pos = 0;
@@ -3368,75 +3511,43 @@ static void tab_zone_cb(lv_event_t *e)
             x_pos += header_widths[i];
         }
 
-        /* 示例数据行 - 灌区1 */
-        int row_y = 60;
+        if (g_program_cached_zone_count == 0) {
+            lv_obj_t *empty_label = lv_label_create(table_bg);
+            lv_label_set_text(empty_label, "暂无灌区数据");
+            lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
+            lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
+            lv_obj_set_pos(empty_label, 20, 70);
+            return;
+        }
 
-        /* 复选框 */
-        lv_obj_t *checkbox1 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox1, 30, row_y);
-        lv_checkbox_set_text(checkbox1, "");
+        for (int i = 0; i < g_program_cached_zone_count && i < 10; i++) {
+            int row_y = 60 + i * 50;
+            const char *valve_names = g_program_cached_zones[i].valve_names[0] ? g_program_cached_zones[i].valve_names : "--";
 
-        /* 序号 */
-        lv_obj_t *label_no1 = lv_label_create(table_bg);
-        lv_label_set_text(label_no1, "1");
-        lv_obj_set_pos(label_no1, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no1, &my_font_cn_16, 0);
+            lv_obj_t *checkbox = lv_checkbox_create(table_bg);
+            lv_obj_set_pos(checkbox, 30, row_y);
+            lv_checkbox_set_text(checkbox, "");
+            if (g_temp_selected_zones[i]) {
+                lv_obj_add_state(checkbox, LV_STATE_CHECKED);
+            }
+            lv_obj_add_event_cb(checkbox, zone_selection_checkbox_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)(0x100 + i));
+            g_zone_zone_checkboxes[i] = checkbox;
 
-        /* 灌区名称 */
-        lv_obj_t *label_name1 = lv_label_create(table_bg);
-        lv_label_set_text(label_name1, "1号灌区");
-        lv_obj_set_pos(label_name1, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name1, &my_font_cn_16, 0);
+            lv_obj_t *label_no = lv_label_create(table_bg);
+            lv_label_set_text_fmt(label_no, "%d", i + 1);
+            lv_obj_set_pos(label_no, 120, row_y + 5);
+            lv_obj_set_style_text_font(label_no, &my_font_cn_16, 0);
 
-        /* 包含阀门 */
-        lv_obj_t *label_valves1 = lv_label_create(table_bg);
-        lv_label_set_text(label_valves1, "1号阀门, 2号阀门, 3号阀门");
-        lv_obj_set_pos(label_valves1, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_valves1, &my_font_cn_16, 0);
+            lv_obj_t *label_name = lv_label_create(table_bg);
+            lv_label_set_text(label_name, g_program_cached_zones[i].name[0] ? g_program_cached_zones[i].name : "--");
+            lv_obj_set_pos(label_name, 220, row_y + 5);
+            lv_obj_set_style_text_font(label_name, &my_font_cn_16, 0);
 
-        /* 示例数据行 - 灌区2 */
-        row_y = 110;
-
-        lv_obj_t *checkbox2 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox2, 30, row_y);
-        lv_checkbox_set_text(checkbox2, "");
-
-        lv_obj_t *label_no2 = lv_label_create(table_bg);
-        lv_label_set_text(label_no2, "2");
-        lv_obj_set_pos(label_no2, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no2, &my_font_cn_16, 0);
-
-        lv_obj_t *label_name2 = lv_label_create(table_bg);
-        lv_label_set_text(label_name2, "2号灌区");
-        lv_obj_set_pos(label_name2, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name2, &my_font_cn_16, 0);
-
-        lv_obj_t *label_valves2 = lv_label_create(table_bg);
-        lv_label_set_text(label_valves2, "4号阀门, 5号阀门");
-        lv_obj_set_pos(label_valves2, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_valves2, &my_font_cn_16, 0);
-
-        /* 示例数据行 - 灌区3 */
-        row_y = 160;
-
-        lv_obj_t *checkbox3 = lv_checkbox_create(table_bg);
-        lv_obj_set_pos(checkbox3, 30, row_y);
-        lv_checkbox_set_text(checkbox3, "");
-
-        lv_obj_t *label_no3 = lv_label_create(table_bg);
-        lv_label_set_text(label_no3, "3");
-        lv_obj_set_pos(label_no3, 120, row_y + 5);
-        lv_obj_set_style_text_font(label_no3, &my_font_cn_16, 0);
-
-        lv_obj_t *label_name3 = lv_label_create(table_bg);
-        lv_label_set_text(label_name3, "3号灌区");
-        lv_obj_set_pos(label_name3, 220, row_y + 5);
-        lv_obj_set_style_text_font(label_name3, &my_font_cn_16, 0);
-
-        lv_obj_t *label_valves3 = lv_label_create(table_bg);
-        lv_label_set_text(label_valves3, "6号阀门, 7号阀门, 8号阀门, 9号阀门");
-        lv_obj_set_pos(label_valves3, 620, row_y + 5);
-        lv_obj_set_style_text_font(label_valves3, &my_font_cn_16, 0);
+            lv_obj_t *label_valves = lv_label_create(table_bg);
+            lv_label_set_text(label_valves, valve_names);
+            lv_obj_set_pos(label_valves, 620, row_y + 5);
+            lv_obj_set_style_text_font(label_valves, &my_font_cn_16, 0);
+        }
     }
 }
 
@@ -3784,13 +3895,324 @@ static void reset_temp_form_data(void)
     g_dropdown_mode = NULL;
 }
 
+static void ensure_program_selection_cache_loaded(void)
+{
+    g_program_cached_valve_count = 0;
+    memset(g_program_cached_valves, 0, sizeof(g_program_cached_valves));
+    if (g_program_valve_count_cb && g_program_valve_list_cb) {
+        int total = g_program_valve_count_cb();
+        if (total > 10) {
+            total = 10;
+        }
+        if (total > 0) {
+            g_program_cached_valve_count = g_program_valve_list_cb(g_program_cached_valves, total, 0);
+            if (g_program_cached_valve_count < 0) {
+                g_program_cached_valve_count = 0;
+            } else if (g_program_cached_valve_count > 10) {
+                g_program_cached_valve_count = 10;
+            }
+        }
+    }
+
+    g_program_cached_zone_count = 0;
+    memset(g_program_cached_zones, 0, sizeof(g_program_cached_zones));
+    if (g_program_zone_count_cb && g_program_zone_list_cb) {
+        int total = g_program_zone_count_cb();
+        if (total > 10) {
+            total = 10;
+        }
+        if (total > 0) {
+            g_program_cached_zone_count = g_program_zone_list_cb(g_program_cached_zones, total, 0);
+            if (g_program_cached_zone_count < 0) {
+                g_program_cached_zone_count = 0;
+            } else if (g_program_cached_zone_count > 10) {
+                g_program_cached_zone_count = 10;
+            }
+        }
+    }
+}
+
+/**
+ * @brief 刷新灌区选择表格数据
+ */
+static void refresh_irrigation_zone_table(void)
+{
+    ensure_program_selection_cache_loaded();
+
+    if (!g_zone_table_bg) {
+        return;
+    }
+
+    uint32_t child_count = lv_obj_get_child_count(g_zone_table_bg);
+    for (uint32_t i = child_count; i > 1; i--) {
+        lv_obj_t *child = lv_obj_get_child(g_zone_table_bg, i - 1);
+        lv_obj_del(child);
+    }
+
+    int header_widths[] = {100, 250, 180, 200, 153};
+    int row_index = 0;
+
+    for (int i = 0; i < g_program_cached_valve_count && row_index < 10; i++) {
+        if (!g_temp_selected_valves[i]) {
+            continue;
+        }
+
+        int row_y = 60 + row_index * 50;
+        int x_pos = 0;
+
+        lv_obj_t *label_no = lv_label_create(g_zone_table_bg);
+        lv_label_set_text_fmt(label_no, "%d", row_index + 1);
+        lv_obj_set_pos(label_no, x_pos + 30, row_y + 15);
+        lv_obj_set_style_text_font(label_no, &my_font_cn_16, 0);
+        x_pos += header_widths[0];
+
+        lv_obj_t *label_name = lv_label_create(g_zone_table_bg);
+        lv_label_set_text(label_name, g_program_cached_valves[i].name[0] ? g_program_cached_valves[i].name : "--");
+        lv_obj_set_pos(label_name, x_pos + 10, row_y + 15);
+        lv_obj_set_style_text_font(label_name, &my_font_cn_16, 0);
+        x_pos += header_widths[1];
+
+        lv_obj_t *label_type = lv_label_create(g_zone_table_bg);
+        lv_label_set_text(label_type, "阀门");
+        lv_obj_set_pos(label_type, x_pos + 10, row_y + 15);
+        lv_obj_set_style_text_font(label_type, &my_font_cn_16, 0);
+        x_pos += header_widths[2];
+
+        lv_obj_t *label_duration = lv_label_create(g_zone_table_bg);
+        lv_label_set_text(label_duration, "--");
+        lv_obj_set_pos(label_duration, x_pos + 10, row_y + 15);
+        lv_obj_set_style_text_font(label_duration, &my_font_cn_16, 0);
+        x_pos += header_widths[3];
+
+        lv_obj_t *btn_del = lv_btn_create(g_zone_table_bg);
+        lv_obj_set_size(btn_del, 80, 30);
+        lv_obj_set_pos(btn_del, x_pos + 20, row_y + 8);
+        lv_obj_set_style_bg_color(btn_del, lv_color_hex(0xe74c3c), 0);
+        lv_obj_set_style_radius(btn_del, 5, 0);
+        lv_obj_add_event_cb(btn_del, btn_delete_selected_target_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *label_del = lv_label_create(btn_del);
+        lv_label_set_text(label_del, "删除");
+        lv_obj_set_style_text_color(label_del, lv_color_white(), 0);
+        lv_obj_set_style_text_font(label_del, &my_font_cn_16, 0);
+        lv_obj_center(label_del);
+
+        row_index++;
+    }
+
+    for (int i = 0; i < g_program_cached_zone_count && row_index < 10; i++) {
+        if (!g_temp_selected_zones[i]) {
+            continue;
+        }
+
+        int row_y = 60 + row_index * 50;
+        int x_pos = 0;
+
+        lv_obj_t *label_no = lv_label_create(g_zone_table_bg);
+        lv_label_set_text_fmt(label_no, "%d", row_index + 1);
+        lv_obj_set_pos(label_no, x_pos + 30, row_y + 15);
+        lv_obj_set_style_text_font(label_no, &my_font_cn_16, 0);
+        x_pos += header_widths[0];
+
+        lv_obj_t *label_name = lv_label_create(g_zone_table_bg);
+        lv_label_set_text(label_name, g_program_cached_zones[i].name[0] ? g_program_cached_zones[i].name : "--");
+        lv_obj_set_pos(label_name, x_pos + 10, row_y + 15);
+        lv_obj_set_style_text_font(label_name, &my_font_cn_16, 0);
+        x_pos += header_widths[1];
+
+        lv_obj_t *label_type = lv_label_create(g_zone_table_bg);
+        lv_label_set_text(label_type, "灌区");
+        lv_obj_set_pos(label_type, x_pos + 10, row_y + 15);
+        lv_obj_set_style_text_font(label_type, &my_font_cn_16, 0);
+        x_pos += header_widths[2];
+
+        lv_obj_t *label_duration = lv_label_create(g_zone_table_bg);
+        lv_label_set_text(label_duration, "--");
+        lv_obj_set_pos(label_duration, x_pos + 10, row_y + 15);
+        lv_obj_set_style_text_font(label_duration, &my_font_cn_16, 0);
+        x_pos += header_widths[3];
+
+        lv_obj_t *btn_del = lv_btn_create(g_zone_table_bg);
+        lv_obj_set_size(btn_del, 80, 30);
+        lv_obj_set_pos(btn_del, x_pos + 20, row_y + 8);
+        lv_obj_set_style_bg_color(btn_del, lv_color_hex(0xe74c3c), 0);
+        lv_obj_set_style_radius(btn_del, 5, 0);
+        lv_obj_add_event_cb(btn_del, btn_delete_selected_target_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(0x100 + i));
+
+        lv_obj_t *label_del = lv_label_create(btn_del);
+        lv_label_set_text(label_del, "删除");
+        lv_obj_set_style_text_color(label_del, lv_color_white(), 0);
+        lv_obj_set_style_text_font(label_del, &my_font_cn_16, 0);
+        lv_obj_center(label_del);
+
+        row_index++;
+    }
+}
+
+static void zone_selection_checkbox_cb(lv_event_t *e)
+{
+    lv_obj_t *checkbox = lv_event_get_target(e);
+    intptr_t raw = (intptr_t)lv_event_get_user_data(e);
+    bool is_zone = (raw & 0x100) != 0;
+    int index = (int)(raw & 0xFF);
+    bool checked = (lv_obj_get_state(checkbox) & LV_STATE_CHECKED) ? true : false;
+
+    if (index < 0 || index >= 10) {
+        return;
+    }
+
+    if (is_zone) {
+        g_temp_selected_zones[index] = checked;
+    } else {
+        g_temp_selected_valves[index] = checked;
+    }
+}
+
+static void btn_delete_selected_target_cb(lv_event_t *e)
+{
+    intptr_t raw = (intptr_t)lv_event_get_user_data(e);
+    bool is_zone = (raw & 0x100) != 0;
+    int index = (int)(raw & 0xFF);
+    show_delete_selected_target_confirm_dialog(is_zone, index);
+}
+
+static void show_delete_selected_target_confirm_dialog(bool is_zone, int index)
+{
+    g_delete_target_is_zone = is_zone;
+    g_delete_target_index = index;
+
+    if (g_delete_confirm_dialog != NULL)
+    {
+        lv_obj_del(g_delete_confirm_dialog);
+        g_delete_confirm_dialog = NULL;
+    }
+
+    g_delete_confirm_dialog = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_delete_confirm_dialog, 630, 390);
+    lv_obj_center(g_delete_confirm_dialog);
+    lv_obj_set_style_bg_color(g_delete_confirm_dialog, COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(g_delete_confirm_dialog, 0, 0);
+    lv_obj_set_style_radius(g_delete_confirm_dialog, 0, 0);
+    lv_obj_set_style_pad_all(g_delete_confirm_dialog, 5, 0);
+    lv_obj_clear_flag(g_delete_confirm_dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *content = lv_obj_create(g_delete_confirm_dialog);
+    lv_obj_set_size(content, 620, 380);
+    lv_obj_center(content);
+    lv_obj_set_style_bg_color(content, lv_color_white(), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 10, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title_label = lv_label_create(content);
+    lv_label_set_text(title_label, is_zone ? "删除灌区" : "删除阀门");
+    lv_obj_set_style_text_font(title_label, &my_fontbd_16, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_black(), 0);
+    lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 30);
+
+    lv_obj_t *msg = lv_label_create(content);
+    lv_label_set_text(msg, is_zone ? "是否从当前程序中删除该灌区" : "是否从当前程序中删除该阀门");
+    lv_obj_set_style_text_font(msg, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(msg, lv_color_black(), 0);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(msg);
+
+    lv_obj_t *btn_cancel = lv_btn_create(content);
+    lv_obj_set_size(btn_cancel, 160, 50);
+    lv_obj_align(btn_cancel, LV_ALIGN_BOTTOM_LEFT, 100, -30);
+    lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(0x808080), 0);
+    lv_obj_set_style_border_width(btn_cancel, 0, 0);
+    lv_obj_set_style_radius(btn_cancel, 25, 0);
+    lv_obj_add_event_cb(btn_cancel, btn_delete_selected_target_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *label_cancel = lv_label_create(btn_cancel);
+    lv_label_set_text(label_cancel, "取消删除");
+    lv_obj_set_style_text_color(label_cancel, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label_cancel, &my_font_cn_16, 0);
+    lv_obj_center(label_cancel);
+
+    lv_obj_t *btn_confirm = lv_btn_create(content);
+    lv_obj_set_size(btn_confirm, 160, 50);
+    lv_obj_align(btn_confirm, LV_ALIGN_BOTTOM_RIGHT, -100, -30);
+    lv_obj_set_style_bg_color(btn_confirm, lv_color_hex(0xe74c3c), 0);
+    lv_obj_set_style_border_width(btn_confirm, 0, 0);
+    lv_obj_set_style_radius(btn_confirm, 25, 0);
+    lv_obj_add_event_cb(btn_confirm, btn_delete_selected_target_confirm_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *label_confirm = lv_label_create(btn_confirm);
+    lv_label_set_text(label_confirm, "确认删除");
+    lv_obj_set_style_text_color(label_confirm, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label_confirm, &my_font_cn_16, 0);
+    lv_obj_center(label_confirm);
+}
+
+static void btn_delete_selected_target_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_delete_confirm_dialog != NULL)
+    {
+        lv_obj_del(g_delete_confirm_dialog);
+        g_delete_confirm_dialog = NULL;
+    }
+    g_delete_target_is_zone = false;
+    g_delete_target_index = -1;
+}
+
+static void btn_delete_selected_target_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (g_delete_target_index >= 0 && g_delete_target_index < 10) {
+        if (g_delete_target_is_zone) {
+            g_temp_selected_zones[g_delete_target_index] = false;
+        } else {
+            g_temp_selected_valves[g_delete_target_index] = false;
+        }
+    }
+
+    if (g_delete_confirm_dialog != NULL)
+    {
+        lv_obj_del(g_delete_confirm_dialog);
+        g_delete_confirm_dialog = NULL;
+    }
+    g_delete_target_is_zone = false;
+    g_delete_target_index = -1;
+    refresh_irrigation_zone_table();
+}
+
+static void find_zone_name_for_valve(uint16_t valve_id, char *buf, int buf_size)
+{
+    if (!buf || buf_size <= 0) {
+        return;
+    }
+
+    snprintf(buf, buf_size, "--");
+
+    if (!g_program_zone_detail_cb) {
+        return;
+    }
+
+    for (int i = 0; i < g_program_cached_zone_count; i++) {
+        ui_zone_add_params_t detail = {0};
+        if (!g_program_zone_detail_cb(g_program_cached_zones[i].slot_index, &detail)) {
+            continue;
+        }
+        for (int j = 0; j < detail.valve_count; j++) {
+            if (detail.valve_ids[j] == valve_id) {
+                snprintf(buf, buf_size, "%s", g_program_cached_zones[i].name[0] ? g_program_cached_zones[i].name : "--");
+                return;
+            }
+        }
+    }
+}
+
 /**
  * @brief 刷新程序管理表格数据
  */
 static void refresh_program_table(void)
 {
-    if (!g_table_bg)
-        return;
+    reload_programs_from_backend();
 
     /* 删除所有现有数据行（保留表头，表头是第一个子对象） */
     uint32_t child_count = lv_obj_get_child_count(g_table_bg);
@@ -4602,7 +5024,27 @@ int ui_program_get_duration(int index)
 {
     if (index < 0 || index >= g_program_count)
         return 0;
-    return g_programs[index].total_duration;
+    return program_get_display_duration(&g_programs[index]);
+}
+
+/**
+ * @brief 获取指定索引的程序启动时段摘要
+ * @param index 程序索引
+ * @param buf 输出缓冲区
+ * @param buf_size 缓冲区大小
+ */
+void ui_program_get_period_text(int index, char *buf, int buf_size)
+{
+    if (!buf || buf_size <= 0) {
+        return;
+    }
+
+    if (index < 0 || index >= g_program_count) {
+        snprintf(buf, buf_size, "--");
+        return;
+    }
+
+    format_program_period_text(&g_programs[index], buf, buf_size);
 }
 
 /**
@@ -4615,4 +5057,44 @@ const char* ui_program_get_formula(int index)
     if (index < 0 || index >= g_program_count)
         return NULL;
     return g_programs[index].formula;
+}
+
+/**
+ * @brief 获取指定索引的程序启动条件文本
+ * @param index 程序索引
+ * @param buf 输出缓冲区
+ * @param buf_size 缓冲区大小
+ */
+void ui_program_get_condition_text(int index, char *buf, int buf_size)
+{
+    if (!buf || buf_size <= 0) {
+        return;
+    }
+
+    if (index < 0 || index >= g_program_count) {
+        snprintf(buf, buf_size, "--");
+        return;
+    }
+
+    snprintf(buf, buf_size, "%s", g_programs[index].condition[0] ? g_programs[index].condition : "--");
+}
+
+/**
+ * @brief 获取指定索引的程序下次启动文本
+ * @param index 程序索引
+ * @param buf 输出缓冲区
+ * @param buf_size 缓冲区大小
+ */
+void ui_program_get_next_start_text(int index, char *buf, int buf_size)
+{
+    if (!buf || buf_size <= 0) {
+        return;
+    }
+
+    if (index < 0 || index >= g_program_count) {
+        snprintf(buf, buf_size, "--");
+        return;
+    }
+
+    snprintf(buf, buf_size, "%s", g_programs[index].next_start[0] ? g_programs[index].next_start : "--");
 }

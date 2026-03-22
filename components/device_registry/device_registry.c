@@ -587,11 +587,11 @@ esp_err_t sensor_registry_add(const dev_sensor_info_t *sensor)
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
-    /* 检查 composed_id 是否重复 */
+    /* 检查 point_id 是否重复 */
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
-        if (s_sensors[i].valid && s_sensors[i].composed_id == sensor->composed_id) {
+        if (s_sensors[i].valid && s_sensors[i].point_id == sensor->point_id) {
             xSemaphoreGive(s_mutex);
-            ESP_LOGW(TAG, "Sensor composed_id %lu already exists", (unsigned long)sensor->composed_id);
+            ESP_LOGW(TAG, "Sensor point_id %lu already exists", (unsigned long)sensor->point_id);
             return ESP_ERR_INVALID_STATE;
         }
     }
@@ -619,12 +619,12 @@ esp_err_t sensor_registry_add(const dev_sensor_info_t *sensor)
     return ESP_OK;
 }
 
-esp_err_t sensor_registry_remove(uint32_t composed_id)
+esp_err_t sensor_registry_remove(uint32_t point_id)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
-        if (s_sensors[i].valid && s_sensors[i].composed_id == composed_id) {
+        if (s_sensors[i].valid && s_sensors[i].point_id == point_id) {
             memset(&s_sensors[i], 0, sizeof(dev_sensor_info_t));
             xSemaphoreGive(s_mutex);
             persist_post(2, i);
@@ -636,13 +636,13 @@ esp_err_t sensor_registry_remove(uint32_t composed_id)
     return ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t sensor_registry_update(uint32_t composed_id, const dev_sensor_info_t *sensor)
+esp_err_t sensor_registry_update(uint32_t point_id, const dev_sensor_info_t *sensor)
 {
     if (!sensor) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
-        if (s_sensors[i].valid && s_sensors[i].composed_id == composed_id) {
+        if (s_sensors[i].valid && s_sensors[i].point_id == point_id) {
             s_sensors[i].type = sensor->type;
             memcpy(s_sensors[i].name, sensor->name, DEV_REG_NAME_LEN);
             s_sensors[i].name[DEV_REG_NAME_LEN - 1] = '\0';
@@ -656,32 +656,32 @@ esp_err_t sensor_registry_update(uint32_t composed_id, const dev_sensor_info_t *
     return ESP_ERR_NOT_FOUND;
 }
 
-bool sensor_registry_is_id_taken(uint32_t composed_id)
+bool sensor_registry_is_id_taken(uint32_t point_id)
 {
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
-        if (s_sensors[i].valid && s_sensors[i].composed_id == composed_id) {
+        if (s_sensors[i].valid && s_sensors[i].point_id == point_id) {
             return true;
         }
     }
     return false;
 }
 
-uint8_t sensor_registry_next_index(uint16_t parent_device_id)
+uint8_t sensor_registry_next_point_no(uint16_t parent_device_id)
 {
     bool used[100] = {false};
 
     for (int i = 0; i < DEV_REG_MAX_SENSORS; i++) {
         if (s_sensors[i].valid && s_sensors[i].parent_device_id == parent_device_id) {
-            uint8_t idx = s_sensors[i].sensor_index;
-            if (idx >= 1 && idx <= 99) {
-                used[idx] = true;
+            uint8_t point_no = s_sensors[i].point_no;
+            if (point_no >= 1 && point_no <= 99) {
+                used[point_no] = true;
             }
         }
     }
 
-    for (uint8_t idx = 1; idx <= 99; idx++) {
-        if (!used[idx]) {
-            return idx;
+    for (uint8_t point_no = 1; point_no <= 99; point_no++) {
+        if (!used[point_no]) {
+            return point_no;
         }
     }
 

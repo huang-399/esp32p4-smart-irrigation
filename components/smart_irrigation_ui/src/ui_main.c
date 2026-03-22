@@ -132,6 +132,10 @@ void ui_switch_nav(nav_item_t nav)
        to prevent zigbee async callbacks from accessing freed memory */
     ui_home_invalidate_objects();
 
+    /* Invalidate device page pointers before destroying content
+       to prevent zigbee async callbacks from accessing freed memory */
+    ui_device_invalidate_objects();
+
     /* 清空内容区 */
     lv_obj_clean(g_ui_main.content);
 
@@ -385,9 +389,11 @@ static void create_statusbar(void)
     /* 右侧：时间日期 */
     g_time_label = lv_label_create(g_ui_main.screen);
     lv_label_set_text(g_time_label, "--:--:--\n----/--/-- --");
+    lv_obj_set_size(g_time_label, 165, 40);
     lv_obj_set_style_text_color(g_time_label, COLOR_TEXT_WHITE, 0);
     lv_obj_set_style_text_font(g_time_label, &my_font_cn_16, 0);
     lv_obj_set_style_text_align(g_time_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(g_time_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_pos(g_time_label, 1100, 755);
 }
 

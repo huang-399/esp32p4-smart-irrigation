@@ -50,7 +50,7 @@ static void add_valve_cancel_cb(lv_event_t *e);
 static void add_valve_bg_click_cb(lv_event_t *e);
 static void valve_parent_device_changed_cb(lv_event_t *e);
 static void sensor_parent_changed_cb(lv_event_t *e);
-static void sensor_index_changed_cb(lv_event_t *e);
+static void sensor_point_no_changed_cb(lv_event_t *e);
 static void device_type_changed_cb(lv_event_t *e);
 static void sensor_type_changed_cb(lv_event_t *e);
 static void update_sensor_default_name(void);
@@ -72,8 +72,11 @@ static void zone_valve_select_all_cb_fn(lv_event_t *e);
 static void zone_device_select_all_cb_fn(lv_event_t *e);
 static void zone_valve_checkbox_cb(lv_event_t *e);
 static void zone_device_checkbox_cb(lv_event_t *e);
+static uint32_t calc_sensor_point_id(uint16_t parent_device_id, uint8_t point_no);
+static const char *get_sensor_group_name(uint32_t point_id);
 
 /* 全局变量 */
+static lv_obj_t *g_settings_container = NULL;
 static lv_obj_t *g_zone_management_view = NULL;   /* 灌区管理视图 */
 static lv_obj_t *g_device_management_view = NULL; /* 设备管理视图 */
 static lv_obj_t *g_valve_management_view = NULL;  /* 阀门管理视图 */
@@ -128,8 +131,8 @@ static lv_obj_t *g_valve_channel_dropdown = NULL;
 
 /* 传感器编号自动组合相关 */
 static lv_obj_t *g_sensor_id_prefix_label = NULL;  /* 父设备ID前缀显示 */
-static lv_obj_t *g_sensor_index_input = NULL;       /* 传感器序号输入 */
-static lv_obj_t *g_sensor_composed_label = NULL;    /* 组合编号显示 */
+static lv_obj_t *g_sensor_point_no_input = NULL;      /* 点位号输入 */
+static lv_obj_t *g_sensor_point_id_label = NULL;       /* 业务点编号显示 */
 
 /* 搜索传感器回调 */
 static ui_search_sensor_cb_t g_search_sensor_cb = NULL;
@@ -156,8 +159,7 @@ static ui_get_sensor_list_cb_t    g_sensor_list_cb = NULL;
 static ui_get_device_dropdown_cb_t g_dev_dropdown_cb = NULL;
 static ui_get_channel_count_cb_t   g_ch_count_cb = NULL;
 static ui_is_sensor_added_cb_t     g_is_sensor_added_cb = NULL;
-static ui_next_sensor_index_cb_t   g_next_sensor_idx_cb = NULL;
-static ui_get_sensor_parent_zb_type_cb_t g_sensor_parent_zb_type_cb = NULL;
+static ui_next_sensor_point_no_cb_t g_next_sensor_point_no_cb = NULL;
 static ui_parse_device_id_cb_t     g_parse_device_id_cb = NULL;
 
 /* ---- 查重回调指针 ---- */
@@ -202,7 +204,7 @@ static uint16_t g_editing_device_id = 0;
 static bool g_is_editing_valve = false;
 static uint16_t g_editing_valve_id = 0;
 static bool g_is_editing_sensor = false;
-static uint32_t g_editing_sensor_composed_id = 0;
+static uint32_t g_editing_sensor_point_id = 0;
 
 /* 编辑回调指针 */
 static ui_device_edit_cb_t  g_device_edit_cb = NULL;
@@ -280,6 +282,7 @@ static void textarea_click_cb(lv_event_t *e);
 void ui_settings_create(lv_obj_t *parent)
 {
     /* 重置静态指针（旧对象已被 ui_switch_nav 中的 lv_obj_clean 销毁） */
+    g_settings_container = NULL;
     g_zone_management_view = NULL;
     g_device_management_view = NULL;
     g_valve_management_view = NULL;
@@ -335,16 +338,16 @@ void ui_settings_create(lv_obj_t *parent)
     create_tab_buttons(parent);
 
     /* 创建主容器 - 用于放置不同的视图 */
-    lv_obj_t *container = lv_obj_create(parent);
-    lv_obj_set_size(container, 1168, 660);
-    lv_obj_set_pos(container, 5, 70);
-    lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(container, 0, 0);
-    lv_obj_set_style_pad_all(container, 0, 0);
-    lv_obj_clear_flag(container, LV_OBJ_FLAG_SCROLLABLE);
+    g_settings_container = lv_obj_create(parent);
+    lv_obj_set_size(g_settings_container, 1168, 660);
+    lv_obj_set_pos(g_settings_container, 5, 70);
+    lv_obj_set_style_bg_opa(g_settings_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_settings_container, 0, 0);
+    lv_obj_set_style_pad_all(g_settings_container, 0, 0);
+    lv_obj_clear_flag(g_settings_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 创建灌区管理视图容器 */
-    g_zone_management_view = lv_obj_create(container);
+    /* 默认只创建首个标签页，其他页面懒加载 */
+    g_zone_management_view = lv_obj_create(g_settings_container);
     lv_obj_set_size(g_zone_management_view, 1168, 660);
     lv_obj_set_pos(g_zone_management_view, 0, 0);
     lv_obj_set_style_bg_color(g_zone_management_view, lv_color_white(), 0);
@@ -352,74 +355,7 @@ void ui_settings_create(lv_obj_t *parent)
     lv_obj_set_style_radius(g_zone_management_view, 10, 0);
     lv_obj_set_style_pad_all(g_zone_management_view, 15, 0);
     lv_obj_clear_flag(g_zone_management_view, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* 创建灌区管理界面内容 */
     create_zone_management_view(g_zone_management_view);
-
-    /* 创建设备管理视图 */
-    g_device_management_view = lv_obj_create(container);
-    lv_obj_set_size(g_device_management_view, 1168, 660);
-    lv_obj_set_pos(g_device_management_view, 0, 0);
-    lv_obj_set_style_bg_color(g_device_management_view, lv_color_white(), 0);
-    lv_obj_set_style_border_width(g_device_management_view, 0, 0);
-    lv_obj_set_style_radius(g_device_management_view, 10, 0);
-    lv_obj_set_style_pad_all(g_device_management_view, 15, 0);
-    lv_obj_clear_flag(g_device_management_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
-
-    create_device_management_view(g_device_management_view);
-
-    /* 创建阀门管理视图 */
-    g_valve_management_view = lv_obj_create(container);
-    lv_obj_set_size(g_valve_management_view, 1168, 660);
-    lv_obj_set_pos(g_valve_management_view, 0, 0);
-    lv_obj_set_style_bg_color(g_valve_management_view, lv_color_white(), 0);
-    lv_obj_set_style_border_width(g_valve_management_view, 0, 0);
-    lv_obj_set_style_radius(g_valve_management_view, 10, 0);
-    lv_obj_set_style_pad_all(g_valve_management_view, 15, 0);
-    lv_obj_clear_flag(g_valve_management_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
-
-    create_valve_management_view(g_valve_management_view);
-
-    /* 创建传感器视图 */
-    g_sensor_view = lv_obj_create(container);
-    lv_obj_set_size(g_sensor_view, 1168, 660);
-    lv_obj_set_pos(g_sensor_view, 0, 0);
-    lv_obj_set_style_bg_color(g_sensor_view, lv_color_white(), 0);
-    lv_obj_set_style_border_width(g_sensor_view, 0, 0);
-    lv_obj_set_style_radius(g_sensor_view, 10, 0);
-    lv_obj_set_style_pad_all(g_sensor_view, 15, 0);
-    lv_obj_clear_flag(g_sensor_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(g_sensor_view, LV_OBJ_FLAG_HIDDEN);
-
-    create_sensor_view(g_sensor_view);
-
-    /* 创建系统设置视图 */
-    g_system_settings_view = lv_obj_create(container);
-    lv_obj_set_size(g_system_settings_view, 1168, 660);
-    lv_obj_set_pos(g_system_settings_view, 0, 0);
-    lv_obj_set_style_bg_opa(g_system_settings_view, LV_OPA_TRANSP, 0);  /* 透明背景 */
-    lv_obj_set_style_border_width(g_system_settings_view, 0, 0);
-    lv_obj_set_style_radius(g_system_settings_view, 10, 0);
-    lv_obj_set_style_pad_all(g_system_settings_view, 0, 0);  /* 无内边距 */
-    lv_obj_clear_flag(g_system_settings_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(g_system_settings_view, LV_OBJ_FLAG_HIDDEN);
-
-    create_system_settings_view(g_system_settings_view);
-
-    /* 创建主机设置视图 */
-    g_host_settings_view = lv_obj_create(container);
-    lv_obj_set_size(g_host_settings_view, 1168, 660);
-    lv_obj_set_pos(g_host_settings_view, 0, 0);
-    lv_obj_set_style_bg_color(g_host_settings_view, lv_color_white(), 0);
-    lv_obj_set_style_border_width(g_host_settings_view, 0, 0);
-    lv_obj_set_style_radius(g_host_settings_view, 10, 0);
-    lv_obj_set_style_pad_all(g_host_settings_view, 15, 0);
-    lv_obj_clear_flag(g_host_settings_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(g_host_settings_view, LV_OBJ_FLAG_HIDDEN);
-
-    create_host_settings_view(g_host_settings_view);
 }
 
 /**********************
@@ -1513,6 +1449,17 @@ static void create_host_settings_view(lv_obj_t *parent)
  */
 static void switch_to_zone_management(void)
 {
+    if (!g_zone_management_view && g_settings_container) {
+        g_zone_management_view = lv_obj_create(g_settings_container);
+        lv_obj_set_size(g_zone_management_view, 1168, 660);
+        lv_obj_set_pos(g_zone_management_view, 0, 0);
+        lv_obj_set_style_bg_color(g_zone_management_view, lv_color_white(), 0);
+        lv_obj_set_style_border_width(g_zone_management_view, 0, 0);
+        lv_obj_set_style_radius(g_zone_management_view, 10, 0);
+        lv_obj_set_style_pad_all(g_zone_management_view, 15, 0);
+        lv_obj_clear_flag(g_zone_management_view, LV_OBJ_FLAG_SCROLLABLE);
+        create_zone_management_view(g_zone_management_view);
+    }
     if (g_zone_management_view) lv_obj_clear_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_device_management_view) lv_obj_add_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_valve_management_view) lv_obj_add_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
@@ -1523,6 +1470,17 @@ static void switch_to_zone_management(void)
 
 static void switch_to_device_management(void)
 {
+    if (!g_device_management_view && g_settings_container) {
+        g_device_management_view = lv_obj_create(g_settings_container);
+        lv_obj_set_size(g_device_management_view, 1168, 660);
+        lv_obj_set_pos(g_device_management_view, 0, 0);
+        lv_obj_set_style_bg_color(g_device_management_view, lv_color_white(), 0);
+        lv_obj_set_style_border_width(g_device_management_view, 0, 0);
+        lv_obj_set_style_radius(g_device_management_view, 10, 0);
+        lv_obj_set_style_pad_all(g_device_management_view, 15, 0);
+        lv_obj_clear_flag(g_device_management_view, LV_OBJ_FLAG_SCROLLABLE);
+        create_device_management_view(g_device_management_view);
+    }
     if (g_zone_management_view) lv_obj_add_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_device_management_view) lv_obj_clear_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_valve_management_view) lv_obj_add_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
@@ -1533,6 +1491,17 @@ static void switch_to_device_management(void)
 
 static void switch_to_valve_management(void)
 {
+    if (!g_valve_management_view && g_settings_container) {
+        g_valve_management_view = lv_obj_create(g_settings_container);
+        lv_obj_set_size(g_valve_management_view, 1168, 660);
+        lv_obj_set_pos(g_valve_management_view, 0, 0);
+        lv_obj_set_style_bg_color(g_valve_management_view, lv_color_white(), 0);
+        lv_obj_set_style_border_width(g_valve_management_view, 0, 0);
+        lv_obj_set_style_radius(g_valve_management_view, 10, 0);
+        lv_obj_set_style_pad_all(g_valve_management_view, 15, 0);
+        lv_obj_clear_flag(g_valve_management_view, LV_OBJ_FLAG_SCROLLABLE);
+        create_valve_management_view(g_valve_management_view);
+    }
     if (g_zone_management_view) lv_obj_add_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_device_management_view) lv_obj_add_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_valve_management_view) lv_obj_clear_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
@@ -1543,6 +1512,17 @@ static void switch_to_valve_management(void)
 
 static void switch_to_sensor(void)
 {
+    if (!g_sensor_view && g_settings_container) {
+        g_sensor_view = lv_obj_create(g_settings_container);
+        lv_obj_set_size(g_sensor_view, 1168, 660);
+        lv_obj_set_pos(g_sensor_view, 0, 0);
+        lv_obj_set_style_bg_color(g_sensor_view, lv_color_white(), 0);
+        lv_obj_set_style_border_width(g_sensor_view, 0, 0);
+        lv_obj_set_style_radius(g_sensor_view, 10, 0);
+        lv_obj_set_style_pad_all(g_sensor_view, 15, 0);
+        lv_obj_clear_flag(g_sensor_view, LV_OBJ_FLAG_SCROLLABLE);
+        create_sensor_view(g_sensor_view);
+    }
     if (g_zone_management_view) lv_obj_add_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_device_management_view) lv_obj_add_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_valve_management_view) lv_obj_add_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
@@ -1553,6 +1533,17 @@ static void switch_to_sensor(void)
 
 static void switch_to_system_settings(void)
 {
+    if (!g_system_settings_view && g_settings_container) {
+        g_system_settings_view = lv_obj_create(g_settings_container);
+        lv_obj_set_size(g_system_settings_view, 1168, 660);
+        lv_obj_set_pos(g_system_settings_view, 0, 0);
+        lv_obj_set_style_bg_opa(g_system_settings_view, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(g_system_settings_view, 0, 0);
+        lv_obj_set_style_radius(g_system_settings_view, 10, 0);
+        lv_obj_set_style_pad_all(g_system_settings_view, 0, 0);
+        lv_obj_clear_flag(g_system_settings_view, LV_OBJ_FLAG_SCROLLABLE);
+        create_system_settings_view(g_system_settings_view);
+    }
     if (g_zone_management_view) lv_obj_add_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_device_management_view) lv_obj_add_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_valve_management_view) lv_obj_add_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
@@ -1563,6 +1554,17 @@ static void switch_to_system_settings(void)
 
 static void switch_to_host_settings(void)
 {
+    if (!g_host_settings_view && g_settings_container) {
+        g_host_settings_view = lv_obj_create(g_settings_container);
+        lv_obj_set_size(g_host_settings_view, 1168, 660);
+        lv_obj_set_pos(g_host_settings_view, 0, 0);
+        lv_obj_set_style_bg_color(g_host_settings_view, lv_color_white(), 0);
+        lv_obj_set_style_border_width(g_host_settings_view, 0, 0);
+        lv_obj_set_style_radius(g_host_settings_view, 10, 0);
+        lv_obj_set_style_pad_all(g_host_settings_view, 15, 0);
+        lv_obj_clear_flag(g_host_settings_view, LV_OBJ_FLAG_SCROLLABLE);
+        create_host_settings_view(g_host_settings_view);
+    }
     if (g_zone_management_view) lv_obj_add_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_device_management_view) lv_obj_add_flag(g_device_management_view, LV_OBJ_FLAG_HIDDEN);
     if (g_valve_management_view) lv_obj_add_flag(g_valve_management_view, LV_OBJ_FLAG_HIDDEN);
@@ -2453,46 +2455,46 @@ static void show_add_sensor_dialog(void)
         lv_dropdown_set_options(g_sensor_parent_dropdown, "(无设备)");
     }
 
-    /* 传感器编号（自动组合：父设备ID + 序号） */
+    /* 传感器点位编号（父设备节点号 + 点位号） */
     lv_obj_t *label_id = lv_label_create(g_add_sensor_dialog);
-    lv_label_set_text(label_id, "传感器编号");
+    lv_label_set_text(label_id, "点位编号");
     lv_obj_set_pos(label_id, 10, 275);
     lv_obj_set_style_text_font(label_id, &my_font_cn_16, 0);
     lv_obj_set_style_text_color(label_id, lv_color_black(), 0);
 
-    /* 父设备ID前缀显示（只读） */
+    /* 父设备节点号前缀显示（只读） */
     g_sensor_id_prefix_label = lv_label_create(g_add_sensor_dialog);
     lv_label_set_text(g_sensor_id_prefix_label, "----");
     lv_obj_set_pos(g_sensor_id_prefix_label, 135, 280);
     lv_obj_set_style_text_font(g_sensor_id_prefix_label, &my_font_cn_16, 0);
     lv_obj_set_style_text_color(g_sensor_id_prefix_label, lv_color_hex(0x333333), 0);
 
-    /* 序号输入框 */
-    g_sensor_index_input = lv_textarea_create(g_add_sensor_dialog);
-    lv_obj_set_size(g_sensor_index_input, 80, 45);
-    lv_obj_set_pos(g_sensor_index_input, 210, 265);
-    lv_textarea_set_text(g_sensor_index_input, "01");
-    lv_textarea_set_one_line(g_sensor_index_input, true);
-    lv_textarea_set_max_length(g_sensor_index_input, 2);
-    lv_obj_set_style_text_font(g_sensor_index_input, &my_font_cn_16, 0);
-    lv_obj_set_style_bg_color(g_sensor_index_input, lv_color_white(), 0);
-    lv_obj_set_style_bg_color(g_sensor_index_input, lv_color_hex(0xf0f0f0), LV_STATE_DISABLED);
-    lv_obj_set_style_border_width(g_sensor_index_input, 1, 0);
-    lv_obj_set_style_border_color(g_sensor_index_input, lv_color_hex(0xcccccc), 0);
-    lv_obj_add_event_cb(g_sensor_index_input, textarea_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(g_sensor_index_input, sensor_index_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    /* 点位号输入框 */
+    g_sensor_point_no_input = lv_textarea_create(g_add_sensor_dialog);
+    lv_obj_set_size(g_sensor_point_no_input, 80, 45);
+    lv_obj_set_pos(g_sensor_point_no_input, 210, 265);
+    lv_textarea_set_text(g_sensor_point_no_input, "01");
+    lv_textarea_set_one_line(g_sensor_point_no_input, true);
+    lv_textarea_set_max_length(g_sensor_point_no_input, 2);
+    lv_obj_set_style_text_font(g_sensor_point_no_input, &my_font_cn_16, 0);
+    lv_obj_set_style_bg_color(g_sensor_point_no_input, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(g_sensor_point_no_input, lv_color_hex(0xf0f0f0), LV_STATE_DISABLED);
+    lv_obj_set_style_border_width(g_sensor_point_no_input, 1, 0);
+    lv_obj_set_style_border_color(g_sensor_point_no_input, lv_color_hex(0xcccccc), 0);
+    lv_obj_add_event_cb(g_sensor_point_no_input, textarea_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(g_sensor_point_no_input, sensor_point_no_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* = 组合编号显示 */
+    /* = 业务点编号显示 */
     lv_obj_t *eq_label = lv_label_create(g_add_sensor_dialog);
     lv_label_set_text(eq_label, "=");
     lv_obj_set_pos(eq_label, 302, 280);
     lv_obj_set_style_text_font(eq_label, &my_font_cn_16, 0);
 
-    g_sensor_composed_label = lv_label_create(g_add_sensor_dialog);
-    lv_label_set_text(g_sensor_composed_label, "------");
-    lv_obj_set_pos(g_sensor_composed_label, 325, 280);
-    lv_obj_set_style_text_font(g_sensor_composed_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(g_sensor_composed_label, COLOR_PRIMARY, 0);
+    g_sensor_point_id_label = lv_label_create(g_add_sensor_dialog);
+    lv_label_set_text(g_sensor_point_id_label, "------");
+    lv_obj_set_pos(g_sensor_point_id_label, 325, 280);
+    lv_obj_set_style_text_font(g_sensor_point_id_label, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_sensor_point_id_label, COLOR_PRIMARY, 0);
 
     /* 保留旧的 g_sensor_id_input 为 NULL（不再使用单独的 ID 输入） */
     g_sensor_id_input = NULL;
@@ -2843,7 +2845,7 @@ static void add_sensor_confirm_cb(lv_event_t *e)
     int64_t t0 = esp_timer_get_time();
 
     if (!g_sensor_type_dropdown || !g_sensor_name_input ||
-        !g_sensor_parent_dropdown || !g_sensor_index_input) return;
+        !g_sensor_parent_dropdown || !g_sensor_point_no_input) return;
 
     ui_sensor_add_params_t add_params;
     ui_sensor_edit_params_t edit_params;
@@ -2855,41 +2857,32 @@ static void add_sensor_confirm_cb(lv_event_t *e)
     snprintf(add_params.name, sizeof(add_params.name), "%s", name ? name : "");
     snprintf(edit_params.name, sizeof(edit_params.name), "%s", add_params.name);
 
-    /* 解析父设备 ID / Zigbee 设备类型 */
     int parent_idx = lv_dropdown_get_selected(g_sensor_parent_dropdown);
     add_params.parent_device_id = g_parse_device_id_cb ? g_parse_device_id_cb(parent_idx) : 0;
-    add_params.zb_dev_type = g_sensor_parent_zb_type_cb ? g_sensor_parent_zb_type_cb(add_params.parent_device_id) : 0;
 
-    const char *idx_str = lv_textarea_get_text(g_sensor_index_input);
-    add_params.sensor_index = (uint8_t)atoi(idx_str ? idx_str : "1");
+    const char *point_no_str = lv_textarea_get_text(g_sensor_point_no_input);
+    add_params.point_no = (uint8_t)atoi(point_no_str ? point_no_str : "1");
+    add_params.point_id = calc_sensor_point_id(add_params.parent_device_id, add_params.point_no);
 
-    if (!g_is_editing_sensor && add_params.zb_dev_type == 0) {
-        show_settings_warning_dialog("添加失败", "当前父设备不支持传感器编号生成");
+    if (!g_is_editing_sensor && add_params.parent_device_id == 0) {
+        show_settings_warning_dialog("添加失败", "请选择有效的父设备");
         return;
     }
 
-    /* 新增模式下检查重复 */
     if (!g_is_editing_sensor) {
         if (g_sensor_name_check_cb && strlen(add_params.name) > 0 && g_sensor_name_check_cb(add_params.name)) {
             show_settings_warning_dialog("添加失败", "已存在相同名称的传感器");
             return;
         }
-        /* composed_id 重复检查（已有回调） */
-        if (g_is_sensor_added_cb) {
-            uint32_t composed_id = (uint32_t)add_params.zb_dev_type * 1000000
-                                 + (uint32_t)add_params.parent_device_id * 100
-                                 + add_params.sensor_index;
-            if (g_is_sensor_added_cb(composed_id)) {
-                show_settings_warning_dialog("添加失败", "已存在相同编号的传感器");
-                return;
-            }
+        if (g_is_sensor_added_cb && g_is_sensor_added_cb(add_params.point_id)) {
+            show_settings_warning_dialog("添加失败", "已存在相同点位编号的传感器");
+            return;
         }
     }
 
-    /* NVS 写入（对话框仍可见，flash 抖动被遮住） */
     bool ok = false;
     if (g_is_editing_sensor && g_sensor_edit_cb) {
-        ok = g_sensor_edit_cb(g_editing_sensor_composed_id, &edit_params);
+        ok = g_sensor_edit_cb(g_editing_sensor_point_id, &edit_params);
     } else if (g_sensor_add_cb) {
         ok = g_sensor_add_cb(&add_params);
     }
@@ -2906,8 +2899,8 @@ static void add_sensor_confirm_cb(lv_event_t *e)
         g_sensor_parent_dropdown = NULL;
         g_sensor_id_input = NULL;
         g_sensor_id_prefix_label = NULL;
-        g_sensor_index_input = NULL;
-        g_sensor_composed_label = NULL;
+        g_sensor_point_no_input = NULL;
+        g_sensor_point_id_label = NULL;
     }
     int64_t t2 = esp_timer_get_time();
 
@@ -2935,6 +2928,9 @@ static void add_sensor_cancel_cb(lv_event_t *e)
         g_sensor_name_input = NULL;
         g_sensor_parent_dropdown = NULL;
         g_sensor_id_input = NULL;
+        g_sensor_id_prefix_label = NULL;
+        g_sensor_point_no_input = NULL;
+        g_sensor_point_id_label = NULL;
     }
 }
 
@@ -4009,10 +4005,7 @@ void ui_settings_update_search_results(const ui_sensor_found_item_t *items, int 
 
     const char *last_group = "";
     for (int i = 0; i < count; i++) {
-        const char *group = "";
-        if (items[i].dev_type == 0x01) group = "田地传感器";
-        else if (items[i].dev_type == 0x02) group = "管道传感器";
-        else if (items[i].dev_type == 0x03) group = "控制系统";
+        const char *group = get_sensor_group_name(items[i].point_id);
 
         if (strcmp(group, last_group) != 0) {
             last_group = group;
@@ -4049,13 +4042,9 @@ void ui_settings_update_search_results(const ui_sensor_found_item_t *items, int 
         lv_obj_set_style_text_font(name_label, &my_font_cn_16, 0);
         lv_obj_set_pos(name_label, 40, 4);
 
-        /* 传感器编号列 */
+        /* 传感器业务点编号列 */
         char id_buf[16];
-        uint32_t display_id = (uint32_t)items[i].dev_id * 100 + items[i].sensor_index;
-        uint32_t cid = (uint32_t)items[i].dev_type * 1000000U
-                     + (uint32_t)items[i].dev_id * 100U
-                     + (uint32_t)items[i].sensor_index;
-        snprintf(id_buf, sizeof(id_buf), "%06lu", (unsigned long)display_id);
+        snprintf(id_buf, sizeof(id_buf), "%06lu", (unsigned long)items[i].point_id);
         lv_obj_t *id_label = lv_label_create(row);
         lv_label_set_text(id_label, id_buf);
         lv_obj_set_style_text_font(id_label, &lv_font_montserrat_14, 0);
@@ -4071,7 +4060,7 @@ void ui_settings_update_search_results(const ui_sensor_found_item_t *items, int 
         /* 已添加/未添加状态 */
         bool added = false;
         if (g_is_sensor_added_cb) {
-            added = g_is_sensor_added_cb(cid);
+            added = g_is_sensor_added_cb(items[i].point_id);
         }
         lv_obj_t *status_label = lv_label_create(row);
         if (added) {
@@ -4106,6 +4095,20 @@ void ui_settings_update_search_results(const ui_sensor_found_item_t *items, int 
 /* ========================================================================
  *  新增函数：表格刷新、分页、删除、阀门/传感器辅助回调、注册函数
  * ======================================================================== */
+
+static uint32_t calc_sensor_point_id(uint16_t parent_device_id, uint8_t point_no)
+{
+    return (uint32_t)parent_device_id * 100U + (uint32_t)point_no;
+}
+
+static const char *get_sensor_group_name(uint32_t point_id)
+{
+    uint32_t node_id = point_id / 100U;
+    if (node_id >= 1001U && node_id <= 1006U) return "田地传感器";
+    if (node_id >= 2000U && node_id <= 2006U) return "管道传感器";
+    if (node_id == 3000U) return "控制系统";
+    return "其他传感器";
+}
 
 /* ---- 通用：创建表格行中的标签 ---- */
 static lv_obj_t *create_row_label(lv_obj_t *parent, const char *text, int x, int y)
@@ -4350,20 +4353,18 @@ void ui_settings_refresh_sensor_table(void)
         const char *stype = (rows[i].type < 11) ? stype_names[rows[i].type] : "未知";
         create_row_label(row_bg, stype, header_x[2], 12);
 
-        snprintf(buf, sizeof(buf), "%u%02u",
-                 (unsigned int)rows[i].parent_device_id,
-                 (unsigned int)rows[i].sensor_index);
+        snprintf(buf, sizeof(buf), "%06lu", (unsigned long)rows[i].point_id);
         create_row_label(row_bg, buf, header_x[3], 12);
 
         create_row_label(row_bg, rows[i].parent_name, header_x[4], 12);
 
-        snprintf(buf, sizeof(buf), "%02d", rows[i].sensor_index);
+        snprintf(buf, sizeof(buf), "%02u", (unsigned int)rows[i].point_no);
         create_row_label(row_bg, buf, header_x[5], 12);
 
         create_edit_btn(row_bg, 920, 6, sensor_edit_btn_cb,
-                        (void *)(uintptr_t)rows[i].composed_id);
+                        (void *)(uintptr_t)rows[i].point_id);
         create_delete_btn(row_bg, 1000, 6, sensor_delete_btn_cb,
-                          (void *)(uintptr_t)rows[i].composed_id);
+                          (void *)(uintptr_t)rows[i].point_id);
     }
 
     if (g_sensor_page_label) {
@@ -4693,16 +4694,14 @@ static void valve_edit_btn_cb(lv_event_t *e)
 
 static void sensor_edit_btn_cb(lv_event_t *e)
 {
-    uint32_t cid = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    uint32_t point_id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
     for (int i = 0; i < g_cached_sensor_count; i++) {
-        if (g_cached_sensor_rows[i].composed_id == cid) {
+        if (g_cached_sensor_rows[i].point_id == point_id) {
             g_is_editing_sensor = true;
-            g_editing_sensor_composed_id = cid;
+            g_editing_sensor_point_id = point_id;
             show_add_sensor_dialog();
-            /* 预填字段 */
             if (g_sensor_type_dropdown)
                 lv_dropdown_set_selected(g_sensor_type_dropdown, g_cached_sensor_rows[i].type);
-            /* 选择父设备 */
             if (g_sensor_parent_dropdown && g_parse_device_id_cb) {
                 int opt_cnt = lv_dropdown_get_option_count(g_sensor_parent_dropdown);
                 for (int j = 0; j < opt_cnt; j++) {
@@ -4714,12 +4713,12 @@ static void sensor_edit_btn_cb(lv_event_t *e)
                 }
                 lv_obj_add_state(g_sensor_parent_dropdown, LV_STATE_DISABLED);
             }
-            if (g_sensor_index_input) {
+            if (g_sensor_point_no_input) {
                 char buf[8];
-                snprintf(buf, sizeof(buf), "%02d", g_cached_sensor_rows[i].sensor_index);
-                lv_textarea_set_text(g_sensor_index_input, buf);
-                sensor_index_changed_cb(NULL);
-                lv_obj_add_state(g_sensor_index_input, LV_STATE_DISABLED);
+                snprintf(buf, sizeof(buf), "%02u", (unsigned int)g_cached_sensor_rows[i].point_no);
+                lv_textarea_set_text(g_sensor_point_no_input, buf);
+                sensor_point_no_changed_cb(NULL);
+                lv_obj_add_state(g_sensor_point_no_input, LV_STATE_DISABLED);
             }
             if (g_sensor_name_input)
                 lv_textarea_set_text(g_sensor_name_input, g_cached_sensor_rows[i].name);
@@ -4727,6 +4726,7 @@ static void sensor_edit_btn_cb(lv_event_t *e)
         }
     }
 }
+
 
 /* ---- 阀门对话框辅助回调 ---- */
 static void valve_parent_device_changed_cb(lv_event_t *e)
@@ -4910,46 +4910,44 @@ static void sensor_parent_changed_cb(lv_event_t *e)
 {
     (void)e;
     if (!g_sensor_parent_dropdown || !g_sensor_id_prefix_label ||
-        !g_sensor_index_input || !g_sensor_composed_label) return;
+        !g_sensor_point_no_input || !g_sensor_point_id_label) return;
 
     int sel = lv_dropdown_get_selected(g_sensor_parent_dropdown);
     uint16_t dev_id = g_parse_device_id_cb ? g_parse_device_id_cb(sel) : 0;
 
     char prefix_buf[8];
-    snprintf(prefix_buf, sizeof(prefix_buf), "%d", dev_id);
+    snprintf(prefix_buf, sizeof(prefix_buf), "%u", (unsigned int)dev_id);
     lv_label_set_text(g_sensor_id_prefix_label, prefix_buf);
 
-    /* 自动填入下一个可用序号（取最小缺口） */
-    uint8_t next_idx = g_next_sensor_idx_cb ? g_next_sensor_idx_cb(dev_id) : 1;
-    char idx_buf[4];
-    snprintf(idx_buf, sizeof(idx_buf), "%02d", next_idx);
-    lv_textarea_set_text(g_sensor_index_input, idx_buf);
+    uint8_t next_point_no = g_next_sensor_point_no_cb ? g_next_sensor_point_no_cb(dev_id) : 1;
+    char point_no_buf[4];
+    snprintf(point_no_buf, sizeof(point_no_buf), "%02u", (unsigned int)next_point_no);
+    lv_textarea_set_text(g_sensor_point_no_input, point_no_buf);
 
-    /* 更新对外显示编号：父设备ID + 2位序号 */
-    char composed_buf[12];
-    snprintf(composed_buf, sizeof(composed_buf), "%u%02u",
-             (unsigned int)dev_id, (unsigned int)next_idx);
-    lv_label_set_text(g_sensor_composed_label, composed_buf);
+    char point_id_buf[12];
+    snprintf(point_id_buf, sizeof(point_id_buf), "%06lu",
+             (unsigned long)calc_sensor_point_id(dev_id, next_point_no));
+    lv_label_set_text(g_sensor_point_id_label, point_id_buf);
 
     update_sensor_default_name();
 }
 
-static void sensor_index_changed_cb(lv_event_t *e)
+static void sensor_point_no_changed_cb(lv_event_t *e)
 {
     (void)e;
-    if (!g_sensor_parent_dropdown || !g_sensor_index_input ||
-        !g_sensor_composed_label) return;
+    if (!g_sensor_parent_dropdown || !g_sensor_point_no_input ||
+        !g_sensor_point_id_label) return;
 
     int sel = lv_dropdown_get_selected(g_sensor_parent_dropdown);
     uint16_t dev_id = g_parse_device_id_cb ? g_parse_device_id_cb(sel) : 0;
 
-    const char *idx_str = lv_textarea_get_text(g_sensor_index_input);
-    int idx = atoi(idx_str ? idx_str : "0");
+    const char *point_no_str = lv_textarea_get_text(g_sensor_point_no_input);
+    uint8_t point_no = (uint8_t)atoi(point_no_str ? point_no_str : "0");
 
-    char composed_buf[12];
-    snprintf(composed_buf, sizeof(composed_buf), "%u%02d",
-             (unsigned int)dev_id, idx);
-    lv_label_set_text(g_sensor_composed_label, composed_buf);
+    char point_id_buf[12];
+    snprintf(point_id_buf, sizeof(point_id_buf), "%06lu",
+             (unsigned long)calc_sensor_point_id(dev_id, point_no));
+    lv_label_set_text(g_sensor_point_id_label, point_id_buf);
 }
 
 /* ---- 回调注册函数 ---- */
@@ -4980,8 +4978,7 @@ void ui_settings_register_query_cbs(
     ui_get_device_dropdown_cb_t dev_dropdown_cb,
     ui_get_channel_count_cb_t   ch_count_cb,
     ui_is_sensor_added_cb_t     is_added_cb,
-    ui_next_sensor_index_cb_t   next_idx_cb,
-    ui_get_sensor_parent_zb_type_cb_t parent_zb_type_cb,
+    ui_next_sensor_point_no_cb_t next_point_no_cb,
     ui_parse_device_id_cb_t     parse_id_cb)
 {
     g_dev_count_cb       = dev_count_cb;
@@ -4993,8 +4990,7 @@ void ui_settings_register_query_cbs(
     g_dev_dropdown_cb    = dev_dropdown_cb;
     g_ch_count_cb        = ch_count_cb;
     g_is_sensor_added_cb = is_added_cb;
-    g_next_sensor_idx_cb = next_idx_cb;
-    g_sensor_parent_zb_type_cb = parent_zb_type_cb;
+    g_next_sensor_point_no_cb = next_point_no_cb;
     g_parse_device_id_cb = parse_id_cb;
 }
 
@@ -5023,8 +5019,8 @@ void ui_settings_close_overlays(void)
         g_sensor_parent_dropdown = NULL;
         g_sensor_id_input = NULL;
         g_sensor_id_prefix_label = NULL;
-        g_sensor_index_input = NULL;
-        g_sensor_composed_label = NULL;
+        g_sensor_point_no_input = NULL;
+        g_sensor_point_id_label = NULL;
     }
 
     if (g_search_sensor_bg) {
@@ -5078,7 +5074,7 @@ void ui_settings_close_overlays(void)
     g_is_editing_valve = false;
     g_editing_valve_id = 0;
     g_is_editing_sensor = false;
-    g_editing_sensor_composed_id = 0;
+    g_editing_sensor_point_id = 0;
     g_is_editing_zone = false;
     g_editing_zone_slot = -1;
 }
