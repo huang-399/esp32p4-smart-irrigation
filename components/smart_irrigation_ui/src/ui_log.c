@@ -4,6 +4,7 @@
  */
 
 #include "ui_common.h"
+#include "ui_log_records.h"
 #include "ui_numpad.h"
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +17,7 @@ static void create_tab_buttons(lv_obj_t *parent);
 static void create_filter_section(lv_obj_t *parent);
 static void create_log_table(lv_obj_t *parent);
 static void create_pagination(lv_obj_t *parent);
+static void show_placeholder_message(lv_obj_t *parent, const char *message);
 static void tab_btn_cb(lv_event_t *e);
 static void query_btn_cb(lv_event_t *e);
 static void btn_calendar_start_cb(lv_event_t *e);
@@ -34,6 +36,32 @@ static int g_active_tab = 0;                 /* 当前活动标签索引 */
 static lv_obj_t *g_tab_buttons[5] = {NULL};   /* 标签按钮数组 */
 static lv_obj_t *g_input_start_date = NULL;   /* 开始日期输入框 */
 static lv_obj_t *g_input_end_date = NULL;     /* 结束日期输入框 */
+static lv_obj_t *g_control_table_area = NULL; /* 控制日志表格区域 */
+static lv_obj_t *g_control_page_info = NULL;  /* 控制日志页码 */
+static lv_obj_t *g_control_btn_first = NULL;  /* 控制日志首页 */
+static lv_obj_t *g_control_btn_prev = NULL;   /* 控制日志上一页 */
+static lv_obj_t *g_control_btn_next = NULL;   /* 控制日志下一页 */
+static lv_obj_t *g_control_btn_last = NULL;   /* 控制日志尾页 */
+static lv_obj_t *g_operation_table_area = NULL; /* 操作日志表格区域 */
+static lv_obj_t *g_operation_page_info = NULL;  /* 操作日志页码 */
+static lv_obj_t *g_operation_btn_first = NULL;  /* 操作日志首页 */
+static lv_obj_t *g_operation_btn_prev = NULL;   /* 操作日志上一页 */
+static lv_obj_t *g_operation_btn_next = NULL;   /* 操作日志下一页 */
+static lv_obj_t *g_operation_btn_last = NULL;   /* 操作日志尾页 */
+static lv_obj_t *g_manual_table_area = NULL;    /* 手灌记录表格区域 */
+static lv_obj_t *g_manual_page_info = NULL;     /* 手灌记录页码 */
+static lv_obj_t *g_manual_btn_first = NULL;     /* 手灌记录首页 */
+static lv_obj_t *g_manual_btn_prev = NULL;      /* 手灌记录上一页 */
+static lv_obj_t *g_manual_btn_next = NULL;      /* 手灌记录下一页 */
+static lv_obj_t *g_manual_btn_last = NULL;      /* 手灌记录尾页 */
+static lv_obj_t *g_manual_status_dropdown = NULL; /* 手灌记录状态筛选 */
+static lv_obj_t *g_program_table_area = NULL;   /* 程序记录表格区域 */
+static lv_obj_t *g_program_page_info = NULL;    /* 程序记录页码 */
+static lv_obj_t *g_program_btn_first = NULL;    /* 程序记录首页 */
+static lv_obj_t *g_program_btn_prev = NULL;     /* 程序记录上一页 */
+static lv_obj_t *g_program_btn_next = NULL;     /* 程序记录下一页 */
+static lv_obj_t *g_program_btn_last = NULL;     /* 程序记录尾页 */
+static lv_obj_t *g_program_status_dropdown = NULL; /* 程序记录状态筛选 */
 static lv_obj_t *g_calendar_popup = NULL;     /* 日历弹窗 */
 static lv_obj_t *g_current_date_input = NULL; /* 当前选择日期的输入框 */
 static lv_obj_t *g_calendar_widget = NULL;    /* 日历控件引用 */
@@ -111,6 +139,32 @@ void ui_log_create(lv_obj_t *parent)
     for (int i = 0; i < 5; i++) g_tab_buttons[i] = NULL;
     g_input_start_date = NULL;
     g_input_end_date = NULL;
+    g_control_table_area = NULL;
+    g_control_page_info = NULL;
+    g_control_btn_first = NULL;
+    g_control_btn_prev = NULL;
+    g_control_btn_next = NULL;
+    g_control_btn_last = NULL;
+    g_operation_table_area = NULL;
+    g_operation_page_info = NULL;
+    g_operation_btn_first = NULL;
+    g_operation_btn_prev = NULL;
+    g_operation_btn_next = NULL;
+    g_operation_btn_last = NULL;
+    g_manual_table_area = NULL;
+    g_manual_page_info = NULL;
+    g_manual_btn_first = NULL;
+    g_manual_btn_prev = NULL;
+    g_manual_btn_next = NULL;
+    g_manual_btn_last = NULL;
+    g_manual_status_dropdown = NULL;
+    g_program_table_area = NULL;
+    g_program_page_info = NULL;
+    g_program_btn_first = NULL;
+    g_program_btn_prev = NULL;
+    g_program_btn_next = NULL;
+    g_program_btn_last = NULL;
+    g_program_status_dropdown = NULL;
     /* g_calendar_popup 由 ui_log_close_calendar() 在 ui_switch_nav 中处理 */
     g_current_date_input = NULL;
     g_calendar_widget = NULL;
@@ -198,6 +252,17 @@ static void create_control_log_view(lv_obj_t *parent)
 
     /* 分页控件 */
     create_pagination(parent);
+
+    ui_log_rec_setup_control(
+        g_input_start_date,
+        g_input_end_date,
+        g_control_table_area,
+        g_control_page_info,
+        g_control_btn_first,
+        g_control_btn_prev,
+        g_control_btn_next,
+        g_control_btn_last
+    );
 }
 
 /**
@@ -316,7 +381,7 @@ static void create_filter_section(lv_obj_t *parent)
     lv_obj_set_style_bg_color(query_btn, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(query_btn, 0, 0);
     lv_obj_set_style_radius(query_btn, 5, 0);
-    lv_obj_add_event_cb(query_btn, query_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(query_btn, ui_log_rec_control_query_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *query_label = lv_label_create(query_btn);
     lv_label_set_text(query_label, "查询");
@@ -354,16 +419,25 @@ static void create_log_table(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_header, 0, 0);
     lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
 
-    const char *headers[] = {"序号", "控制时间", "控制源", "被控对象", "操作", "结果"};
-    int header_x[] = {20, 100, 350, 550, 750, 950};
+    const char *headers[] = {"序号", "记录时间", "日志描述"};
+    int header_x[] = {20, 180, 600};
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 3; i++) {
         lv_obj_t *h_label = lv_label_create(table_header);
         lv_label_set_text(h_label, headers[i]);
         lv_obj_set_pos(h_label, header_x[i], 12);
         lv_obj_set_style_text_font(h_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(h_label, lv_color_hex(0x333333), 0);
     }
+
+    g_control_table_area = lv_obj_create(table_container);
+    lv_obj_set_size(g_control_table_area, 1138, table_height - 40);
+    lv_obj_set_pos(g_control_table_area, 0, 40);
+    lv_obj_set_style_bg_opa(g_control_table_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_control_table_area, 0, 0);
+    lv_obj_set_style_radius(g_control_table_area, 0, 0);
+    lv_obj_set_style_pad_all(g_control_table_area, 0, 0);
+    lv_obj_clear_flag(g_control_table_area, LV_OBJ_FLAG_SCROLLABLE);
 }
 
 /**
@@ -374,63 +448,63 @@ static void create_pagination(lv_obj_t *parent)
     int pagination_y = 610;
 
     /* 首页按钮 */
-    lv_obj_t *first_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(first_page_btn, 70, 35);
-    lv_obj_set_pos(first_page_btn, 350, pagination_y);
-    lv_obj_set_style_bg_color(first_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(first_page_btn, 0, 0);
-    lv_obj_set_style_radius(first_page_btn, 5, 0);
+    g_control_btn_first = lv_btn_create(parent);
+    lv_obj_set_size(g_control_btn_first, 70, 35);
+    lv_obj_set_pos(g_control_btn_first, 350, pagination_y);
+    lv_obj_set_style_bg_color(g_control_btn_first, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_control_btn_first, 0, 0);
+    lv_obj_set_style_radius(g_control_btn_first, 5, 0);
 
-    lv_obj_t *first_label = lv_label_create(first_page_btn);
+    lv_obj_t *first_label = lv_label_create(g_control_btn_first);
     lv_label_set_text(first_label, "首页");
     lv_obj_set_style_text_color(first_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(first_label, &my_font_cn_16, 0);
     lv_obj_center(first_label);
 
     /* 上一页按钮 */
-    lv_obj_t *prev_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(prev_page_btn, 80, 35);
-    lv_obj_set_pos(prev_page_btn, 430, pagination_y);
-    lv_obj_set_style_bg_color(prev_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(prev_page_btn, 0, 0);
-    lv_obj_set_style_radius(prev_page_btn, 5, 0);
+    g_control_btn_prev = lv_btn_create(parent);
+    lv_obj_set_size(g_control_btn_prev, 80, 35);
+    lv_obj_set_pos(g_control_btn_prev, 430, pagination_y);
+    lv_obj_set_style_bg_color(g_control_btn_prev, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_control_btn_prev, 0, 0);
+    lv_obj_set_style_radius(g_control_btn_prev, 5, 0);
 
-    lv_obj_t *prev_label = lv_label_create(prev_page_btn);
+    lv_obj_t *prev_label = lv_label_create(g_control_btn_prev);
     lv_label_set_text(prev_label, "上一页");
     lv_obj_set_style_text_color(prev_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(prev_label, &my_font_cn_16, 0);
     lv_obj_center(prev_label);
 
     /* 页码显示 */
-    lv_obj_t *page_label = lv_label_create(parent);
-    lv_label_set_text(page_label, "0/0");
-    lv_obj_set_pos(page_label, 540, pagination_y + 8);
-    lv_obj_set_style_text_font(page_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(page_label, lv_color_hex(0x333333), 0);
+    g_control_page_info = lv_label_create(parent);
+    lv_label_set_text(g_control_page_info, "0/0");
+    lv_obj_set_pos(g_control_page_info, 540, pagination_y + 8);
+    lv_obj_set_style_text_font(g_control_page_info, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_control_page_info, lv_color_hex(0x333333), 0);
 
     /* 下一页按钮 */
-    lv_obj_t *next_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(next_page_btn, 80, 35);
-    lv_obj_set_pos(next_page_btn, 600, pagination_y);
-    lv_obj_set_style_bg_color(next_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(next_page_btn, 0, 0);
-    lv_obj_set_style_radius(next_page_btn, 5, 0);
+    g_control_btn_next = lv_btn_create(parent);
+    lv_obj_set_size(g_control_btn_next, 80, 35);
+    lv_obj_set_pos(g_control_btn_next, 600, pagination_y);
+    lv_obj_set_style_bg_color(g_control_btn_next, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_control_btn_next, 0, 0);
+    lv_obj_set_style_radius(g_control_btn_next, 5, 0);
 
-    lv_obj_t *next_label = lv_label_create(next_page_btn);
+    lv_obj_t *next_label = lv_label_create(g_control_btn_next);
     lv_label_set_text(next_label, "下一页");
     lv_obj_set_style_text_color(next_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(next_label, &my_font_cn_16, 0);
     lv_obj_center(next_label);
 
     /* 尾页按钮 */
-    lv_obj_t *last_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(last_page_btn, 70, 35);
-    lv_obj_set_pos(last_page_btn, 690, pagination_y);
-    lv_obj_set_style_bg_color(last_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(last_page_btn, 0, 0);
-    lv_obj_set_style_radius(last_page_btn, 5, 0);
+    g_control_btn_last = lv_btn_create(parent);
+    lv_obj_set_size(g_control_btn_last, 70, 35);
+    lv_obj_set_pos(g_control_btn_last, 690, pagination_y);
+    lv_obj_set_style_bg_color(g_control_btn_last, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_control_btn_last, 0, 0);
+    lv_obj_set_style_radius(g_control_btn_last, 5, 0);
 
-    lv_obj_t *last_label = lv_label_create(last_page_btn);
+    lv_obj_t *last_label = lv_label_create(g_control_btn_last);
     lv_label_set_text(last_label, "尾页");
     lv_obj_set_style_text_color(last_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(last_label, &my_font_cn_16, 0);
@@ -443,6 +517,8 @@ static void create_pagination(lv_obj_t *parent)
 static void switch_to_tab(int tab_index)
 {
     if (!g_view_container) return;
+
+    ui_log_rec_invalidate();
 
     /* 销毁旧视图（及其所有子对象） */
     if (g_active_view) {
@@ -518,7 +594,17 @@ static void tab_btn_cb(lv_event_t *e)
 static void query_btn_cb(lv_event_t *e)
 {
     (void)e;
-    /* TODO: 实现查询逻辑 */
+}
+
+static void show_placeholder_message(lv_obj_t *parent, const char *message)
+{
+    if (!parent) return;
+
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, message ? message : "当前版本暂未接入数据");
+    lv_obj_set_style_text_font(label, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(label, COLOR_TEXT_GRAY, 0);
+    lv_obj_center(label);
 }
 
 /**
@@ -899,15 +985,14 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_textarea_set_one_line(input_start, true);
     lv_textarea_set_text(input_start, today_buf);
     lv_obj_set_style_text_font(input_start, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_start, 0, 0);
     lv_obj_set_style_pad_right(input_start, 0, 0);
-    lv_obj_set_style_pad_top(input_start, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_start, 4, 0);
     lv_obj_set_style_pad_bottom(input_start, 0, 0);
     lv_obj_set_style_border_width(input_start, 0, 0);
     lv_obj_clear_flag(input_start, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 起始日期日历按钮 */
     lv_obj_t *btn_start_cal = lv_btn_create(start_date_container);
     lv_obj_set_size(btn_start_cal, 28, 28);
     lv_obj_set_pos(btn_start_cal, 161, 1);
@@ -921,13 +1006,11 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_start, &my_font_cn_16, 0);
     lv_obj_center(icon_start);
 
-    /* 至 */
     lv_obj_t *to_label = lv_label_create(parent);
     lv_label_set_text(to_label, "至");
     lv_obj_set_pos(to_label, 265, y_pos + 8);
     lv_obj_set_style_text_font(to_label, &my_font_cn_16, 0);
 
-    /* 结束日期输入框容器 */
     lv_obj_t *end_date_container = lv_obj_create(parent);
     lv_obj_set_size(end_date_container, 190, 30);
     lv_obj_set_pos(end_date_container, 300, y_pos + 3);
@@ -938,22 +1021,20 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(end_date_container, 0, 0);
     lv_obj_clear_flag(end_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 结束日期输入框 */
     lv_obj_t *input_end = lv_textarea_create(end_date_container);
     lv_obj_set_size(input_end, 155, 28);
     lv_obj_set_pos(input_end, 1, 1);
     lv_textarea_set_one_line(input_end, true);
     lv_textarea_set_text(input_end, today_buf);
     lv_obj_set_style_text_font(input_end, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_end, 0, 0);
     lv_obj_set_style_pad_right(input_end, 0, 0);
-    lv_obj_set_style_pad_top(input_end, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_end, 4, 0);
     lv_obj_set_style_pad_bottom(input_end, 0, 0);
     lv_obj_set_style_border_width(input_end, 0, 0);
     lv_obj_clear_flag(input_end, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 结束日期日历按钮 */
     lv_obj_t *btn_end_cal = lv_btn_create(end_date_container);
     lv_obj_set_size(btn_end_cal, 28, 28);
     lv_obj_set_pos(btn_end_cal, 161, 1);
@@ -967,13 +1048,13 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_end, &my_font_cn_16, 0);
     lv_obj_center(icon_end);
 
-    /* 查询按钮 */
     lv_obj_t *query_btn = lv_btn_create(parent);
     lv_obj_set_size(query_btn, 100, 30);
     lv_obj_set_pos(query_btn, 1000, y_pos + 3);
     lv_obj_set_style_bg_color(query_btn, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(query_btn, 0, 0);
     lv_obj_set_style_radius(query_btn, 5, 0);
+    lv_obj_add_event_cb(query_btn, ui_log_rec_operation_query_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *query_label = lv_label_create(query_btn);
     lv_label_set_text(query_label, "查询");
@@ -981,7 +1062,6 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(query_label, &my_font_cn_16, 0);
     lv_obj_center(query_label);
 
-    /* 操作日志表格 */
     int table_y = 45;
     int table_height = 555;
 
@@ -995,7 +1075,6 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_container, 0, 0);
     lv_obj_clear_flag(table_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 表头 */
     lv_obj_t *table_header = lv_obj_create(table_container);
     lv_obj_set_size(table_header, 1138, 40);
     lv_obj_set_pos(table_header, 0, 0);
@@ -1005,8 +1084,8 @@ static void create_operation_log_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_header, 0, 0);
     lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
 
-    const char *headers[] = {"序号", "操作时间", "操作描述"};
-    int header_x[] = {20, 150, 450};
+    const char *headers[] = {"序号", "记录时间", "日志描述"};
+    int header_x[] = {20, 180, 600};
 
     for (int i = 0; i < 3; i++) {
         lv_obj_t *h_label = lv_label_create(table_header);
@@ -1016,71 +1095,85 @@ static void create_operation_log_view(lv_obj_t *parent)
         lv_obj_set_style_text_color(h_label, lv_color_hex(0x333333), 0);
     }
 
-    /* 分页控件 */
+    g_operation_table_area = lv_obj_create(table_container);
+    lv_obj_set_size(g_operation_table_area, 1138, table_height - 40);
+    lv_obj_set_pos(g_operation_table_area, 0, 40);
+    lv_obj_set_style_bg_opa(g_operation_table_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_operation_table_area, 0, 0);
+    lv_obj_set_style_radius(g_operation_table_area, 0, 0);
+    lv_obj_set_style_pad_all(g_operation_table_area, 0, 0);
+    lv_obj_clear_flag(g_operation_table_area, LV_OBJ_FLAG_SCROLLABLE);
+
     int pagination_y = 610;
 
-    /* 首页按钮 */
-    lv_obj_t *first_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(first_page_btn, 70, 35);
-    lv_obj_set_pos(first_page_btn, 350, pagination_y);
-    lv_obj_set_style_bg_color(first_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(first_page_btn, 0, 0);
-    lv_obj_set_style_radius(first_page_btn, 5, 0);
+    g_operation_btn_first = lv_btn_create(parent);
+    lv_obj_set_size(g_operation_btn_first, 70, 35);
+    lv_obj_set_pos(g_operation_btn_first, 350, pagination_y);
+    lv_obj_set_style_bg_color(g_operation_btn_first, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_operation_btn_first, 0, 0);
+    lv_obj_set_style_radius(g_operation_btn_first, 5, 0);
 
-    lv_obj_t *first_label = lv_label_create(first_page_btn);
+    lv_obj_t *first_label = lv_label_create(g_operation_btn_first);
     lv_label_set_text(first_label, "首页");
     lv_obj_set_style_text_color(first_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(first_label, &my_font_cn_16, 0);
     lv_obj_center(first_label);
 
-    /* 上一页按钮 */
-    lv_obj_t *prev_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(prev_page_btn, 80, 35);
-    lv_obj_set_pos(prev_page_btn, 430, pagination_y);
-    lv_obj_set_style_bg_color(prev_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(prev_page_btn, 0, 0);
-    lv_obj_set_style_radius(prev_page_btn, 5, 0);
+    g_operation_btn_prev = lv_btn_create(parent);
+    lv_obj_set_size(g_operation_btn_prev, 80, 35);
+    lv_obj_set_pos(g_operation_btn_prev, 430, pagination_y);
+    lv_obj_set_style_bg_color(g_operation_btn_prev, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_operation_btn_prev, 0, 0);
+    lv_obj_set_style_radius(g_operation_btn_prev, 5, 0);
 
-    lv_obj_t *prev_label = lv_label_create(prev_page_btn);
+    lv_obj_t *prev_label = lv_label_create(g_operation_btn_prev);
     lv_label_set_text(prev_label, "上一页");
     lv_obj_set_style_text_color(prev_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(prev_label, &my_font_cn_16, 0);
     lv_obj_center(prev_label);
 
-    /* 页码显示 */
-    lv_obj_t *page_label = lv_label_create(parent);
-    lv_label_set_text(page_label, "0/0");
-    lv_obj_set_pos(page_label, 540, pagination_y + 8);
-    lv_obj_set_style_text_font(page_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(page_label, lv_color_hex(0x333333), 0);
+    g_operation_page_info = lv_label_create(parent);
+    lv_label_set_text(g_operation_page_info, "0/0");
+    lv_obj_set_pos(g_operation_page_info, 540, pagination_y + 8);
+    lv_obj_set_style_text_font(g_operation_page_info, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_operation_page_info, lv_color_hex(0x333333), 0);
 
-    /* 下一页按钮 */
-    lv_obj_t *next_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(next_page_btn, 80, 35);
-    lv_obj_set_pos(next_page_btn, 600, pagination_y);
-    lv_obj_set_style_bg_color(next_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(next_page_btn, 0, 0);
-    lv_obj_set_style_radius(next_page_btn, 5, 0);
+    g_operation_btn_next = lv_btn_create(parent);
+    lv_obj_set_size(g_operation_btn_next, 80, 35);
+    lv_obj_set_pos(g_operation_btn_next, 600, pagination_y);
+    lv_obj_set_style_bg_color(g_operation_btn_next, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_operation_btn_next, 0, 0);
+    lv_obj_set_style_radius(g_operation_btn_next, 5, 0);
 
-    lv_obj_t *next_label = lv_label_create(next_page_btn);
+    lv_obj_t *next_label = lv_label_create(g_operation_btn_next);
     lv_label_set_text(next_label, "下一页");
     lv_obj_set_style_text_color(next_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(next_label, &my_font_cn_16, 0);
     lv_obj_center(next_label);
 
-    /* 尾页按钮 */
-    lv_obj_t *last_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(last_page_btn, 70, 35);
-    lv_obj_set_pos(last_page_btn, 690, pagination_y);
-    lv_obj_set_style_bg_color(last_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(last_page_btn, 0, 0);
-    lv_obj_set_style_radius(last_page_btn, 5, 0);
+    g_operation_btn_last = lv_btn_create(parent);
+    lv_obj_set_size(g_operation_btn_last, 70, 35);
+    lv_obj_set_pos(g_operation_btn_last, 690, pagination_y);
+    lv_obj_set_style_bg_color(g_operation_btn_last, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_operation_btn_last, 0, 0);
+    lv_obj_set_style_radius(g_operation_btn_last, 5, 0);
 
-    lv_obj_t *last_label = lv_label_create(last_page_btn);
+    lv_obj_t *last_label = lv_label_create(g_operation_btn_last);
     lv_label_set_text(last_label, "尾页");
     lv_obj_set_style_text_color(last_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(last_label, &my_font_cn_16, 0);
     lv_obj_center(last_label);
+
+    ui_log_rec_setup_operation(
+        input_start,
+        input_end,
+        g_operation_table_area,
+        g_operation_page_info,
+        g_operation_btn_first,
+        g_operation_btn_prev,
+        g_operation_btn_next,
+        g_operation_btn_last
+    );
 }
 
 /**
@@ -1089,16 +1182,15 @@ static void create_operation_log_view(lv_obj_t *parent)
 static void create_manual_record_view(lv_obj_t *parent)
 {
     int y_pos = 5;
+    int pagination_y = 610;
     char today_buf[32];
     get_today_str(today_buf, sizeof(today_buf));
 
-    /* 日期标签 */
     lv_obj_t *date_label = lv_label_create(parent);
     lv_label_set_text(date_label, "日期:");
     lv_obj_set_pos(date_label, 10, y_pos + 8);
     lv_obj_set_style_text_font(date_label, &my_font_cn_16, 0);
 
-    /* 起始日期输入框容器 */
     lv_obj_t *start_date_container = lv_obj_create(parent);
     lv_obj_set_size(start_date_container, 190, 30);
     lv_obj_set_pos(start_date_container, 60, y_pos + 3);
@@ -1109,22 +1201,20 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(start_date_container, 0, 0);
     lv_obj_clear_flag(start_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 起始日期输入框 */
     lv_obj_t *input_start = lv_textarea_create(start_date_container);
     lv_obj_set_size(input_start, 155, 28);
     lv_obj_set_pos(input_start, 1, 1);
     lv_textarea_set_one_line(input_start, true);
     lv_textarea_set_text(input_start, today_buf);
     lv_obj_set_style_text_font(input_start, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_start, 0, 0);
     lv_obj_set_style_pad_right(input_start, 0, 0);
-    lv_obj_set_style_pad_top(input_start, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_start, 4, 0);
     lv_obj_set_style_pad_bottom(input_start, 0, 0);
     lv_obj_set_style_border_width(input_start, 0, 0);
     lv_obj_clear_flag(input_start, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 起始日期日历按钮 */
     lv_obj_t *btn_start_cal = lv_btn_create(start_date_container);
     lv_obj_set_size(btn_start_cal, 28, 28);
     lv_obj_set_pos(btn_start_cal, 161, 1);
@@ -1138,13 +1228,11 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_start, &my_font_cn_16, 0);
     lv_obj_center(icon_start);
 
-    /* 至 */
     lv_obj_t *to_label = lv_label_create(parent);
     lv_label_set_text(to_label, "至");
     lv_obj_set_pos(to_label, 265, y_pos + 8);
     lv_obj_set_style_text_font(to_label, &my_font_cn_16, 0);
 
-    /* 结束日期输入框容器 */
     lv_obj_t *end_date_container = lv_obj_create(parent);
     lv_obj_set_size(end_date_container, 190, 30);
     lv_obj_set_pos(end_date_container, 300, y_pos + 3);
@@ -1155,22 +1243,20 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(end_date_container, 0, 0);
     lv_obj_clear_flag(end_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 结束日期输入框 */
     lv_obj_t *input_end = lv_textarea_create(end_date_container);
     lv_obj_set_size(input_end, 155, 28);
     lv_obj_set_pos(input_end, 1, 1);
     lv_textarea_set_one_line(input_end, true);
     lv_textarea_set_text(input_end, today_buf);
     lv_obj_set_style_text_font(input_end, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_end, 0, 0);
     lv_obj_set_style_pad_right(input_end, 0, 0);
-    lv_obj_set_style_pad_top(input_end, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_end, 4, 0);
     lv_obj_set_style_pad_bottom(input_end, 0, 0);
     lv_obj_set_style_border_width(input_end, 0, 0);
     lv_obj_clear_flag(input_end, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 结束日期日历按钮 */
     lv_obj_t *btn_end_cal = lv_btn_create(end_date_container);
     lv_obj_set_size(btn_end_cal, 28, 28);
     lv_obj_set_pos(btn_end_cal, 161, 1);
@@ -1184,21 +1270,20 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_end, &my_font_cn_16, 0);
     lv_obj_center(icon_end);
 
-    /* 类型下拉框 */
-    lv_obj_t *dropdown = lv_dropdown_create(parent);
-    lv_obj_set_size(dropdown, 120, 30);
-    lv_obj_set_pos(dropdown, 850, y_pos + 3);
-    lv_dropdown_set_options(dropdown, "全部\n正常\n异常");
-    lv_obj_set_style_text_font(dropdown, &my_font_cn_16, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(dropdown), &my_font_cn_16, 0);
+    g_manual_status_dropdown = lv_dropdown_create(parent);
+    lv_obj_set_size(g_manual_status_dropdown, 120, 30);
+    lv_obj_set_pos(g_manual_status_dropdown, 850, y_pos + 3);
+    lv_dropdown_set_options(g_manual_status_dropdown, "全部\n正常\n异常");
+    lv_obj_set_style_text_font(g_manual_status_dropdown, &my_font_cn_16, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(g_manual_status_dropdown), &my_font_cn_16, 0);
 
-    /* 查询按钮 */
     lv_obj_t *query_btn = lv_btn_create(parent);
     lv_obj_set_size(query_btn, 100, 30);
     lv_obj_set_pos(query_btn, 1000, y_pos + 3);
     lv_obj_set_style_bg_color(query_btn, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(query_btn, 0, 0);
     lv_obj_set_style_radius(query_btn, 5, 0);
+    lv_obj_add_event_cb(query_btn, ui_log_rec_manual_query_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *query_label = lv_label_create(query_btn);
     lv_label_set_text(query_label, "查询");
@@ -1206,13 +1291,9 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(query_label, &my_font_cn_16, 0);
     lv_obj_center(query_label);
 
-    /* 手灌记录表格 */
-    int table_y = 45;
-    int table_height = 555;
-
     lv_obj_t *table_container = lv_obj_create(parent);
-    lv_obj_set_size(table_container, 1138, table_height);
-    lv_obj_set_pos(table_container, 0, table_y);
+    lv_obj_set_size(table_container, 1138, 555);
+    lv_obj_set_pos(table_container, 0, 45);
     lv_obj_set_style_bg_color(table_container, lv_color_hex(0xf5f5f5), 0);
     lv_obj_set_style_border_width(table_container, 1, 0);
     lv_obj_set_style_border_color(table_container, lv_color_hex(0xcccccc), 0);
@@ -1220,7 +1301,6 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_container, 0, 0);
     lv_obj_clear_flag(table_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 表头 */
     lv_obj_t *table_header = lv_obj_create(table_container);
     lv_obj_set_size(table_header, 1138, 40);
     lv_obj_set_pos(table_header, 0, 0);
@@ -1231,8 +1311,7 @@ static void create_manual_record_view(lv_obj_t *parent)
     lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
 
     const char *headers[] = {"序号", "启动时间", "计划运行时长", "实际运行时长", "状态", "详情"};
-    int header_x[] = {20, 150, 380, 610, 840, 1000};
-
+    int header_x[] = {20, 160, 385, 625, 860, 1010};
     for (int i = 0; i < 6; i++) {
         lv_obj_t *h_label = lv_label_create(table_header);
         lv_label_set_text(h_label, headers[i]);
@@ -1241,71 +1320,80 @@ static void create_manual_record_view(lv_obj_t *parent)
         lv_obj_set_style_text_color(h_label, lv_color_hex(0x333333), 0);
     }
 
-    /* 分页控件 */
-    int pagination_y = 610;
+    g_manual_table_area = lv_obj_create(table_container);
+    lv_obj_set_size(g_manual_table_area, 1138, 515);
+    lv_obj_set_pos(g_manual_table_area, 0, 40);
+    lv_obj_set_style_bg_opa(g_manual_table_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_manual_table_area, 0, 0);
+    lv_obj_set_style_radius(g_manual_table_area, 0, 0);
+    lv_obj_set_style_pad_all(g_manual_table_area, 0, 0);
+    lv_obj_clear_flag(g_manual_table_area, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 首页按钮 */
-    lv_obj_t *first_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(first_page_btn, 70, 35);
-    lv_obj_set_pos(first_page_btn, 350, pagination_y);
-    lv_obj_set_style_bg_color(first_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(first_page_btn, 0, 0);
-    lv_obj_set_style_radius(first_page_btn, 5, 0);
-
-    lv_obj_t *first_label = lv_label_create(first_page_btn);
+    g_manual_btn_first = lv_btn_create(parent);
+    lv_obj_set_size(g_manual_btn_first, 70, 35);
+    lv_obj_set_pos(g_manual_btn_first, 350, pagination_y);
+    lv_obj_set_style_bg_color(g_manual_btn_first, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_manual_btn_first, 0, 0);
+    lv_obj_set_style_radius(g_manual_btn_first, 5, 0);
+    lv_obj_t *first_label = lv_label_create(g_manual_btn_first);
     lv_label_set_text(first_label, "首页");
     lv_obj_set_style_text_color(first_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(first_label, &my_font_cn_16, 0);
     lv_obj_center(first_label);
 
-    /* 上一页按钮 */
-    lv_obj_t *prev_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(prev_page_btn, 80, 35);
-    lv_obj_set_pos(prev_page_btn, 430, pagination_y);
-    lv_obj_set_style_bg_color(prev_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(prev_page_btn, 0, 0);
-    lv_obj_set_style_radius(prev_page_btn, 5, 0);
-
-    lv_obj_t *prev_label = lv_label_create(prev_page_btn);
+    g_manual_btn_prev = lv_btn_create(parent);
+    lv_obj_set_size(g_manual_btn_prev, 80, 35);
+    lv_obj_set_pos(g_manual_btn_prev, 430, pagination_y);
+    lv_obj_set_style_bg_color(g_manual_btn_prev, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_manual_btn_prev, 0, 0);
+    lv_obj_set_style_radius(g_manual_btn_prev, 5, 0);
+    lv_obj_t *prev_label = lv_label_create(g_manual_btn_prev);
     lv_label_set_text(prev_label, "上一页");
     lv_obj_set_style_text_color(prev_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(prev_label, &my_font_cn_16, 0);
     lv_obj_center(prev_label);
 
-    /* 页码显示 */
-    lv_obj_t *page_label = lv_label_create(parent);
-    lv_label_set_text(page_label, "0/0");
-    lv_obj_set_pos(page_label, 540, pagination_y + 8);
-    lv_obj_set_style_text_font(page_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(page_label, lv_color_hex(0x333333), 0);
+    g_manual_page_info = lv_label_create(parent);
+    lv_label_set_text(g_manual_page_info, "0/0");
+    lv_obj_set_pos(g_manual_page_info, 540, pagination_y + 8);
+    lv_obj_set_style_text_font(g_manual_page_info, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_manual_page_info, lv_color_hex(0x333333), 0);
 
-    /* 下一页按钮 */
-    lv_obj_t *next_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(next_page_btn, 80, 35);
-    lv_obj_set_pos(next_page_btn, 600, pagination_y);
-    lv_obj_set_style_bg_color(next_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(next_page_btn, 0, 0);
-    lv_obj_set_style_radius(next_page_btn, 5, 0);
-
-    lv_obj_t *next_label = lv_label_create(next_page_btn);
+    g_manual_btn_next = lv_btn_create(parent);
+    lv_obj_set_size(g_manual_btn_next, 80, 35);
+    lv_obj_set_pos(g_manual_btn_next, 600, pagination_y);
+    lv_obj_set_style_bg_color(g_manual_btn_next, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_manual_btn_next, 0, 0);
+    lv_obj_set_style_radius(g_manual_btn_next, 5, 0);
+    lv_obj_t *next_label = lv_label_create(g_manual_btn_next);
     lv_label_set_text(next_label, "下一页");
     lv_obj_set_style_text_color(next_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(next_label, &my_font_cn_16, 0);
     lv_obj_center(next_label);
 
-    /* 尾页按钮 */
-    lv_obj_t *last_page_btn2 = lv_btn_create(parent);
-    lv_obj_set_size(last_page_btn2, 70, 35);
-    lv_obj_set_pos(last_page_btn2, 690, pagination_y);
-    lv_obj_set_style_bg_color(last_page_btn2, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(last_page_btn2, 0, 0);
-    lv_obj_set_style_radius(last_page_btn2, 5, 0);
+    g_manual_btn_last = lv_btn_create(parent);
+    lv_obj_set_size(g_manual_btn_last, 70, 35);
+    lv_obj_set_pos(g_manual_btn_last, 690, pagination_y);
+    lv_obj_set_style_bg_color(g_manual_btn_last, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_manual_btn_last, 0, 0);
+    lv_obj_set_style_radius(g_manual_btn_last, 5, 0);
+    lv_obj_t *last_label = lv_label_create(g_manual_btn_last);
+    lv_label_set_text(last_label, "尾页");
+    lv_obj_set_style_text_color(last_label, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_text_font(last_label, &my_font_cn_16, 0);
+    lv_obj_center(last_label);
 
-    lv_obj_t *last_label2 = lv_label_create(last_page_btn2);
-    lv_label_set_text(last_label2, "尾页");
-    lv_obj_set_style_text_color(last_label2, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_text_font(last_label2, &my_font_cn_16, 0);
-    lv_obj_center(last_label2);
+    ui_log_rec_setup_manual(
+        input_start,
+        input_end,
+        g_manual_status_dropdown,
+        g_manual_table_area,
+        g_manual_page_info,
+        g_manual_btn_first,
+        g_manual_btn_prev,
+        g_manual_btn_next,
+        g_manual_btn_last
+    );
 }
 
 /**
@@ -1314,16 +1402,15 @@ static void create_manual_record_view(lv_obj_t *parent)
 static void create_program_record_view(lv_obj_t *parent)
 {
     int y_pos = 5;
+    int pagination_y = 610;
     char today_buf[32];
     get_today_str(today_buf, sizeof(today_buf));
 
-    /* 日期标签 */
     lv_obj_t *date_label = lv_label_create(parent);
     lv_label_set_text(date_label, "日期:");
     lv_obj_set_pos(date_label, 10, y_pos + 8);
     lv_obj_set_style_text_font(date_label, &my_font_cn_16, 0);
 
-    /* 起始日期输入框容器 */
     lv_obj_t *start_date_container = lv_obj_create(parent);
     lv_obj_set_size(start_date_container, 190, 30);
     lv_obj_set_pos(start_date_container, 60, y_pos + 3);
@@ -1334,22 +1421,20 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(start_date_container, 0, 0);
     lv_obj_clear_flag(start_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 起始日期输入框 */
     lv_obj_t *input_start = lv_textarea_create(start_date_container);
     lv_obj_set_size(input_start, 155, 28);
     lv_obj_set_pos(input_start, 1, 1);
     lv_textarea_set_one_line(input_start, true);
     lv_textarea_set_text(input_start, today_buf);
     lv_obj_set_style_text_font(input_start, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_start, 0, 0);
     lv_obj_set_style_pad_right(input_start, 0, 0);
-    lv_obj_set_style_pad_top(input_start, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_start, 4, 0);
     lv_obj_set_style_pad_bottom(input_start, 0, 0);
     lv_obj_set_style_border_width(input_start, 0, 0);
     lv_obj_clear_flag(input_start, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 起始日期日历按钮 */
     lv_obj_t *btn_start_cal = lv_btn_create(start_date_container);
     lv_obj_set_size(btn_start_cal, 28, 28);
     lv_obj_set_pos(btn_start_cal, 161, 1);
@@ -1363,13 +1448,11 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_start, &my_font_cn_16, 0);
     lv_obj_center(icon_start);
 
-    /* 至 */
     lv_obj_t *to_label = lv_label_create(parent);
     lv_label_set_text(to_label, "至");
     lv_obj_set_pos(to_label, 265, y_pos + 8);
     lv_obj_set_style_text_font(to_label, &my_font_cn_16, 0);
 
-    /* 结束日期输入框容器 */
     lv_obj_t *end_date_container = lv_obj_create(parent);
     lv_obj_set_size(end_date_container, 190, 30);
     lv_obj_set_pos(end_date_container, 300, y_pos + 3);
@@ -1380,22 +1463,20 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(end_date_container, 0, 0);
     lv_obj_clear_flag(end_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 结束日期输入框 */
     lv_obj_t *input_end = lv_textarea_create(end_date_container);
     lv_obj_set_size(input_end, 155, 28);
     lv_obj_set_pos(input_end, 1, 1);
     lv_textarea_set_one_line(input_end, true);
     lv_textarea_set_text(input_end, today_buf);
     lv_obj_set_style_text_font(input_end, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_end, 0, 0);
     lv_obj_set_style_pad_right(input_end, 0, 0);
-    lv_obj_set_style_pad_top(input_end, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_end, 4, 0);
     lv_obj_set_style_pad_bottom(input_end, 0, 0);
     lv_obj_set_style_border_width(input_end, 0, 0);
     lv_obj_clear_flag(input_end, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 结束日期日历按钮 */
     lv_obj_t *btn_end_cal = lv_btn_create(end_date_container);
     lv_obj_set_size(btn_end_cal, 28, 28);
     lv_obj_set_pos(btn_end_cal, 161, 1);
@@ -1409,21 +1490,20 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_end, &my_font_cn_16, 0);
     lv_obj_center(icon_end);
 
-    /* 类型下拉框 */
-    lv_obj_t *dropdown = lv_dropdown_create(parent);
-    lv_obj_set_size(dropdown, 120, 30);
-    lv_obj_set_pos(dropdown, 850, y_pos + 3);
-    lv_dropdown_set_options(dropdown, "全部\n正常\n异常");
-    lv_obj_set_style_text_font(dropdown, &my_font_cn_16, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(dropdown), &my_font_cn_16, 0);
+    g_program_status_dropdown = lv_dropdown_create(parent);
+    lv_obj_set_size(g_program_status_dropdown, 120, 30);
+    lv_obj_set_pos(g_program_status_dropdown, 850, y_pos + 3);
+    lv_dropdown_set_options(g_program_status_dropdown, "全部\n正常\n异常");
+    lv_obj_set_style_text_font(g_program_status_dropdown, &my_font_cn_16, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(g_program_status_dropdown), &my_font_cn_16, 0);
 
-    /* 查询按钮 */
     lv_obj_t *query_btn = lv_btn_create(parent);
     lv_obj_set_size(query_btn, 100, 30);
     lv_obj_set_pos(query_btn, 1000, y_pos + 3);
     lv_obj_set_style_bg_color(query_btn, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(query_btn, 0, 0);
     lv_obj_set_style_radius(query_btn, 5, 0);
+    lv_obj_add_event_cb(query_btn, ui_log_rec_program_query_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *query_label = lv_label_create(query_btn);
     lv_label_set_text(query_label, "查询");
@@ -1431,13 +1511,9 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(query_label, &my_font_cn_16, 0);
     lv_obj_center(query_label);
 
-    /* 程序记录表格 */
-    int table_y = 45;
-    int table_height = 555;
-
     lv_obj_t *table_container = lv_obj_create(parent);
-    lv_obj_set_size(table_container, 1138, table_height);
-    lv_obj_set_pos(table_container, 0, table_y);
+    lv_obj_set_size(table_container, 1138, 555);
+    lv_obj_set_pos(table_container, 0, 45);
     lv_obj_set_style_bg_color(table_container, lv_color_hex(0xf5f5f5), 0);
     lv_obj_set_style_border_width(table_container, 1, 0);
     lv_obj_set_style_border_color(table_container, lv_color_hex(0xcccccc), 0);
@@ -1445,7 +1521,6 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_container, 0, 0);
     lv_obj_clear_flag(table_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 表头 */
     lv_obj_t *table_header = lv_obj_create(table_container);
     lv_obj_set_size(table_header, 1138, 40);
     lv_obj_set_pos(table_header, 0, 0);
@@ -1456,8 +1531,7 @@ static void create_program_record_view(lv_obj_t *parent)
     lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
 
     const char *headers[] = {"序号", "名称", "启动条件", "启动时间", "计划运行时长", "实际运行时长", "状态", "详情"};
-    int header_x[] = {20, 90, 210, 380, 550, 720, 890, 1000};
-
+    int header_x[] = {15, 105, 245, 400, 585, 770, 955, 1050};
     for (int i = 0; i < 8; i++) {
         lv_obj_t *h_label = lv_label_create(table_header);
         lv_label_set_text(h_label, headers[i]);
@@ -1466,71 +1540,80 @@ static void create_program_record_view(lv_obj_t *parent)
         lv_obj_set_style_text_color(h_label, lv_color_hex(0x333333), 0);
     }
 
-    /* 分页控件 */
-    int pagination_y = 610;
+    g_program_table_area = lv_obj_create(table_container);
+    lv_obj_set_size(g_program_table_area, 1138, 515);
+    lv_obj_set_pos(g_program_table_area, 0, 40);
+    lv_obj_set_style_bg_opa(g_program_table_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_program_table_area, 0, 0);
+    lv_obj_set_style_radius(g_program_table_area, 0, 0);
+    lv_obj_set_style_pad_all(g_program_table_area, 0, 0);
+    lv_obj_clear_flag(g_program_table_area, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 首页按钮 */
-    lv_obj_t *first_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(first_page_btn, 70, 35);
-    lv_obj_set_pos(first_page_btn, 350, pagination_y);
-    lv_obj_set_style_bg_color(first_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(first_page_btn, 0, 0);
-    lv_obj_set_style_radius(first_page_btn, 5, 0);
-
-    lv_obj_t *first_label = lv_label_create(first_page_btn);
+    g_program_btn_first = lv_btn_create(parent);
+    lv_obj_set_size(g_program_btn_first, 70, 35);
+    lv_obj_set_pos(g_program_btn_first, 350, pagination_y);
+    lv_obj_set_style_bg_color(g_program_btn_first, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_program_btn_first, 0, 0);
+    lv_obj_set_style_radius(g_program_btn_first, 5, 0);
+    lv_obj_t *first_label = lv_label_create(g_program_btn_first);
     lv_label_set_text(first_label, "首页");
     lv_obj_set_style_text_color(first_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(first_label, &my_font_cn_16, 0);
     lv_obj_center(first_label);
 
-    /* 上一页按钮 */
-    lv_obj_t *prev_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(prev_page_btn, 80, 35);
-    lv_obj_set_pos(prev_page_btn, 430, pagination_y);
-    lv_obj_set_style_bg_color(prev_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(prev_page_btn, 0, 0);
-    lv_obj_set_style_radius(prev_page_btn, 5, 0);
-
-    lv_obj_t *prev_label = lv_label_create(prev_page_btn);
+    g_program_btn_prev = lv_btn_create(parent);
+    lv_obj_set_size(g_program_btn_prev, 80, 35);
+    lv_obj_set_pos(g_program_btn_prev, 430, pagination_y);
+    lv_obj_set_style_bg_color(g_program_btn_prev, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_program_btn_prev, 0, 0);
+    lv_obj_set_style_radius(g_program_btn_prev, 5, 0);
+    lv_obj_t *prev_label = lv_label_create(g_program_btn_prev);
     lv_label_set_text(prev_label, "上一页");
     lv_obj_set_style_text_color(prev_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(prev_label, &my_font_cn_16, 0);
     lv_obj_center(prev_label);
 
-    /* 页码显示 */
-    lv_obj_t *page_label = lv_label_create(parent);
-    lv_label_set_text(page_label, "0/0");
-    lv_obj_set_pos(page_label, 540, pagination_y + 8);
-    lv_obj_set_style_text_font(page_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(page_label, lv_color_hex(0x333333), 0);
+    g_program_page_info = lv_label_create(parent);
+    lv_label_set_text(g_program_page_info, "0/0");
+    lv_obj_set_pos(g_program_page_info, 540, pagination_y + 8);
+    lv_obj_set_style_text_font(g_program_page_info, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_program_page_info, lv_color_hex(0x333333), 0);
 
-    /* 下一页按钮 */
-    lv_obj_t *next_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(next_page_btn, 80, 35);
-    lv_obj_set_pos(next_page_btn, 600, pagination_y);
-    lv_obj_set_style_bg_color(next_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(next_page_btn, 0, 0);
-    lv_obj_set_style_radius(next_page_btn, 5, 0);
-
-    lv_obj_t *next_label = lv_label_create(next_page_btn);
+    g_program_btn_next = lv_btn_create(parent);
+    lv_obj_set_size(g_program_btn_next, 80, 35);
+    lv_obj_set_pos(g_program_btn_next, 600, pagination_y);
+    lv_obj_set_style_bg_color(g_program_btn_next, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_program_btn_next, 0, 0);
+    lv_obj_set_style_radius(g_program_btn_next, 5, 0);
+    lv_obj_t *next_label = lv_label_create(g_program_btn_next);
     lv_label_set_text(next_label, "下一页");
     lv_obj_set_style_text_color(next_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(next_label, &my_font_cn_16, 0);
     lv_obj_center(next_label);
 
-    /* 尾页按钮 */
-    lv_obj_t *last_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(last_page_btn, 70, 35);
-    lv_obj_set_pos(last_page_btn, 690, pagination_y);
-    lv_obj_set_style_bg_color(last_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(last_page_btn, 0, 0);
-    lv_obj_set_style_radius(last_page_btn, 5, 0);
-
-    lv_obj_t *last_label = lv_label_create(last_page_btn);
+    g_program_btn_last = lv_btn_create(parent);
+    lv_obj_set_size(g_program_btn_last, 70, 35);
+    lv_obj_set_pos(g_program_btn_last, 690, pagination_y);
+    lv_obj_set_style_bg_color(g_program_btn_last, lv_color_hex(0xe0e0e0), 0);
+    lv_obj_set_style_border_width(g_program_btn_last, 0, 0);
+    lv_obj_set_style_radius(g_program_btn_last, 5, 0);
+    lv_obj_t *last_label = lv_label_create(g_program_btn_last);
     lv_label_set_text(last_label, "尾页");
     lv_obj_set_style_text_color(last_label, lv_color_hex(0x333333), 0);
     lv_obj_set_style_text_font(last_label, &my_font_cn_16, 0);
     lv_obj_center(last_label);
+
+    ui_log_rec_setup_program(
+        input_start,
+        input_end,
+        g_program_status_dropdown,
+        g_program_table_area,
+        g_program_page_info,
+        g_program_btn_first,
+        g_program_btn_prev,
+        g_program_btn_next,
+        g_program_btn_last
+    );
 }
 
 /**
@@ -1542,13 +1625,11 @@ static void create_daily_flow_view(lv_obj_t *parent)
     char today_buf[32];
     get_today_str(today_buf, sizeof(today_buf));
 
-    /* 日期标签 */
     lv_obj_t *date_label = lv_label_create(parent);
     lv_label_set_text(date_label, "日期:");
     lv_obj_set_pos(date_label, 10, y_pos + 8);
     lv_obj_set_style_text_font(date_label, &my_font_cn_16, 0);
 
-    /* 起始日期输入框容器 */
     lv_obj_t *start_date_container = lv_obj_create(parent);
     lv_obj_set_size(start_date_container, 190, 30);
     lv_obj_set_pos(start_date_container, 60, y_pos + 3);
@@ -1559,22 +1640,20 @@ static void create_daily_flow_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(start_date_container, 0, 0);
     lv_obj_clear_flag(start_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 起始日期输入框 */
     lv_obj_t *input_start = lv_textarea_create(start_date_container);
     lv_obj_set_size(input_start, 155, 28);
     lv_obj_set_pos(input_start, 1, 1);
     lv_textarea_set_one_line(input_start, true);
     lv_textarea_set_text(input_start, today_buf);
     lv_obj_set_style_text_font(input_start, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_start, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_start, 0, 0);
     lv_obj_set_style_pad_right(input_start, 0, 0);
-    lv_obj_set_style_pad_top(input_start, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_start, 4, 0);
     lv_obj_set_style_pad_bottom(input_start, 0, 0);
     lv_obj_set_style_border_width(input_start, 0, 0);
     lv_obj_clear_flag(input_start, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 起始日期日历按钮 */
     lv_obj_t *btn_start_cal = lv_btn_create(start_date_container);
     lv_obj_set_size(btn_start_cal, 28, 28);
     lv_obj_set_pos(btn_start_cal, 161, 1);
@@ -1588,13 +1667,11 @@ static void create_daily_flow_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_start, &my_font_cn_16, 0);
     lv_obj_center(icon_start);
 
-    /* 至 */
     lv_obj_t *to_label = lv_label_create(parent);
     lv_label_set_text(to_label, "至");
     lv_obj_set_pos(to_label, 265, y_pos + 8);
     lv_obj_set_style_text_font(to_label, &my_font_cn_16, 0);
 
-    /* 结束日期输入框容器 */
     lv_obj_t *end_date_container = lv_obj_create(parent);
     lv_obj_set_size(end_date_container, 190, 30);
     lv_obj_set_pos(end_date_container, 300, y_pos + 3);
@@ -1605,22 +1682,20 @@ static void create_daily_flow_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(end_date_container, 0, 0);
     lv_obj_clear_flag(end_date_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 结束日期输入框 */
     lv_obj_t *input_end = lv_textarea_create(end_date_container);
     lv_obj_set_size(input_end, 155, 28);
     lv_obj_set_pos(input_end, 1, 1);
     lv_textarea_set_one_line(input_end, true);
     lv_textarea_set_text(input_end, today_buf);
     lv_obj_set_style_text_font(input_end, &my_font_cn_16, 0);
-    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);  /* 文本水平居中 */
+    lv_obj_set_style_text_align(input_end, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_left(input_end, 0, 0);
     lv_obj_set_style_pad_right(input_end, 0, 0);
-    lv_obj_set_style_pad_top(input_end, 4, 0);  /* 上边距4px */
+    lv_obj_set_style_pad_top(input_end, 4, 0);
     lv_obj_set_style_pad_bottom(input_end, 0, 0);
     lv_obj_set_style_border_width(input_end, 0, 0);
     lv_obj_clear_flag(input_end, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 结束日期日历按钮 */
     lv_obj_t *btn_end_cal = lv_btn_create(end_date_container);
     lv_obj_set_size(btn_end_cal, 28, 28);
     lv_obj_set_pos(btn_end_cal, 161, 1);
@@ -1634,13 +1709,13 @@ static void create_daily_flow_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(icon_end, &my_font_cn_16, 0);
     lv_obj_center(icon_end);
 
-    /* 查询按钮 */
     lv_obj_t *query_btn = lv_btn_create(parent);
     lv_obj_set_size(query_btn, 100, 30);
     lv_obj_set_pos(query_btn, 1000, y_pos + 3);
     lv_obj_set_style_bg_color(query_btn, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(query_btn, 0, 0);
     lv_obj_set_style_radius(query_btn, 5, 0);
+    lv_obj_add_event_cb(query_btn, query_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *query_label = lv_label_create(query_btn);
     lv_label_set_text(query_label, "查询");
@@ -1648,13 +1723,9 @@ static void create_daily_flow_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(query_label, &my_font_cn_16, 0);
     lv_obj_center(query_label);
 
-    /* 每日流量表格 */
-    int table_y = 45;
-    int table_height = 555;
-
     lv_obj_t *table_container = lv_obj_create(parent);
-    lv_obj_set_size(table_container, 1138, table_height);
-    lv_obj_set_pos(table_container, 0, table_y);
+    lv_obj_set_size(table_container, 1138, 555);
+    lv_obj_set_pos(table_container, 0, 45);
     lv_obj_set_style_bg_color(table_container, lv_color_hex(0xf5f5f5), 0);
     lv_obj_set_style_border_width(table_container, 1, 0);
     lv_obj_set_style_border_color(table_container, lv_color_hex(0xcccccc), 0);
@@ -1662,7 +1733,6 @@ static void create_daily_flow_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_container, 0, 0);
     lv_obj_clear_flag(table_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 表头 */
     lv_obj_t *table_header = lv_obj_create(table_container);
     lv_obj_set_size(table_header, 1138, 40);
     lv_obj_set_pos(table_header, 0, 0);
@@ -1674,7 +1744,6 @@ static void create_daily_flow_view(lv_obj_t *parent)
 
     const char *headers[] = {"序号", "日期", "灌肥量(L)", "灌水量(m³)"};
     int header_x[] = {20, 250, 550, 850};
-
     for (int i = 0; i < 4; i++) {
         lv_obj_t *h_label = lv_label_create(table_header);
         lv_label_set_text(h_label, headers[i]);
@@ -1683,82 +1752,7 @@ static void create_daily_flow_view(lv_obj_t *parent)
         lv_obj_set_style_text_color(h_label, lv_color_hex(0x333333), 0);
     }
 
-    /* 分页控件 */
-    int pagination_y = 610;
-
-    /* 首页按钮 */
-    lv_obj_t *first_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(first_page_btn, 70, 35);
-    lv_obj_set_pos(first_page_btn, 350, pagination_y);
-    lv_obj_set_style_bg_color(first_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(first_page_btn, 0, 0);
-    lv_obj_set_style_radius(first_page_btn, 5, 0);
-
-    lv_obj_t *first_label = lv_label_create(first_page_btn);
-    lv_label_set_text(first_label, "首页");
-    lv_obj_set_style_text_color(first_label, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_text_font(first_label, &my_font_cn_16, 0);
-    lv_obj_center(first_label);
-
-    /* 上一页按钮 */
-    lv_obj_t *prev_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(prev_page_btn, 80, 35);
-    lv_obj_set_pos(prev_page_btn, 430, pagination_y);
-    lv_obj_set_style_bg_color(prev_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(prev_page_btn, 0, 0);
-    lv_obj_set_style_radius(prev_page_btn, 5, 0);
-
-    lv_obj_t *prev_label = lv_label_create(prev_page_btn);
-    lv_label_set_text(prev_label, "上一页");
-    lv_obj_set_style_text_color(prev_label, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_text_font(prev_label, &my_font_cn_16, 0);
-    lv_obj_center(prev_label);
-
-    /* 页码显示 */
-    lv_obj_t *page_label = lv_label_create(parent);
-    lv_label_set_text(page_label, "0/0");
-    lv_obj_set_pos(page_label, 540, pagination_y + 8);
-    lv_obj_set_style_text_font(page_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(page_label, lv_color_hex(0x333333), 0);
-
-    /* 下一页按钮 */
-    lv_obj_t *next_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(next_page_btn, 80, 35);
-    lv_obj_set_pos(next_page_btn, 600, pagination_y);
-    lv_obj_set_style_bg_color(next_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(next_page_btn, 0, 0);
-    lv_obj_set_style_radius(next_page_btn, 5, 0);
-
-    lv_obj_t *next_label = lv_label_create(next_page_btn);
-    lv_label_set_text(next_label, "下一页");
-    lv_obj_set_style_text_color(next_label, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_text_font(next_label, &my_font_cn_16, 0);
-    lv_obj_center(next_label);
-
-    /* 尾页按钮 */
-    lv_obj_t *last_page_btn = lv_btn_create(parent);
-    lv_obj_set_size(last_page_btn, 70, 35);
-    lv_obj_set_pos(last_page_btn, 690, pagination_y);
-    lv_obj_set_style_bg_color(last_page_btn, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_border_width(last_page_btn, 0, 0);
-    lv_obj_set_style_radius(last_page_btn, 5, 0);
-
-    lv_obj_t *last_label = lv_label_create(last_page_btn);
-    lv_label_set_text(last_label, "尾页");
-    lv_obj_set_style_text_color(last_label, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_text_font(last_label, &my_font_cn_16, 0);
-    lv_obj_center(last_label);
+    show_placeholder_message(table_container, "当前版本暂未接入每日流量数据");
 }
 
-/**
- * @brief 输入框点击回调 - 显示数字键盘
- */
-static void textarea_click_cb(lv_event_t *e)
-{
-    lv_obj_t *textarea = lv_event_get_target(e);
-    ui_main_t *ui_main = ui_get_main();
 
-    if (textarea && ui_main && ui_main->screen) {
-        ui_numpad_show(textarea, ui_main->screen);
-    }
-}
