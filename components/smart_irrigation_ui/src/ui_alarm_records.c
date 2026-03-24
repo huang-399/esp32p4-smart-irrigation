@@ -1,6 +1,6 @@
 /**
  * @file ui_alarm_records.c
- * @brief 告警管理 - 掉线记录/上电记录 表格渲染与分页逻辑
+ * @brief 告警管理 - 历史报警/掉线记录/上电记录 表格渲染与分页逻辑
  */
 
 #include "ui_alarm_records.h"
@@ -40,6 +40,7 @@ typedef struct {
  *  STATIC VARIABLES
  *********************/
 static ui_alarm_rec_query_fn s_query_fn = NULL;
+static rec_tab_ctx_t s_history_ctx;
 static rec_tab_ctx_t s_offline_ctx;
 static rec_tab_ctx_t s_poweron_ctx;
 
@@ -52,6 +53,7 @@ static void page_first_cb(lv_event_t *e);
 static void page_prev_cb(lv_event_t *e);
 static void page_next_cb(lv_event_t *e);
 static void page_last_cb(lv_event_t *e);
+static const char *get_empty_message(ui_alarm_rec_type_t type);
 
 /**********************
  *   GLOBAL FUNCTIONS
@@ -60,6 +62,29 @@ static void page_last_cb(lv_event_t *e);
 void ui_alarm_rec_register_query_cb(ui_alarm_rec_query_fn fn)
 {
     s_query_fn = fn;
+}
+
+void ui_alarm_rec_setup_history_alarm(lv_obj_t *input_start, lv_obj_t *input_end,
+    lv_obj_t *table_area, lv_obj_t *page_info,
+    lv_obj_t *btn_first, lv_obj_t *btn_prev,
+    lv_obj_t *btn_next, lv_obj_t *btn_last)
+{
+    s_history_ctx.type = UI_ALARM_REC_HISTORY_ALARM;
+    s_history_ctx.input_start = input_start;
+    s_history_ctx.input_end = input_end;
+    s_history_ctx.table_area = table_area;
+    s_history_ctx.page_info = page_info;
+    s_history_ctx.btn_first = btn_first;
+    s_history_ctx.btn_prev = btn_prev;
+    s_history_ctx.btn_next = btn_next;
+    s_history_ctx.btn_last = btn_last;
+    s_history_ctx.current_page = 0;
+    s_history_ctx.valid = true;
+
+    lv_obj_add_event_cb(btn_first, page_first_cb, LV_EVENT_CLICKED, &s_history_ctx);
+    lv_obj_add_event_cb(btn_prev, page_prev_cb, LV_EVENT_CLICKED, &s_history_ctx);
+    lv_obj_add_event_cb(btn_next, page_next_cb, LV_EVENT_CLICKED, &s_history_ctx);
+    lv_obj_add_event_cb(btn_last, page_last_cb, LV_EVENT_CLICKED, &s_history_ctx);
 }
 
 void ui_alarm_rec_setup_offline(lv_obj_t *input_start, lv_obj_t *input_end,
@@ -108,6 +133,14 @@ void ui_alarm_rec_setup_poweron(lv_obj_t *input_start, lv_obj_t *input_end,
     lv_obj_add_event_cb(btn_last, page_last_cb, LV_EVENT_CLICKED, &s_poweron_ctx);
 }
 
+void ui_alarm_rec_history_query_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_history_ctx.valid) return;
+    s_history_ctx.current_page = 0;
+    render_page(&s_history_ctx);
+}
+
 void ui_alarm_rec_offline_query_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -126,6 +159,10 @@ void ui_alarm_rec_poweron_query_btn_cb(lv_event_t *e)
 
 void ui_alarm_rec_invalidate(void)
 {
+    s_history_ctx.valid = false;
+    s_history_ctx.table_area = NULL;
+    s_history_ctx.page_info = NULL;
+
     s_offline_ctx.valid = false;
     s_offline_ctx.table_area = NULL;
     s_offline_ctx.page_info = NULL;
@@ -137,6 +174,9 @@ void ui_alarm_rec_invalidate(void)
 
 void ui_alarm_rec_refresh_visible(void)
 {
+    if (s_history_ctx.valid && s_history_ctx.table_area) {
+        render_page(&s_history_ctx);
+    }
     if (s_offline_ctx.valid && s_offline_ctx.table_area) {
         render_page(&s_offline_ctx);
     }
@@ -149,12 +189,6 @@ void ui_alarm_rec_refresh_visible(void)
  *   STATIC FUNCTIONS
  **********************/
 
-/**
- * @brief Parse "YYYY-MM-DD" string to epoch seconds
- * @param date_str Date string in "YYYY-MM-DD" format
- * @param is_end If true, set time to 23:59:59; otherwise 00:00:00
- * @return epoch seconds, or 0 on failure
- */
 static int64_t date_str_to_epoch(const char *date_str, bool is_end)
 {
     if (!date_str || strlen(date_str) < 10) return 0;
@@ -174,6 +208,20 @@ static int64_t date_str_to_epoch(const char *date_str, bool is_end)
     }
 
     return (int64_t)mktime(&tm_val);
+}
+
+static const char *get_empty_message(ui_alarm_rec_type_t type)
+{
+    switch (type) {
+        case UI_ALARM_REC_OFFLINE:
+            return "暂无掉线记录";
+        case UI_ALARM_REC_POWERON:
+            return "暂无上电记录";
+        case UI_ALARM_REC_HISTORY_ALARM:
+            return "暂无历史报警记录";
+        default:
+            return "暂无记录";
+    }
 }
 
 /**
@@ -206,9 +254,7 @@ static void render_page(rec_tab_ctx_t *ctx)
     if (result.count == 0) {
         /* Show empty message */
         lv_obj_t *empty_label = lv_label_create(ctx->table_area);
-        const char *msg = (ctx->type == UI_ALARM_REC_OFFLINE) ?
-            "暂无掉线记录" : "暂无上电记录";
-        lv_label_set_text(empty_label, msg);
+        lv_label_set_text(empty_label, get_empty_message(ctx->type));
         lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
         lv_obj_center(empty_label);

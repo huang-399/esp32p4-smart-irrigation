@@ -12,7 +12,8 @@ extern "C" {
 
 typedef enum {
     UI_ALARM_REC_OFFLINE = 0,
-    UI_ALARM_REC_POWERON
+    UI_ALARM_REC_POWERON,
+    UI_ALARM_REC_HISTORY_ALARM
 } ui_alarm_rec_type_t;
 
 typedef struct {
@@ -34,6 +35,11 @@ typedef void (*ui_alarm_rec_query_fn)(ui_alarm_rec_type_t type,
 
 void ui_alarm_rec_register_query_cb(ui_alarm_rec_query_fn fn);
 
+void ui_alarm_rec_setup_history_alarm(lv_obj_t *input_start, lv_obj_t *input_end,
+    lv_obj_t *table_area, lv_obj_t *page_info,
+    lv_obj_t *btn_first, lv_obj_t *btn_prev,
+    lv_obj_t *btn_next, lv_obj_t *btn_last);
+
 void ui_alarm_rec_setup_offline(lv_obj_t *input_start, lv_obj_t *input_end,
     lv_obj_t *table_area, lv_obj_t *page_info,
     lv_obj_t *btn_first, lv_obj_t *btn_prev,
@@ -44,6 +50,7 @@ void ui_alarm_rec_setup_poweron(lv_obj_t *input_start, lv_obj_t *input_end,
     lv_obj_t *btn_first, lv_obj_t *btn_prev,
     lv_obj_t *btn_next, lv_obj_t *btn_last);
 
+void ui_alarm_rec_history_query_btn_cb(lv_event_t *e);
 void ui_alarm_rec_offline_query_btn_cb(lv_event_t *e);
 void ui_alarm_rec_poweron_query_btn_cb(lv_event_t *e);
 

@@ -15,6 +15,7 @@ static const char *TAG = "event_recorder";
 #define NVS_KEY_POWERON "poweron"
 #define NVS_KEY_CONTROL "control"
 #define NVS_KEY_OPERATION "operation"
+#define NVS_KEY_ALARM "alarm"
 #define NVS_KEY_MANUAL "manual_rec"
 #define NVS_KEY_PROGRAM "program_rec"
 #define TIME_SYNC_THRESHOLD 1704067200LL  /* 2024-01-01 00:00:00 UTC */
@@ -37,23 +38,31 @@ typedef struct {
     evt_program_record_t records[EVT_RECORD_MAX];
 } evt_program_store_t;
 
-static evt_store_t s_basic_stores[EVT_TYPE_OPERATION + 1];
+static evt_store_t s_basic_stores[EVT_TYPE_ALARM + 1];
 static evt_manual_store_t s_manual_store;
 static evt_program_store_t s_program_store;
+static bool s_basic_dirty[EVT_TYPE_ALARM + 1] = {0};
+static bool s_manual_dirty = false;
+static bool s_program_dirty = false;
 static SemaphoreHandle_t s_mutex = NULL;
 static nvs_handle_t s_nvs_handle;
 static bool s_initialized = false;
 
-static const char *s_basic_nvs_keys[EVT_TYPE_OPERATION + 1] = {
+static const char *s_basic_nvs_keys[EVT_TYPE_ALARM + 1] = {
     NVS_KEY_OFFLINE,
     NVS_KEY_POWERON,
     NVS_KEY_CONTROL,
-    NVS_KEY_OPERATION
+    NVS_KEY_OPERATION,
+    NVS_KEY_ALARM
 };
+
+static esp_err_t set_manual_store_blob(void);
+static esp_err_t set_program_store_blob(void);
+static esp_err_t flush_dirty_stores_locked(void);
 
 static bool is_basic_type(evt_type_t type)
 {
-    return type >= EVT_TYPE_OFFLINE && type <= EVT_TYPE_OPERATION;
+    return type >= EVT_TYPE_OFFLINE && type <= EVT_TYPE_ALARM;
 }
 
 static bool timestamp_matches_range(int64_t ts, int64_t start_ts, int64_t end_ts)
@@ -95,14 +104,63 @@ static esp_err_t load_basic_store(evt_type_t type)
     return ret;
 }
 
+static esp_err_t set_basic_store_blob(evt_type_t type)
+{
+    return nvs_set_blob(s_nvs_handle, s_basic_nvs_keys[type],
+                        &s_basic_stores[type], sizeof(evt_store_t));
+}
+
+static esp_err_t flush_dirty_stores_locked(void)
+{
+    bool wrote_any = false;
+
+    for (int t = EVT_TYPE_OFFLINE; t <= EVT_TYPE_ALARM; t++) {
+        if (!s_basic_dirty[t]) {
+            continue;
+        }
+
+        esp_err_t ret = set_basic_store_blob((evt_type_t)t);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        wrote_any = true;
+    }
+
+    if (s_manual_dirty) {
+        esp_err_t ret = set_manual_store_blob();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        wrote_any = true;
+    }
+
+    if (s_program_dirty) {
+        esp_err_t ret = set_program_store_blob();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        wrote_any = true;
+    }
+
+    if (!wrote_any) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = nvs_commit(s_nvs_handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    memset(s_basic_dirty, 0, sizeof(s_basic_dirty));
+    s_manual_dirty = false;
+    s_program_dirty = false;
+    return ESP_OK;
+}
+
 static esp_err_t save_basic_store(evt_type_t type)
 {
-    esp_err_t ret = nvs_set_blob(s_nvs_handle, s_basic_nvs_keys[type],
-                                 &s_basic_stores[type], sizeof(evt_store_t));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(s_nvs_handle);
-    }
-    return ret;
+    s_basic_dirty[type] = true;
+    return flush_dirty_stores_locked();
 }
 
 static esp_err_t load_manual_store(void)
@@ -116,14 +174,16 @@ static esp_err_t load_manual_store(void)
     return ret;
 }
 
+static esp_err_t set_manual_store_blob(void)
+{
+    return nvs_set_blob(s_nvs_handle, NVS_KEY_MANUAL,
+                        &s_manual_store, sizeof(s_manual_store));
+}
+
 static esp_err_t save_manual_store(void)
 {
-    esp_err_t ret = nvs_set_blob(s_nvs_handle, NVS_KEY_MANUAL,
-                                 &s_manual_store, sizeof(s_manual_store));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(s_nvs_handle);
-    }
-    return ret;
+    s_manual_dirty = true;
+    return flush_dirty_stores_locked();
 }
 
 static esp_err_t load_program_store(void)
@@ -137,14 +197,16 @@ static esp_err_t load_program_store(void)
     return ret;
 }
 
+static esp_err_t set_program_store_blob(void)
+{
+    return nvs_set_blob(s_nvs_handle, NVS_KEY_PROGRAM,
+                        &s_program_store, sizeof(s_program_store));
+}
+
 static esp_err_t save_program_store(void)
 {
-    esp_err_t ret = nvs_set_blob(s_nvs_handle, NVS_KEY_PROGRAM,
-                                 &s_program_store, sizeof(s_program_store));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(s_nvs_handle);
-    }
-    return ret;
+    s_program_dirty = true;
+    return flush_dirty_stores_locked();
 }
 
 static const char *record_type_name(evt_type_t type)
@@ -158,6 +220,8 @@ static const char *record_type_name(evt_type_t type)
             return "control";
         case EVT_TYPE_OPERATION:
             return "operation";
+        case EVT_TYPE_ALARM:
+            return "alarm";
         case EVT_TYPE_MANUAL_RECORD:
             return "manual";
         case EVT_TYPE_PROGRAM_RECORD:
@@ -340,7 +404,7 @@ esp_err_t event_recorder_init(void)
         return ret;
     }
 
-    for (int i = EVT_TYPE_OFFLINE; i <= EVT_TYPE_OPERATION; i++) {
+    for (int i = EVT_TYPE_OFFLINE; i <= EVT_TYPE_ALARM; i++) {
         ret = load_basic_store((evt_type_t)i);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to load store %d: %s", i, esp_err_to_name(ret));
@@ -362,11 +426,12 @@ esp_err_t event_recorder_init(void)
 
     s_initialized = true;
     ESP_LOGI(TAG,
-             "Event recorder initialized (offline:%d, poweron:%d, control:%d, operation:%d, manual:%d, program:%d)",
+             "Event recorder initialized (offline:%d, poweron:%d, control:%d, operation:%d, alarm:%d, manual:%d, program:%d)",
              s_basic_stores[EVT_TYPE_OFFLINE].count,
              s_basic_stores[EVT_TYPE_POWERON].count,
              s_basic_stores[EVT_TYPE_CONTROL].count,
              s_basic_stores[EVT_TYPE_OPERATION].count,
+             s_basic_stores[EVT_TYPE_ALARM].count,
              s_manual_store.count,
              s_program_store.count);
 
@@ -391,6 +456,11 @@ esp_err_t event_recorder_add_control(const char *desc)
 esp_err_t event_recorder_add_operation(const char *desc)
 {
     return add_record(EVT_TYPE_OPERATION, desc);
+}
+
+esp_err_t event_recorder_add_alarm(const char *desc)
+{
+    return add_record(EVT_TYPE_ALARM, desc);
 }
 
 esp_err_t event_recorder_add_manual_record(const evt_manual_record_t *record)
@@ -634,7 +704,9 @@ esp_err_t event_recorder_fix_timestamps(void)
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
-    for (int t = EVT_TYPE_OFFLINE; t <= EVT_TYPE_OPERATION; t++) {
+    bool any_modified = false;
+
+    for (int t = EVT_TYPE_OFFLINE; t <= EVT_TYPE_ALARM; t++) {
         evt_store_t *store = &s_basic_stores[t];
         bool modified = false;
 
@@ -650,8 +722,9 @@ esp_err_t event_recorder_fix_timestamps(void)
         }
 
         if (modified) {
-            save_basic_store((evt_type_t)t);
-            ESP_LOGI(TAG, "Updated %s timestamps to %lld",
+            s_basic_dirty[t] = true;
+            any_modified = true;
+            ESP_LOGI(TAG, "Updated %s timestamps to %lld (deferred save)",
                      record_type_name((evt_type_t)t),
                      (long long)now);
         }
@@ -669,8 +742,9 @@ esp_err_t event_recorder_fix_timestamps(void)
             dedupe_manual_store();
         }
         if (modified) {
-            save_manual_store();
-            ESP_LOGI(TAG, "Updated manual record timestamps to %lld", (long long)now);
+            s_manual_dirty = true;
+            any_modified = true;
+            ESP_LOGI(TAG, "Updated manual record timestamps to %lld (deferred save)", (long long)now);
         }
     }
 
@@ -686,8 +760,9 @@ esp_err_t event_recorder_fix_timestamps(void)
             dedupe_program_store();
         }
         if (modified) {
-            save_program_store();
-            ESP_LOGI(TAG, "Updated program record timestamps to %lld", (long long)now);
+            s_program_dirty = true;
+            any_modified = true;
+            ESP_LOGI(TAG, "Updated program record timestamps to %lld (deferred save)", (long long)now);
         }
     }
 

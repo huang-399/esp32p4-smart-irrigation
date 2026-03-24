@@ -174,6 +174,16 @@ esp_err_t display_manager_init(void)
     return ESP_OK;
 }
 
+void display_manager_preview_brightness(int percent)
+{
+    if (percent < 5) percent = 5;
+    if (percent > 100) percent = 100;
+
+    if (s_screen_on) {
+        bsp_display_brightness_set(percent);
+    }
+}
+
 void display_manager_set_brightness(int percent)
 {
     if (percent < 5) percent = 5;

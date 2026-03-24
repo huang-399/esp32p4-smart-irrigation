@@ -23,6 +23,12 @@ typedef void (*display_mgr_wake_cb_t)(void);
 esp_err_t display_manager_init(void);
 
 /**
+ * @brief Preview brightness immediately without saving to NVS.
+ * @param percent 0-100
+ */
+void display_manager_preview_brightness(int percent);
+
+/**
  * @brief Set brightness and save to NVS.
  * @param percent 0-100
  */

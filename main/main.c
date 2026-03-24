@@ -12,10 +12,12 @@
 #include "ui_wifi.h"
 #include "ui_display.h"
 #include "ui_network.h"
+#include "ui_alarm.h"
 #include "ui_alarm_records.h"
 #include "ui_log_records.h"
 #include "wifi_manager.h"
 #include "display_manager.h"
+#include "alarm_manager.h"
 #include "event_recorder.h"
 #include "zigbee_bridge.h"
 #include "device_registry.h"
@@ -26,7 +28,6 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
-
 static const char *TAG = "smart_irrigation";
 
 static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out);
@@ -37,6 +38,12 @@ static bool s_ntp_started = false;
 static bool s_wifi_connected = false;
 static bool s_event_fix_scheduled = false;
 static bool s_event_fix_completed = false;
+
+static bool is_nav_visible(nav_item_t nav)
+{
+    ui_main_t *ui = ui_get_main();
+    return ui && ui->current_nav == nav;
+}
 
 /* ---- Time update task ---- */
 
@@ -78,13 +85,17 @@ static void time_update_task(void *pvParameters)
 static void refresh_log_records_async(void *arg)
 {
     (void)arg;
-    ui_log_rec_refresh_visible();
+    if (is_nav_visible(NAV_LOG)) {
+        ui_log_rec_refresh_visible();
+    }
 }
 
 static void refresh_alarm_records_async(void *arg)
 {
     (void)arg;
-    ui_alarm_rec_refresh_visible();
+    if (is_nav_visible(NAV_LOG)) {
+        ui_alarm_rec_refresh_visible();
+    }
 }
 
 static void fix_event_timestamps_task(void *arg)
@@ -293,7 +304,12 @@ static void request_wifi_connect_saved(const char *ssid)
 
 /* ---- Display settings bridge callbacks ---- */
 
-static void on_brightness_change(int percent)
+static void on_preview_brightness(int percent)
+{
+    display_manager_preview_brightness(percent);
+}
+
+static void on_save_brightness(int percent)
 {
     display_manager_set_brightness(percent);
 
@@ -401,9 +417,32 @@ static void on_get_network_info(char *buf, int buf_size)
 static void on_query_records(ui_alarm_rec_type_t type, int64_t start_ts,
     int64_t end_ts, uint16_t page, ui_alarm_rec_result_t *result)
 {
-    /* Use static to reduce stack usage (called only from LVGL task) */
     static evt_query_result_t r;
-    event_recorder_query((evt_type_t)type, start_ts, end_ts, page, &r);
+    evt_type_t evt_type;
+
+    if (!result) {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+
+    switch (type) {
+        case UI_ALARM_REC_OFFLINE:
+            evt_type = EVT_TYPE_OFFLINE;
+            break;
+        case UI_ALARM_REC_POWERON:
+            evt_type = EVT_TYPE_POWERON;
+            break;
+        case UI_ALARM_REC_HISTORY_ALARM:
+            evt_type = EVT_TYPE_ALARM;
+            break;
+        default:
+            return;
+    }
+
+    if (event_recorder_query(evt_type, start_ts, end_ts, page, &r) != ESP_OK) {
+        return;
+    }
 
     result->count = r.count;
     result->total_matched = r.total_matched;
@@ -411,8 +450,86 @@ static void on_query_records(ui_alarm_rec_type_t type, int64_t start_ts,
     result->current_page = r.current_page;
     for (int i = 0; i < r.count; i++) {
         result->records[i].timestamp = r.records[i].timestamp;
-        memcpy(result->records[i].desc, r.records[i].desc, sizeof(r.records[i].desc));
+        memcpy(result->records[i].desc, r.records[i].desc, sizeof(result->records[i].desc));
     }
+}
+
+static esp_err_t on_query_current_alarms(ui_alarm_current_item_t *items,
+    size_t max_items, size_t *out_count)
+{
+    alarm_manager_current_alarm_t backend_items[ALARM_MANAGER_MAX_CURRENT] = {0};
+    size_t backend_count = 0;
+    esp_err_t ret = alarm_manager_get_current_alarms(backend_items,
+        ALARM_MANAGER_MAX_CURRENT, &backend_count);
+
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (!items || !out_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t copy_count = backend_count;
+    if (copy_count > max_items) {
+        copy_count = max_items;
+    }
+    for (size_t i = 0; i < copy_count; i++) {
+        items[i].timestamp = backend_items[i].timestamp;
+        memcpy(items[i].desc, backend_items[i].desc, sizeof(items[i].desc));
+    }
+    *out_count = copy_count;
+    return ESP_OK;
+}
+
+static esp_err_t on_clear_current_alarms(void)
+{
+    return alarm_manager_clear_current_alarms();
+}
+
+static esp_err_t on_load_alarm_settings(ui_alarm_settings_t *settings)
+{
+    alarm_manager_settings_t backend_settings = {0};
+    esp_err_t ret;
+
+    if (!settings) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = alarm_manager_load_settings(&backend_settings);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    memset(settings, 0, sizeof(*settings));
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT && i < ALARM_MANAGER_SETTINGS_COUNT; i++) {
+        memcpy(settings->items[i].threshold, backend_settings.items[i].threshold,
+               sizeof(settings->items[i].threshold));
+        settings->items[i].duration_s = backend_settings.items[i].duration_s;
+        settings->items[i].action = backend_settings.items[i].action;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t on_save_alarm_settings(const ui_alarm_settings_t *settings)
+{
+    alarm_manager_settings_t backend_settings = {0};
+
+    if (!settings) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT && i < ALARM_MANAGER_SETTINGS_COUNT; i++) {
+        memcpy(backend_settings.items[i].threshold, settings->items[i].threshold,
+               sizeof(backend_settings.items[i].threshold));
+        backend_settings.items[i].duration_s = settings->items[i].duration_s;
+        backend_settings.items[i].action = settings->items[i].action;
+    }
+
+    return alarm_manager_save_settings(&backend_settings);
 }
 
 static void on_query_log_records(ui_log_rec_type_t type, int64_t start_ts,
@@ -1432,8 +1549,14 @@ void app_main(void)
         event_recorder_add_operation("系统启动");
     }
 
+    esp_err_t alarm_ret = alarm_manager_init();
+    if (alarm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm manager init failed: %s", esp_err_to_name(alarm_ret));
+    }
+
     /* Register display settings callbacks */
-    ui_display_register_brightness_cb(on_brightness_change);
+    ui_display_register_preview_brightness_cb(on_preview_brightness);
+    ui_display_register_save_brightness_cb(on_save_brightness);
     ui_display_register_timeout_cb(on_timeout_change);
 
     /* Initialize device registry (NVS-based, before UI init) */
@@ -1508,6 +1631,12 @@ void app_main(void)
     ui_network_register_apply_static_ip_cb(on_apply_static_ip);
     ui_network_register_restore_dhcp_cb(on_restore_dhcp);
     ui_network_register_get_info_cb(on_get_network_info);
+
+    /* Register alarm callbacks */
+    ui_alarm_register_query_current_cb(on_query_current_alarms);
+    ui_alarm_register_clear_current_cb(on_clear_current_alarms);
+    ui_alarm_register_load_settings_cb(on_load_alarm_settings);
+    ui_alarm_register_save_settings_cb(on_save_alarm_settings);
 
     /* Register event records query callback */
     ui_alarm_rec_register_query_cb(on_query_records);

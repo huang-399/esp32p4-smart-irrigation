@@ -53,7 +53,11 @@ static void sensor_parent_changed_cb(lv_event_t *e);
 static void sensor_point_no_changed_cb(lv_event_t *e);
 static void device_type_changed_cb(lv_event_t *e);
 static void sensor_type_changed_cb(lv_event_t *e);
+static void update_device_default_name(void);
+static void update_device_default_id(void);
 static void update_sensor_default_name(void);
+static const char *get_device_type_base_name(int idx);
+static bool is_device_id_used(uint16_t candidate_id);
 static void device_page_cb(lv_event_t *e);
 static void valve_page_cb(lv_event_t *e);
 static void sensor_page_cb(lv_event_t *e);
@@ -2123,7 +2127,7 @@ static void show_add_device_dialog(void)
     g_device_name_input = lv_textarea_create(g_add_device_dialog);
     lv_obj_set_size(g_device_name_input, 420, 45);
     lv_obj_set_pos(g_device_name_input, 130, 125);
-    lv_textarea_set_text(g_device_name_input, "8路控制器1");
+    lv_textarea_set_text(g_device_name_input, "");
     lv_textarea_set_one_line(g_device_name_input, true);
     lv_obj_set_style_text_font(g_device_name_input, &my_font_cn_16, 0);
     lv_obj_set_style_bg_color(g_device_name_input, lv_color_hex(0xf0f0f0), 0);
@@ -2141,7 +2145,7 @@ static void show_add_device_dialog(void)
     g_device_id_input = lv_textarea_create(g_add_device_dialog);
     lv_obj_set_size(g_device_id_input, 420, 45);
     lv_obj_set_pos(g_device_id_input, 130, 195);
-    lv_textarea_set_text(g_device_id_input, "1001");
+    lv_textarea_set_text(g_device_id_input, "");
     lv_textarea_set_one_line(g_device_id_input, true);
     lv_obj_set_style_text_font(g_device_id_input, &my_font_cn_16, 0);
     lv_obj_set_style_bg_color(g_device_id_input, lv_color_hex(0xf0f0f0), 0);
@@ -2196,6 +2200,11 @@ static void show_add_device_dialog(void)
     lv_obj_set_style_text_color(confirm_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(confirm_label, &my_font_cn_16, 0);
     lv_obj_center(confirm_label);
+
+    if (!g_is_editing_device) {
+        update_device_default_name();
+        update_device_default_id();
+    }
 }
 
 /**
@@ -4827,18 +4836,117 @@ static void add_valve_bg_click_cb(lv_event_t *e)
 static void device_type_changed_cb(lv_event_t *e)
 {
     (void)e;
-    if (!g_device_type_dropdown || !g_device_name_input) return;
+    update_device_default_name();
+    update_device_default_id();
+}
 
+static const char *get_device_type_base_name(int idx)
+{
     static const char *type_names[] = {
         "8路控制器", "16路控制器", "32路控制器",
         "Zigbee传感节点", "Zigbee控制节点", "虚拟节点"
     };
-    int idx = lv_dropdown_get_selected(g_device_type_dropdown);
-    if (idx >= 0 && idx < 6) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "%s1", type_names[idx]);
-        lv_textarea_set_text(g_device_name_input, buf);
+
+    if (idx < 0 || idx >= (int)(sizeof(type_names) / sizeof(type_names[0]))) {
+        return NULL;
     }
+
+    return type_names[idx];
+}
+
+static void update_device_default_name(void)
+{
+    if (!g_device_type_dropdown || !g_device_name_input || g_is_editing_device) return;
+
+    int idx = lv_dropdown_get_selected(g_device_type_dropdown);
+    const char *base_name = get_device_type_base_name(idx);
+    if (!base_name) return;
+
+    bool used_suffix[128] = {false};
+    int next_suffix = 1;
+
+    if (g_dev_count_cb && g_dev_list_cb) {
+        int total = g_dev_count_cb();
+        ui_device_row_t rows[ROWS_PER_PAGE];
+        for (int offset = 0; offset < total; offset += ROWS_PER_PAGE) {
+            int count = g_dev_list_cb(rows, ROWS_PER_PAGE, offset);
+            if (count <= 0) break;
+
+            for (int i = 0; i < count; i++) {
+                if (rows[i].type != idx) continue;
+
+                size_t base_len = strlen(base_name);
+                if (strncmp(rows[i].name, base_name, base_len) != 0) continue;
+
+                const char *suffix = rows[i].name + base_len;
+                int suffix_value = 0;
+
+                if (*suffix == '\0') {
+                    suffix_value = 1;
+                } else {
+                    char *endptr = NULL;
+                    long value = strtol(suffix, &endptr, 10);
+                    if (endptr && *endptr == '\0' && value > 0 && value < (long)(sizeof(used_suffix) / sizeof(used_suffix[0]))) {
+                        suffix_value = (int)value;
+                    }
+                }
+
+                if (suffix_value > 0) {
+                    used_suffix[suffix_value] = true;
+                }
+            }
+        }
+    }
+
+    while (next_suffix < (int)(sizeof(used_suffix) / sizeof(used_suffix[0])) && used_suffix[next_suffix]) {
+        next_suffix++;
+    }
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s%d", base_name, next_suffix);
+    lv_textarea_set_text(g_device_name_input, buf);
+}
+
+static bool is_device_id_used(uint16_t candidate_id)
+{
+    if (candidate_id == 0) {
+        return true;
+    }
+
+    if (g_device_id_check_cb) {
+        return g_device_id_check_cb(candidate_id);
+    }
+
+    if (g_dev_count_cb && g_dev_list_cb) {
+        int total = g_dev_count_cb();
+        ui_device_row_t rows[ROWS_PER_PAGE];
+        for (int offset = 0; offset < total; offset += ROWS_PER_PAGE) {
+            int count = g_dev_list_cb(rows, ROWS_PER_PAGE, offset);
+            if (count <= 0) break;
+
+            for (int i = 0; i < count; i++) {
+                if (rows[i].id == candidate_id) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static void update_device_default_id(void)
+{
+    if (!g_device_id_input || g_is_editing_device) return;
+
+    uint16_t next_id = 1;
+    while (next_id < UINT16_MAX && is_device_id_used(next_id)) {
+        next_id++;
+    }
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u", (unsigned int)next_id);
+    lv_textarea_set_text(g_device_id_input, buf);
 }
 
 static void sensor_type_changed_cb(lv_event_t *e)

@@ -12,13 +12,17 @@
 extern "C" {
 #endif
 
-/** Callback type: set brightness (0-100) */
-typedef void (*ui_display_set_brightness_fn)(int percent);
+/** Callback type: preview brightness in real time (0-100) */
+typedef void (*ui_display_preview_brightness_fn)(int percent);
+
+/** Callback type: persist brightness setting (0-100) */
+typedef void (*ui_display_save_brightness_fn)(int percent);
 
 /** Callback type: set auto-off timeout index */
 typedef void (*ui_display_set_timeout_fn)(int index);
 
-void ui_display_register_brightness_cb(ui_display_set_brightness_fn fn);
+void ui_display_register_preview_brightness_cb(ui_display_preview_brightness_fn fn);
+void ui_display_register_save_brightness_cb(ui_display_save_brightness_fn fn);
 void ui_display_register_timeout_cb(ui_display_set_timeout_fn fn);
 
 /**

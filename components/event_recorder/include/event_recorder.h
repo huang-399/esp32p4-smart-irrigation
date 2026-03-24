@@ -16,6 +16,7 @@ typedef enum {
     EVT_TYPE_POWERON,
     EVT_TYPE_CONTROL,
     EVT_TYPE_OPERATION,
+    EVT_TYPE_ALARM,
     EVT_TYPE_MANUAL_RECORD,
     EVT_TYPE_PROGRAM_RECORD,
     EVT_TYPE_MAX
@@ -79,6 +80,7 @@ esp_err_t event_recorder_add_offline(const char *desc);
 esp_err_t event_recorder_add_poweron(const char *desc);
 esp_err_t event_recorder_add_control(const char *desc);
 esp_err_t event_recorder_add_operation(const char *desc);
+esp_err_t event_recorder_add_alarm(const char *desc);
 esp_err_t event_recorder_add_manual_record(const evt_manual_record_t *record);
 esp_err_t event_recorder_add_program_record(const evt_program_record_t *record);
 esp_err_t event_recorder_query(evt_type_t type, int64_t start_ts, int64_t end_ts,

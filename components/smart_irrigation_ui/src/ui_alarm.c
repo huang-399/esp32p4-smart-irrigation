@@ -9,8 +9,11 @@
 #include "ui_common.h"
 #include "ui_numpad.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#define TIME_SYNC_THRESHOLD 1704067200LL
 
 /*********************
  *  DEFINES
@@ -43,7 +46,11 @@ static void create_history_alarm_content(lv_obj_t *parent);
 static void create_settings_content(lv_obj_t *parent);
 static void create_offline_content(lv_obj_t *parent);
 static void create_poweron_content(lv_obj_t *parent);
-static void query_btn_cb(lv_event_t *e);
+static void settings_cancel_btn_cb(lv_event_t *e);
+static void settings_save_btn_cb(lv_event_t *e);
+static void ensure_settings_cache_loaded(void);
+static void restore_settings_controls_from_cache(void);
+static void collect_settings_from_controls(ui_alarm_settings_t *settings);
 static void btn_calendar_start_cb(lv_event_t *e);
 static void btn_calendar_end_cb(lv_event_t *e);
 static void calendar_event_cb(lv_event_t *e);
@@ -53,6 +60,7 @@ static void btn_year_next_cb(lv_event_t *e);
 static void btn_month_prev_cb(lv_event_t *e);
 static void btn_month_next_cb(lv_event_t *e);
 static void input_click_cb(lv_event_t *e);
+static void format_alarm_time(char *buf, size_t buf_size, int64_t timestamp);
 
 /*********************
  *  STATIC VARIABLES
@@ -68,6 +76,32 @@ static lv_obj_t *g_calendar_popup = NULL;     /* 日历弹窗 */
 static lv_obj_t *g_current_date_input = NULL; /* 当前选择日期的输入框 */
 static lv_obj_t *g_calendar_widget = NULL;    /* 日历控件引用 */
 static lv_obj_t *g_year_month_label = NULL;   /* 年月显示标签 */
+
+static ui_alarm_query_current_fn s_query_current_cb = NULL;
+static ui_alarm_clear_current_fn s_clear_current_cb = NULL;
+static ui_alarm_load_settings_fn s_load_settings_cb = NULL;
+static ui_alarm_save_settings_fn s_save_settings_cb = NULL;
+
+static lv_obj_t *s_setting_threshold_inputs[UI_ALARM_SETTINGS_COUNT] = {NULL};
+static lv_obj_t *s_setting_duration_inputs[UI_ALARM_SETTINGS_COUNT] = {NULL};
+static lv_obj_t *s_setting_action_dropdowns[UI_ALARM_SETTINGS_COUNT] = {NULL};
+static ui_alarm_settings_t s_cached_settings;
+static bool s_settings_cache_valid = false;
+
+static const ui_alarm_settings_t s_default_settings = {
+    .items = {
+        {"0.20", 10, 0},
+        {"0.20", 10, 0},
+        {"4.00", 10, 0},
+        {"10.00", 10, 0},
+        {"0.10", 10, 0},
+        {"4.00", 5, 0},
+        {"1.00", 30, 0},
+        {"2.50", 3, 0},
+        {"0.05", 3, 0},
+        {"0.60", 5, 0}
+    }
+};
 
 /* 标签页名称 */
 static const char *tab_names[TAB_COUNT] = {
@@ -174,6 +208,27 @@ bool ui_alarm_is_visible(void)
     return (g_alarm_dialog != NULL);
 }
 
+void ui_alarm_register_query_current_cb(ui_alarm_query_current_fn fn)
+{
+    s_query_current_cb = fn;
+}
+
+void ui_alarm_register_clear_current_cb(ui_alarm_clear_current_fn fn)
+{
+    s_clear_current_cb = fn;
+}
+
+void ui_alarm_register_load_settings_cb(ui_alarm_load_settings_fn fn)
+{
+    s_load_settings_cb = fn;
+    s_settings_cache_valid = false;
+}
+
+void ui_alarm_register_save_settings_cb(ui_alarm_save_settings_fn fn)
+{
+    s_save_settings_cb = fn;
+}
+
 /**********************
  *   STATIC FUNCTIONS
  **********************/
@@ -277,7 +332,14 @@ static void close_btn_click_cb(lv_event_t *e)
 static void clear_alarm_btn_click_cb(lv_event_t *e)
 {
     (void)e;
-    /* TODO: 实现清除报警逻辑 */
+
+    if (s_clear_current_cb) {
+        s_clear_current_cb();
+    }
+
+    if (g_current_tab == TAB_CURRENT) {
+        switch_tab(TAB_CURRENT);
+    }
 }
 
 /**
@@ -330,6 +392,9 @@ static void switch_tab(alarm_tab_t tab)
         g_clear_btn = NULL;
         g_input_start_date = NULL;
         g_input_end_date = NULL;
+        memset(s_setting_threshold_inputs, 0, sizeof(s_setting_threshold_inputs));
+        memset(s_setting_duration_inputs, 0, sizeof(s_setting_duration_inputs));
+        memset(s_setting_action_dropdowns, 0, sizeof(s_setting_action_dropdowns));
 
         /* 根据标签页加载不同内容 */
         switch (tab) {
@@ -402,44 +467,115 @@ static void calendar_set_from_input(lv_obj_t *calendar, lv_obj_t *input, lv_obj_
  */
 static void create_current_alarm_content(lv_obj_t *parent)
 {
+    ui_alarm_current_item_t items[UI_ALARM_MAX_CURRENT] = {0};
+    size_t count = 0;
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+
     /* 创建表格表头背景 */
     lv_obj_t *header_bg = lv_obj_create(parent);
     lv_obj_set_size(header_bg, 1220, 50);
     lv_obj_set_pos(header_bg, 10, 10);
-    lv_obj_set_style_bg_color(header_bg, lv_color_hex(0xf0f8ff), 0);  /* 淡蓝色 */
+    lv_obj_set_style_bg_color(header_bg, lv_color_hex(0xf0f8ff), 0);
     lv_obj_set_style_border_width(header_bg, 0, 0);
     lv_obj_set_style_radius(header_bg, 0, 0);
     lv_obj_set_style_pad_all(header_bg, 0, 0);
     lv_obj_clear_flag(header_bg, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 表头列 */
     const char *headers[] = {"序号", "报警发生时间", "报警原因"};
-    int header_widths[] = {150, 400, 670};  /* 总宽度约1220 */
-    int x_pos = 10;
+    int header_widths[] = {150, 400, 670};
+    int x_pos = 0;
 
     for (int i = 0; i < 3; i++) {
         lv_obj_t *header_label = lv_label_create(header_bg);
         lv_label_set_text(header_label, headers[i]);
         lv_obj_set_style_text_font(header_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(header_label, COLOR_TEXT_MAIN, 0);
-        lv_obj_set_pos(header_label, x_pos + 10, 17);
+        lv_obj_set_size(header_label, header_widths[i], 50);
+        lv_obj_set_pos(header_label, x_pos, 0);
+        lv_obj_set_style_text_align(header_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_top(header_label, 17, 0);
         x_pos += header_widths[i];
     }
 
-    /* 在表头右侧添加"清除报警"文字 */
     g_clear_btn = lv_label_create(header_bg);
     lv_label_set_text(g_clear_btn, "清除报警");
     lv_obj_set_style_text_font(g_clear_btn, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(g_clear_btn, COLOR_TEXT_MAIN, 0);
-    lv_obj_set_pos(g_clear_btn, 1100, 17);  /* 放在表头右侧 */
+    lv_obj_set_style_text_color(g_clear_btn, COLOR_PRIMARY, 0);
+    lv_obj_set_pos(g_clear_btn, 1120, 17);
+    lv_obj_add_flag(g_clear_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_clear_btn, clear_alarm_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 数据行区域 - 显示示例数据 */
-    /* 这里可以添加实际的报警数据，暂时留空 */
-    lv_obj_t *empty_label = lv_label_create(parent);
-    lv_label_set_text(empty_label, "暂无报警记录");
-    lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
-    lv_obj_set_pos(empty_label, 550, 300);
+    lv_obj_t *table_area = lv_obj_create(parent);
+    lv_obj_set_size(table_area, 1220, 610);
+    lv_obj_set_pos(table_area, 10, 60);
+    lv_obj_set_style_bg_color(table_area, lv_color_white(), 0);
+    lv_obj_set_style_border_width(table_area, 0, 0);
+    lv_obj_set_style_radius(table_area, 0, 0);
+    lv_obj_set_style_pad_all(table_area, 0, 0);
+    lv_obj_clear_flag(table_area, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (s_query_current_cb) {
+        ret = s_query_current_cb(items, UI_ALARM_MAX_CURRENT, &count);
+    }
+
+    if (ret != ESP_OK || count == 0) {
+        lv_obj_t *empty_label = lv_label_create(table_area);
+        lv_label_set_text(empty_label, "暂无报警记录");
+        lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
+        lv_obj_center(empty_label);
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        int y = (int)i * 50;
+        int cell_x = 0;
+        char idx_buf[8];
+        char time_buf[48];
+
+        if ((i % 2U) == 1U) {
+            lv_obj_t *row_bg = lv_obj_create(table_area);
+            lv_obj_set_size(row_bg, 1220, 50);
+            lv_obj_set_pos(row_bg, 0, y);
+            lv_obj_set_style_bg_color(row_bg, lv_color_hex(0xf8f8f8), 0);
+            lv_obj_set_style_border_width(row_bg, 0, 0);
+            lv_obj_set_style_radius(row_bg, 0, 0);
+            lv_obj_set_style_pad_all(row_bg, 0, 0);
+            lv_obj_clear_flag(row_bg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        }
+
+        snprintf(idx_buf, sizeof(idx_buf), "%u", (unsigned)(i + 1U));
+        format_alarm_time(time_buf, sizeof(time_buf), items[i].timestamp);
+
+        lv_obj_t *idx_label = lv_label_create(table_area);
+        lv_label_set_text(idx_label, idx_buf);
+        lv_obj_set_style_text_font(idx_label, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(idx_label, COLOR_TEXT_MAIN, 0);
+        lv_obj_set_size(idx_label, header_widths[0], 50);
+        lv_obj_set_pos(idx_label, cell_x, y);
+        lv_obj_set_style_text_align(idx_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_top(idx_label, 17, 0);
+        cell_x += header_widths[0];
+
+        lv_obj_t *time_label = lv_label_create(table_area);
+        lv_label_set_text(time_label, time_buf);
+        lv_obj_set_style_text_font(time_label, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(time_label, COLOR_TEXT_MAIN, 0);
+        lv_obj_set_size(time_label, header_widths[1], 50);
+        lv_obj_set_pos(time_label, cell_x, y);
+        lv_obj_set_style_text_align(time_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_top(time_label, 17, 0);
+        cell_x += header_widths[1];
+
+        lv_obj_t *desc_label = lv_label_create(table_area);
+        lv_label_set_text(desc_label, items[i].desc);
+        lv_obj_set_style_text_font(desc_label, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(desc_label, COLOR_TEXT_MAIN, 0);
+        lv_obj_set_size(desc_label, header_widths[2], 50);
+        lv_obj_set_pos(desc_label, cell_x, y);
+        lv_obj_set_style_text_align(desc_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_top(desc_label, 17, 0);
+    }
 }
 
 /**
@@ -550,7 +686,7 @@ static void create_history_alarm_content(lv_obj_t *parent)
     lv_obj_set_style_bg_color(btn_query, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(btn_query, 0, 0);
     lv_obj_set_style_radius(btn_query, 5, 0);
-    lv_obj_add_event_cb(btn_query, query_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn_query, ui_alarm_rec_history_query_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *query_label = lv_label_create(btn_query);
     lv_label_set_text(query_label, "查询");
@@ -558,7 +694,6 @@ static void create_history_alarm_content(lv_obj_t *parent)
     lv_obj_set_style_text_font(query_label, &my_font_cn_16, 0);
     lv_obj_center(query_label);
 
-    /* 创建表格表头背景 */
     lv_obj_t *header_bg = lv_obj_create(parent);
     lv_obj_set_size(header_bg, 1220, 50);
     lv_obj_set_pos(header_bg, 10, 60);
@@ -568,27 +703,31 @@ static void create_history_alarm_content(lv_obj_t *parent)
     lv_obj_set_style_pad_all(header_bg, 0, 0);
     lv_obj_clear_flag(header_bg, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 表头列 */
-    const char *headers[] = {"序号", "报警发生时间", "报警原因"};
-    int header_widths[] = {120, 500, 600};
-    int x_pos = 10;
+    const char *headers[] = {"序号", "发生时间", "描述"};
+    int header_widths[] = {150, 730, 340};
+    int x_pos = 0;
 
     for (int i = 0; i < 3; i++) {
         lv_obj_t *header_label = lv_label_create(header_bg);
         lv_label_set_text(header_label, headers[i]);
         lv_obj_set_style_text_font(header_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(header_label, COLOR_TEXT_MAIN, 0);
-        lv_obj_set_pos(header_label, x_pos + 10, 17);
+        lv_obj_set_size(header_label, header_widths[i], 50);
+        lv_obj_set_pos(header_label, x_pos, 0);
+        lv_obj_set_style_text_align(header_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_top(header_label, 17, 0);
         x_pos += header_widths[i];
     }
 
-    lv_obj_t *empty_label = lv_label_create(parent);
-    lv_label_set_text(empty_label, "暂无历史报警记录");
-    lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
-    lv_obj_set_pos(empty_label, 520, 350);
+    lv_obj_t *table_area = lv_obj_create(parent);
+    lv_obj_set_size(table_area, 1220, 560);
+    lv_obj_set_pos(table_area, 10, 110);
+    lv_obj_set_style_bg_color(table_area, lv_color_white(), 0);
+    lv_obj_set_style_border_width(table_area, 0, 0);
+    lv_obj_set_style_radius(table_area, 0, 0);
+    lv_obj_set_style_pad_all(table_area, 0, 0);
+    lv_obj_clear_flag(table_area, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 底部分页控件 */
     int page_y = 630;
 
     lv_obj_t *btn_first = lv_btn_create(parent);
@@ -635,6 +774,9 @@ static void create_history_alarm_content(lv_obj_t *parent)
     lv_label_set_text(label_last, "尾页");
     lv_obj_set_style_text_font(label_last, &my_font_cn_16, 0);
     lv_obj_center(label_last);
+
+    ui_alarm_rec_setup_history_alarm(g_input_start_date, g_input_end_date,
+        table_area, page_info, btn_first, btn_prev, btn_next, btn_last);
 }
 
 /**
@@ -642,118 +784,110 @@ static void create_history_alarm_content(lv_obj_t *parent)
  */
 static void create_settings_content(lv_obj_t *parent)
 {
-    /* 定义所有报警设置项 */
     typedef struct {
         const char *label;
-        const char *default_value;
-        const char *default_duration;
         const char *dropdown_options;
-    } alarm_setting_t;
+    } alarm_setting_row_t;
 
-    alarm_setting_t settings[] = {
-        {"PH1和PH2差值大于", "0.20", "10", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"EC1和EC2差值大于(mS/cm):", "0.20", "10", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"PH低于:", "4.00", "10", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"PH高于:", "10.00", "10", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"EC低于(mS/cm):", "0.10", "10", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"EC高于(mS/cm):", "4.00", "5", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"主管道流速低于(m³/h):", "1.00", "30", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"肥桶液位高于(m):", "2.50", "3", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"肥桶液位低于(m):", "0.05", "3", "不触发报警\n仅触发报警\n报警并停止灌溉"},
-        {"肥管压力高于(MPa):", "0.60", "5", "不触发报警\n仅触发报警\n报警并停止灌溉"}
+    static const alarm_setting_row_t setting_rows[UI_ALARM_SETTINGS_COUNT] = {
+        {"PH1和PH2差值大于", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"EC1和EC2差值大于(mS/cm):", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"PH低于:", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"PH高于:", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"EC低于(mS/cm):", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"EC高于(mS/cm):", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"主管道流速低于(m³/h):", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"肥桶液位高于(m):", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"肥桶液位低于(m):", "不触发报警\n仅触发报警\n报警并停止灌溉"},
+        {"肥管压力高于(MPa):", "不触发报警\n仅触发报警\n报警并停止灌溉"}
     };
 
     int start_y = 15;
     int row_height = 55;
-    int label_width = 250;
     int value_width = 280;
-    int duration_width = 280;
     int dropdown_width = 280;
 
-    /* 创建所有设置行 */
-    for (int i = 0; i < 10; i++) {
+    ensure_settings_cache_loaded();
+
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT; i++) {
         int y = start_y + i * row_height;
 
-        /* 标签文字 */
         lv_obj_t *label = lv_label_create(parent);
-        lv_label_set_text(label, settings[i].label);
+        lv_label_set_text(label, setting_rows[i].label);
         lv_obj_set_pos(label, 20, y + 12);
         lv_obj_set_style_text_font(label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(label, COLOR_TEXT_MAIN, 0);
 
-        /* 阈值输入框 */
         lv_obj_t *value_input = lv_textarea_create(parent);
         lv_obj_set_size(value_input, value_width, 40);
         lv_obj_set_pos(value_input, 280, y);
         lv_textarea_set_one_line(value_input, true);
-        lv_textarea_set_text(value_input, settings[i].default_value);
         lv_obj_set_style_text_font(value_input, &my_font_cn_16, 0);
-        lv_obj_set_style_text_align(value_input, LV_TEXT_ALIGN_LEFT, 0);  /* 左对齐 */
+        lv_obj_set_style_text_align(value_input, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_bg_color(value_input, lv_color_hex(0xf5f5f5), 0);
         lv_obj_set_style_border_color(value_input, lv_color_hex(0xcccccc), 0);
         lv_obj_set_style_border_width(value_input, 1, 0);
         lv_obj_set_style_radius(value_input, 5, 0);
-        lv_obj_set_style_pad_left(value_input, 10, 0);  /* 左侧内边距 */
-        lv_textarea_set_accepted_chars(value_input, "0123456789.");  /* 只接受数字和小数点 */
-        lv_textarea_set_text_selection(value_input, true);  /* 启用文本选择 */
-        lv_obj_add_event_cb(value_input, input_click_cb, LV_EVENT_CLICKED, NULL);  /* 点击弹出键盘 */
+        lv_obj_set_style_pad_left(value_input, 10, 0);
+        lv_textarea_set_accepted_chars(value_input, "0123456789.");
+        lv_textarea_set_text_selection(value_input, true);
+        lv_obj_add_event_cb(value_input, input_click_cb, LV_EVENT_CLICKED, NULL);
+        s_setting_threshold_inputs[i] = value_input;
 
-        /* 持续时长标签 */
         lv_obj_t *duration_label = lv_label_create(parent);
         lv_label_set_text(duration_label, "持续时长(S):");
         lv_obj_set_pos(duration_label, 585, y + 12);
         lv_obj_set_style_text_font(duration_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(duration_label, COLOR_TEXT_MAIN, 0);
 
-        /* 持续时长输入框 */
         lv_obj_t *duration_input = lv_textarea_create(parent);
         lv_obj_set_size(duration_input, 100, 40);
         lv_obj_set_pos(duration_input, 720, y);
         lv_textarea_set_one_line(duration_input, true);
-        lv_textarea_set_text(duration_input, settings[i].default_duration);
         lv_obj_set_style_text_font(duration_input, &my_font_cn_16, 0);
-        lv_obj_set_style_text_align(duration_input, LV_TEXT_ALIGN_LEFT, 0);  /* 左对齐 */
+        lv_obj_set_style_text_align(duration_input, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_bg_color(duration_input, lv_color_hex(0xf5f5f5), 0);
         lv_obj_set_style_border_color(duration_input, lv_color_hex(0xcccccc), 0);
         lv_obj_set_style_border_width(duration_input, 1, 0);
         lv_obj_set_style_radius(duration_input, 5, 0);
-        lv_obj_set_style_pad_left(duration_input, 10, 0);  /* 左侧内边距 */
-        lv_textarea_set_accepted_chars(duration_input, "0123456789");  /* 只接受数字 */
-        lv_textarea_set_text_selection(duration_input, true);  /* 启用文本选择 */
-        lv_obj_add_event_cb(duration_input, input_click_cb, LV_EVENT_CLICKED, NULL);  /* 点击弹出键盘 */
+        lv_obj_set_style_pad_left(duration_input, 10, 0);
+        lv_textarea_set_accepted_chars(duration_input, "0123456789");
+        lv_textarea_set_text_selection(duration_input, true);
+        lv_obj_add_event_cb(duration_input, input_click_cb, LV_EVENT_CLICKED, NULL);
+        s_setting_duration_inputs[i] = duration_input;
 
-        /* 则 标签 */
         lv_obj_t *then_label = lv_label_create(parent);
         lv_label_set_text(then_label, "则");
         lv_obj_set_pos(then_label, 850, y + 12);
         lv_obj_set_style_text_font(then_label, &my_font_cn_16, 0);
         lv_obj_set_style_text_color(then_label, COLOR_TEXT_MAIN, 0);
 
-        /* 下拉选择框 */
         lv_obj_t *dropdown = lv_dropdown_create(parent);
         lv_obj_set_size(dropdown, dropdown_width, 40);
         lv_obj_set_pos(dropdown, 900, y);
-        lv_dropdown_set_options(dropdown, settings[i].dropdown_options);
+        lv_dropdown_set_options(dropdown, setting_rows[i].dropdown_options);
         lv_obj_set_style_text_font(dropdown, &my_font_cn_16, 0);
         lv_obj_set_style_text_font(lv_dropdown_get_list(dropdown), &my_font_cn_16, 0);
         lv_obj_set_style_bg_color(dropdown, lv_color_white(), 0);
         lv_obj_set_style_border_color(dropdown, lv_color_hex(0xcccccc), 0);
         lv_obj_set_style_border_width(dropdown, 1, 0);
         lv_obj_set_style_radius(dropdown, 5, 0);
+        s_setting_action_dropdowns[i] = dropdown;
     }
 
-    /* 底部按钮区域 */
+    restore_settings_controls_from_cache();
+
     int btn_y = 610;
     int btn_width = 150;
     int btn_height = 50;
 
-    /* 取消设置按钮 */
     lv_obj_t *cancel_btn = lv_btn_create(parent);
     lv_obj_set_size(cancel_btn, btn_width, btn_height);
     lv_obj_set_pos(cancel_btn, 450, btn_y);
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0xcccccc), 0);
     lv_obj_set_style_border_width(cancel_btn, 0, 0);
     lv_obj_set_style_radius(cancel_btn, 25, 0);
+    lv_obj_add_event_cb(cancel_btn, settings_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "取消设置");
@@ -761,13 +895,13 @@ static void create_settings_content(lv_obj_t *parent)
     lv_obj_set_style_text_color(cancel_label, COLOR_TEXT_MAIN, 0);
     lv_obj_center(cancel_label);
 
-    /* 保存设置按钮 */
     lv_obj_t *save_btn = lv_btn_create(parent);
     lv_obj_set_size(save_btn, btn_width, btn_height);
     lv_obj_set_pos(save_btn, 630, btn_y);
     lv_obj_set_style_bg_color(save_btn, COLOR_PRIMARY, 0);
     lv_obj_set_style_border_width(save_btn, 0, 0);
     lv_obj_set_style_radius(save_btn, 25, 0);
+    lv_obj_add_event_cb(save_btn, settings_save_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *save_label = lv_label_create(save_btn);
     lv_label_set_text(save_label, "保存设置");
@@ -1200,14 +1334,112 @@ static void create_poweron_content(lv_obj_t *parent)
         table_area, page_info, btn_first, btn_prev, btn_next, btn_last);
 }
 
-/**
- * @brief 查询按钮回调
- */
-static void query_btn_cb(lv_event_t *e)
+static void ensure_settings_cache_loaded(void)
+{
+    if (s_settings_cache_valid) {
+        return;
+    }
+
+    memcpy(&s_cached_settings, &s_default_settings, sizeof(s_cached_settings));
+    if (s_load_settings_cb) {
+        if (s_load_settings_cb(&s_cached_settings) != ESP_OK) {
+            memcpy(&s_cached_settings, &s_default_settings, sizeof(s_cached_settings));
+        }
+    }
+
+    s_settings_cache_valid = true;
+}
+
+static void restore_settings_controls_from_cache(void)
+{
+    ensure_settings_cache_loaded();
+
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT; i++) {
+        if (s_setting_threshold_inputs[i]) {
+            lv_textarea_set_text(s_setting_threshold_inputs[i], s_cached_settings.items[i].threshold);
+        }
+        if (s_setting_duration_inputs[i]) {
+            char duration_buf[16];
+            snprintf(duration_buf, sizeof(duration_buf), "%u", s_cached_settings.items[i].duration_s);
+            lv_textarea_set_text(s_setting_duration_inputs[i], duration_buf);
+        }
+        if (s_setting_action_dropdowns[i]) {
+            uint16_t action = s_cached_settings.items[i].action;
+            if (action > 2U) {
+                action = 0;
+            }
+            lv_dropdown_set_selected(s_setting_action_dropdowns[i], action);
+        }
+    }
+}
+
+static void collect_settings_from_controls(ui_alarm_settings_t *settings)
+{
+    if (!settings) {
+        return;
+    }
+
+    memset(settings, 0, sizeof(*settings));
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT; i++) {
+        if (s_setting_threshold_inputs[i]) {
+            const char *text = lv_textarea_get_text(s_setting_threshold_inputs[i]);
+            strncpy(settings->items[i].threshold, text ? text : "",
+                sizeof(settings->items[i].threshold) - 1);
+            settings->items[i].threshold[sizeof(settings->items[i].threshold) - 1] = '\0';
+        }
+        if (s_setting_duration_inputs[i]) {
+            const char *text = lv_textarea_get_text(s_setting_duration_inputs[i]);
+            settings->items[i].duration_s = (uint16_t)atoi(text ? text : "0");
+        }
+        if (s_setting_action_dropdowns[i]) {
+            settings->items[i].action = (uint8_t)lv_dropdown_get_selected(s_setting_action_dropdowns[i]);
+        }
+    }
+}
+
+static void settings_cancel_btn_cb(lv_event_t *e)
 {
     (void)e;
-    /* TODO: 实现查询逻辑 */
+    restore_settings_controls_from_cache();
 }
+
+static void settings_save_btn_cb(lv_event_t *e)
+{
+    (void)e;
+
+    ui_alarm_settings_t settings;
+    collect_settings_from_controls(&settings);
+
+    if (s_save_settings_cb) {
+        if (s_save_settings_cb(&settings) != ESP_OK) {
+            restore_settings_controls_from_cache();
+            return;
+        }
+    }
+
+    memcpy(&s_cached_settings, &settings, sizeof(s_cached_settings));
+    s_settings_cache_valid = true;
+}
+
+static void format_alarm_time(char *buf, size_t buf_size, int64_t timestamp)
+{
+    if (!buf || buf_size == 0U) {
+        return;
+    }
+
+    if (timestamp < TIME_SYNC_THRESHOLD) {
+        snprintf(buf, buf_size, "时间未同步");
+        return;
+    }
+
+    time_t ts = (time_t)timestamp;
+    struct tm timeinfo;
+    localtime_r(&ts, &timeinfo);
+    snprintf(buf, buf_size, "%04d-%02d-%02d %02d:%02d:%02d",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+}
+
 
 /**
  * @brief 开始日期日历按钮回调
