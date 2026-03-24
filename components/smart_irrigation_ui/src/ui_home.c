@@ -70,6 +70,9 @@ static lv_obj_t *g_manual_input_post_water = NULL;
 static lv_obj_t *g_manual_input_duration = NULL;
 static lv_obj_t *g_manual_dropdown_formula = NULL;
 static lv_obj_t *g_schedule_card = NULL;   /* 首页计划卡片 */
+static lv_obj_t *g_schedule_rows[4] = {NULL};
+static lv_obj_t *g_schedule_labels[4][6] = {{NULL}};
+static lv_obj_t *g_schedule_empty_labels[4] = {NULL};
 static lv_timer_t *g_runtime_status_timer = NULL;
 
 static ui_program_auto_mode_set_cb_t g_auto_mode_set_cb = NULL;
@@ -446,6 +449,9 @@ void ui_home_create(lv_obj_t *parent)
     g_manual_input_duration = NULL;
     g_manual_dropdown_formula = NULL;
     g_schedule_card = NULL;
+    memset(g_schedule_rows, 0, sizeof(g_schedule_rows));
+    memset(g_schedule_labels, 0, sizeof(g_schedule_labels));
+    memset(g_schedule_empty_labels, 0, sizeof(g_schedule_empty_labels));
     if (g_runtime_status_timer) {
         lv_timer_del(g_runtime_status_timer);
         g_runtime_status_timer = NULL;
@@ -721,43 +727,7 @@ static void refresh_schedule_table_display(void)
         return;
     }
 
-    lv_obj_clean(g_schedule_card);
-
-    /* 标题 - 直接显示文字 */
-    lv_obj_t *title = lv_label_create(g_schedule_card);
-    lv_label_set_text(title, "今日剩余灌溉计划（启动条件：定时）");
-    lv_obj_set_style_text_font(title, &my_fontbd_16, 0);
-    lv_obj_set_style_text_color(title, COLOR_TEXT_MAIN, 0);
-    lv_obj_set_pos(title, 15, 15);
-
-    /* 表格表头区域 */
-    lv_obj_t *header_bg = lv_obj_create(g_schedule_card);
-    lv_obj_set_size(header_bg, 850, 40);
-    lv_obj_set_pos(header_bg, 15, 50);
-    lv_obj_set_style_bg_color(header_bg, lv_color_hex(0xf0f8ff), 0);
-    lv_obj_set_style_border_width(header_bg, 0, 0);
-    lv_obj_set_style_radius(header_bg, 0, 0);
-    lv_obj_set_style_pad_all(header_bg, 0, 0);
-    lv_obj_clear_flag(header_bg, LV_OBJ_FLAG_SCROLLABLE);
-
-    const char *headers[] = {"序号", "程序名称", "关联配方", "启动条件", "启动时间", "合计时长"};
-    const int col_widths[] = {60, 180, 140, 140, 140, 140};
-    const int col_x[] = {5, 65, 245, 385, 525, 665};
-    int x_pos = 5;
-
-    for (int i = 0; i < 6; i++) {
-        lv_obj_t *header_label = lv_label_create(header_bg);
-        lv_label_set_text(header_label, headers[i]);
-        lv_obj_set_style_text_font(header_label, &my_font_cn_16, 0);
-        lv_obj_set_style_text_color(header_label, COLOR_TEXT_MAIN, 0);
-        lv_obj_set_pos(header_label, x_pos, 12);
-        x_pos += col_widths[i];
-    }
-
     const int max_rows = 4;
-    const int row_height = 64;
-    const int row_y_start = 90;
-    const int row_width = 850;
     const int program_count = ui_program_get_count();
     int display_row = 0;
 
@@ -765,6 +735,7 @@ static void refresh_schedule_table_display(void)
         char condition[32];
         char next_start[40];
         char duration[24];
+        char index_buf[8];
         const char *name = ui_program_get_name(i);
         const char *formula = ui_program_get_formula(i);
 
@@ -775,30 +746,10 @@ static void refresh_schedule_table_display(void)
 
         ui_program_get_next_start_text(i, next_start, sizeof(next_start));
         snprintf(duration, sizeof(duration), "%d分钟", ui_program_get_duration(i));
-
-        lv_obj_t *row_bg = lv_obj_create(g_schedule_card);
-        lv_obj_set_size(row_bg, row_width, row_height);
-        lv_obj_set_pos(row_bg, 15, row_y_start + display_row * row_height);
-        lv_obj_set_style_bg_color(row_bg, lv_color_white(), 0);
-        lv_obj_set_style_border_width(row_bg, 0, 0);
-        lv_obj_set_style_radius(row_bg, 0, 0);
-        lv_obj_set_style_pad_all(row_bg, 0, 0);
-        lv_obj_clear_flag(row_bg, LV_OBJ_FLAG_SCROLLABLE);
-
-        if ((display_row % 2) == 1) {
-            lv_obj_set_style_bg_color(row_bg, lv_color_hex(0xfafcff), 0);
-        }
-
-        const char *index_text = "1";
-        switch (display_row) {
-            case 0: index_text = "1"; break;
-            case 1: index_text = "2"; break;
-            case 2: index_text = "3"; break;
-            default: index_text = "4"; break;
-        }
+        snprintf(index_buf, sizeof(index_buf), "%d", display_row + 1);
 
         const char *values[] = {
-            index_text,
+            index_buf,
             name ? name : "--",
             (formula && formula[0]) ? formula : "--",
             condition,
@@ -806,39 +757,42 @@ static void refresh_schedule_table_display(void)
             duration,
         };
 
+        if (g_schedule_rows[display_row]) {
+            lv_obj_clear_flag(g_schedule_rows[display_row], LV_OBJ_FLAG_HIDDEN);
+        }
+        if (g_schedule_empty_labels[display_row]) {
+            lv_obj_add_flag(g_schedule_empty_labels[display_row], LV_OBJ_FLAG_HIDDEN);
+        }
+
         for (int col = 0; col < 6; col++) {
-            lv_obj_t *label = lv_label_create(row_bg);
-            lv_label_set_text(label, values[col]);
-            lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
-            lv_obj_set_width(label, col_widths[col] - 12);
-            lv_obj_set_style_text_font(label, &my_font_cn_16, 0);
-            lv_obj_set_style_text_color(label, COLOR_TEXT_MAIN, 0);
-            lv_obj_set_pos(label, col_x[col], 22);
+            if (g_schedule_labels[display_row][col]) {
+                lv_label_set_text(g_schedule_labels[display_row][col], values[col]);
+                lv_obj_clear_flag(g_schedule_labels[display_row][col], LV_OBJ_FLAG_HIDDEN);
+            }
         }
 
         display_row++;
     }
 
-    for (; display_row < max_rows; display_row++) {
-        lv_obj_t *row_bg = lv_obj_create(g_schedule_card);
-        lv_obj_set_size(row_bg, row_width, row_height);
-        lv_obj_set_pos(row_bg, 15, row_y_start + display_row * row_height);
-        lv_obj_set_style_bg_color(row_bg, lv_color_white(), 0);
-        lv_obj_set_style_border_width(row_bg, 0, 0);
-        lv_obj_set_style_radius(row_bg, 0, 0);
-        lv_obj_set_style_pad_all(row_bg, 0, 0);
-        lv_obj_clear_flag(row_bg, LV_OBJ_FLAG_SCROLLABLE);
-
-        if ((display_row % 2) == 1) {
-            lv_obj_set_style_bg_color(row_bg, lv_color_hex(0xfafcff), 0);
+    for (int row = display_row; row < max_rows; row++) {
+        if (g_schedule_rows[row]) {
+            lv_obj_clear_flag(g_schedule_rows[row], LV_OBJ_FLAG_HIDDEN);
         }
 
-        if (display_row == 0) {
-            lv_obj_t *empty_label = lv_label_create(row_bg);
-            lv_label_set_text(empty_label, "暂无定时灌溉计划");
-            lv_obj_set_style_text_font(empty_label, &my_font_cn_16, 0);
-            lv_obj_set_style_text_color(empty_label, COLOR_TEXT_GRAY, 0);
-            lv_obj_center(empty_label);
+        for (int col = 0; col < 6; col++) {
+            if (g_schedule_labels[row][col]) {
+                lv_label_set_text(g_schedule_labels[row][col], "");
+                lv_obj_add_flag(g_schedule_labels[row][col], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+
+        if (g_schedule_empty_labels[row]) {
+            if (row == 0 && display_row == 0) {
+                lv_label_set_text(g_schedule_empty_labels[row], "暂无定时灌溉计划");
+                lv_obj_clear_flag(g_schedule_empty_labels[row], LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(g_schedule_empty_labels[row], LV_OBJ_FLAG_HIDDEN);
+            }
         }
     }
 }
@@ -848,6 +802,13 @@ static void refresh_schedule_table_display(void)
  */
 static void create_schedule_area(lv_obj_t *parent)
 {
+    const char *headers[] = {"序号", "程序名称", "关联配方", "启动条件", "启动时间", "合计时长"};
+    const int col_widths[] = {60, 180, 140, 140, 140, 140};
+    const int col_x[] = {5, 65, 245, 385, 525, 665};
+    const int row_height = 64;
+    const int row_y_start = 90;
+    const int row_width = 850;
+
     g_schedule_card = lv_obj_create(parent);
     lv_obj_set_size(g_schedule_card, 879, 362);
     lv_obj_set_pos(g_schedule_card, 294, 5);
@@ -856,6 +817,59 @@ static void create_schedule_area(lv_obj_t *parent)
     lv_obj_set_style_radius(g_schedule_card, 10, 0);
     lv_obj_set_style_pad_all(g_schedule_card, 0, 0);
     lv_obj_clear_flag(g_schedule_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(g_schedule_card);
+    lv_label_set_text(title, "今日剩余灌溉计划（启动条件：定时）");
+    lv_obj_set_style_text_font(title, &my_fontbd_16, 0);
+    lv_obj_set_style_text_color(title, COLOR_TEXT_MAIN, 0);
+    lv_obj_set_pos(title, 15, 15);
+
+    lv_obj_t *header_bg = lv_obj_create(g_schedule_card);
+    lv_obj_set_size(header_bg, 850, 40);
+    lv_obj_set_pos(header_bg, 15, 50);
+    lv_obj_set_style_bg_color(header_bg, lv_color_hex(0xf0f8ff), 0);
+    lv_obj_set_style_border_width(header_bg, 0, 0);
+    lv_obj_set_style_radius(header_bg, 0, 0);
+    lv_obj_set_style_pad_all(header_bg, 0, 0);
+    lv_obj_clear_flag(header_bg, LV_OBJ_FLAG_SCROLLABLE);
+
+    int x_pos = 5;
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *header_label = lv_label_create(header_bg);
+        lv_label_set_text(header_label, headers[i]);
+        lv_obj_set_style_text_font(header_label, &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(header_label, COLOR_TEXT_MAIN, 0);
+        lv_obj_set_pos(header_label, x_pos, 12);
+        x_pos += col_widths[i];
+    }
+
+    for (int row = 0; row < 4; row++) {
+        g_schedule_rows[row] = lv_obj_create(g_schedule_card);
+        lv_obj_set_size(g_schedule_rows[row], row_width, row_height);
+        lv_obj_set_pos(g_schedule_rows[row], 15, row_y_start + row * row_height);
+        lv_obj_set_style_bg_color(g_schedule_rows[row], (row % 2) == 1 ? lv_color_hex(0xfafcff) : lv_color_white(), 0);
+        lv_obj_set_style_border_width(g_schedule_rows[row], 0, 0);
+        lv_obj_set_style_radius(g_schedule_rows[row], 0, 0);
+        lv_obj_set_style_pad_all(g_schedule_rows[row], 0, 0);
+        lv_obj_clear_flag(g_schedule_rows[row], LV_OBJ_FLAG_SCROLLABLE);
+
+        for (int col = 0; col < 6; col++) {
+            g_schedule_labels[row][col] = lv_label_create(g_schedule_rows[row]);
+            lv_label_set_text(g_schedule_labels[row][col], "");
+            lv_label_set_long_mode(g_schedule_labels[row][col], LV_LABEL_LONG_CLIP);
+            lv_obj_set_width(g_schedule_labels[row][col], col_widths[col] - 12);
+            lv_obj_set_style_text_font(g_schedule_labels[row][col], &my_font_cn_16, 0);
+            lv_obj_set_style_text_color(g_schedule_labels[row][col], COLOR_TEXT_MAIN, 0);
+            lv_obj_set_pos(g_schedule_labels[row][col], col_x[col], 22);
+        }
+
+        g_schedule_empty_labels[row] = lv_label_create(g_schedule_rows[row]);
+        lv_label_set_text(g_schedule_empty_labels[row], "");
+        lv_obj_set_style_text_font(g_schedule_empty_labels[row], &my_font_cn_16, 0);
+        lv_obj_set_style_text_color(g_schedule_empty_labels[row], COLOR_TEXT_GRAY, 0);
+        lv_obj_center(g_schedule_empty_labels[row]);
+        lv_obj_add_flag(g_schedule_empty_labels[row], LV_OBJ_FLAG_HIDDEN);
+    }
 
     refresh_schedule_table_display();
 }

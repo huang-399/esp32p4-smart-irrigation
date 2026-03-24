@@ -12,9 +12,12 @@
 #include "ui_wifi.h"
 #include "ui_display.h"
 #include "ui_network.h"
+#include "ui_alarm.h"
 #include "ui_alarm_records.h"
+#include "ui_log_records.h"
 #include "wifi_manager.h"
 #include "display_manager.h"
+#include "alarm_manager.h"
 #include "event_recorder.h"
 #include "zigbee_bridge.h"
 #include "device_registry.h"
@@ -25,7 +28,6 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
-
 static const char *TAG = "smart_irrigation";
 
 static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out);
@@ -36,6 +38,12 @@ static bool s_ntp_started = false;
 static bool s_wifi_connected = false;
 static bool s_event_fix_scheduled = false;
 static bool s_event_fix_completed = false;
+
+static bool is_nav_visible(nav_item_t nav)
+{
+    ui_main_t *ui = ui_get_main();
+    return ui && ui->current_nav == nav;
+}
 
 /* ---- Time update task ---- */
 
@@ -74,10 +82,20 @@ static void time_update_task(void *pvParameters)
     }
 }
 
+static void refresh_log_records_async(void *arg)
+{
+    (void)arg;
+    if (is_nav_visible(NAV_LOG)) {
+        ui_log_rec_refresh_visible();
+    }
+}
+
 static void refresh_alarm_records_async(void *arg)
 {
     (void)arg;
-    ui_alarm_rec_refresh_visible();
+    if (is_nav_visible(NAV_LOG)) {
+        ui_alarm_rec_refresh_visible();
+    }
 }
 
 static void fix_event_timestamps_task(void *arg)
@@ -90,6 +108,7 @@ static void fix_event_timestamps_task(void *arg)
     if (ret == ESP_OK) {
         s_event_fix_completed = true;
         lv_async_call(refresh_alarm_records_async, NULL);
+        lv_async_call(refresh_log_records_async, NULL);
     } else {
         ESP_LOGW(TAG, "Deferred event timestamp repair failed: %s", esp_err_to_name(ret));
     }
@@ -218,6 +237,11 @@ static void on_wifi_conn_status(wifi_mgr_conn_status_t status, const char *ssid,
         ESP_LOGI(TAG, "WiFi connected: %s", msg->ssid);
         s_wifi_connected = true;
         start_ntp();
+        if (msg->ssid[0] != '\0') {
+            char desc[64];
+            snprintf(desc, sizeof(desc), "WiFi连接: %s", msg->ssid);
+            event_recorder_add_operation(desc);
+        }
     } else if (status == WIFI_MGR_CONNECT_FAILED) {
         ESP_LOGW(TAG, "WiFi connect failed: %s", msg->ssid);
     } else {
@@ -247,6 +271,10 @@ static void request_wifi_connect(const char *ssid, const char *password)
     esp_err_t ret = wifi_manager_connect(ssid, password);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi connect failed: %s", esp_err_to_name(ret));
+    } else {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "WiFi操作: 连接 %.24s", ssid ? ssid : "");
+        event_recorder_add_operation(desc);
     }
 }
 
@@ -256,6 +284,8 @@ static void request_wifi_disconnect(void)
     esp_err_t ret = wifi_manager_disconnect();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi disconnect failed: %s", esp_err_to_name(ret));
+    } else {
+        event_recorder_add_operation("WiFi操作: 主动断开连接");
     }
 }
 
@@ -265,19 +295,36 @@ static void request_wifi_connect_saved(const char *ssid)
     esp_err_t ret = wifi_manager_connect_saved(ssid);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi connect saved failed: %s", esp_err_to_name(ret));
+    } else {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "WiFi操作: 连接已保存网络 %.20s", ssid ? ssid : "");
+        event_recorder_add_operation(desc);
     }
 }
 
 /* ---- Display settings bridge callbacks ---- */
 
-static void on_brightness_change(int percent)
+static void on_preview_brightness(int percent)
+{
+    display_manager_preview_brightness(percent);
+}
+
+static void on_save_brightness(int percent)
 {
     display_manager_set_brightness(percent);
+
+    char desc[64];
+    snprintf(desc, sizeof(desc), "显示设置: 亮度 %d%%", percent);
+    event_recorder_add_operation(desc);
 }
 
 static void on_timeout_change(int index)
 {
     display_manager_set_timeout_index(index);
+
+    char desc[64];
+    snprintf(desc, sizeof(desc), "显示设置: 熄屏时间索引 %d", index);
+    event_recorder_add_operation(desc);
 }
 
 /* ---- Network settings bridge callbacks ---- */
@@ -292,6 +339,11 @@ static ui_net_result_t on_apply_static_ip(const char *ip, const char *mask,
     }
 
     esp_err_t ret = wifi_manager_set_static_ip(ip, mask, gateway, dns);
+    if (ret == ESP_OK) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "网络设置: 应用静态IP %s/%s", ip, mask);
+        event_recorder_add_operation(desc);
+    }
     return (ret == ESP_OK) ? UI_NET_RESULT_OK : UI_NET_RESULT_FAIL;
 }
 
@@ -299,6 +351,9 @@ static ui_net_result_t on_restore_dhcp(void)
 {
     ESP_LOGI(TAG, "DHCP restore requested");
     esp_err_t ret = wifi_manager_restore_dhcp();
+    if (ret == ESP_OK) {
+        event_recorder_add_operation("网络设置: 恢复DHCP");
+    }
     return (ret == ESP_OK) ? UI_NET_RESULT_OK : UI_NET_RESULT_FAIL;
 }
 
@@ -362,9 +417,32 @@ static void on_get_network_info(char *buf, int buf_size)
 static void on_query_records(ui_alarm_rec_type_t type, int64_t start_ts,
     int64_t end_ts, uint16_t page, ui_alarm_rec_result_t *result)
 {
-    /* Use static to reduce stack usage (called only from LVGL task) */
     static evt_query_result_t r;
-    event_recorder_query((evt_type_t)type, start_ts, end_ts, page, &r);
+    evt_type_t evt_type;
+
+    if (!result) {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+
+    switch (type) {
+        case UI_ALARM_REC_OFFLINE:
+            evt_type = EVT_TYPE_OFFLINE;
+            break;
+        case UI_ALARM_REC_POWERON:
+            evt_type = EVT_TYPE_POWERON;
+            break;
+        case UI_ALARM_REC_HISTORY_ALARM:
+            evt_type = EVT_TYPE_ALARM;
+            break;
+        default:
+            return;
+    }
+
+    if (event_recorder_query(evt_type, start_ts, end_ts, page, &r) != ESP_OK) {
+        return;
+    }
 
     result->count = r.count;
     result->total_matched = r.total_matched;
@@ -372,7 +450,154 @@ static void on_query_records(ui_alarm_rec_type_t type, int64_t start_ts,
     result->current_page = r.current_page;
     for (int i = 0; i < r.count; i++) {
         result->records[i].timestamp = r.records[i].timestamp;
-        memcpy(result->records[i].desc, r.records[i].desc, sizeof(r.records[i].desc));
+        memcpy(result->records[i].desc, r.records[i].desc, sizeof(result->records[i].desc));
+    }
+}
+
+static esp_err_t on_query_current_alarms(ui_alarm_current_item_t *items,
+    size_t max_items, size_t *out_count)
+{
+    alarm_manager_current_alarm_t backend_items[ALARM_MANAGER_MAX_CURRENT] = {0};
+    size_t backend_count = 0;
+    esp_err_t ret = alarm_manager_get_current_alarms(backend_items,
+        ALARM_MANAGER_MAX_CURRENT, &backend_count);
+
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (!items || !out_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t copy_count = backend_count;
+    if (copy_count > max_items) {
+        copy_count = max_items;
+    }
+    for (size_t i = 0; i < copy_count; i++) {
+        items[i].timestamp = backend_items[i].timestamp;
+        memcpy(items[i].desc, backend_items[i].desc, sizeof(items[i].desc));
+    }
+    *out_count = copy_count;
+    return ESP_OK;
+}
+
+static esp_err_t on_clear_current_alarms(void)
+{
+    return alarm_manager_clear_current_alarms();
+}
+
+static esp_err_t on_load_alarm_settings(ui_alarm_settings_t *settings)
+{
+    alarm_manager_settings_t backend_settings = {0};
+    esp_err_t ret;
+
+    if (!settings) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = alarm_manager_load_settings(&backend_settings);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    memset(settings, 0, sizeof(*settings));
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT && i < ALARM_MANAGER_SETTINGS_COUNT; i++) {
+        memcpy(settings->items[i].threshold, backend_settings.items[i].threshold,
+               sizeof(settings->items[i].threshold));
+        settings->items[i].duration_s = backend_settings.items[i].duration_s;
+        settings->items[i].action = backend_settings.items[i].action;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t on_save_alarm_settings(const ui_alarm_settings_t *settings)
+{
+    alarm_manager_settings_t backend_settings = {0};
+
+    if (!settings) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < UI_ALARM_SETTINGS_COUNT && i < ALARM_MANAGER_SETTINGS_COUNT; i++) {
+        memcpy(backend_settings.items[i].threshold, settings->items[i].threshold,
+               sizeof(backend_settings.items[i].threshold));
+        backend_settings.items[i].duration_s = settings->items[i].duration_s;
+        backend_settings.items[i].action = settings->items[i].action;
+    }
+
+    return alarm_manager_save_settings(&backend_settings);
+}
+
+static void on_query_log_records(ui_log_rec_type_t type, int64_t start_ts,
+    int64_t end_ts, uint16_t page, ui_log_rec_status_filter_t status_filter,
+    ui_log_rec_result_t *result)
+{
+    static evt_query_result_t basic_result;
+    static evt_manual_query_result_t manual_result;
+    static evt_program_query_result_t program_result;
+    evt_type_t evt_type;
+
+    memset(result, 0, sizeof(*result));
+
+    if (type == UI_LOG_REC_CONTROL || type == UI_LOG_REC_OPERATION) {
+        evt_type = (type == UI_LOG_REC_CONTROL) ? EVT_TYPE_CONTROL : EVT_TYPE_OPERATION;
+        event_recorder_query(evt_type, start_ts, end_ts, page, &basic_result);
+
+        result->count = basic_result.count;
+        result->total_matched = basic_result.total_matched;
+        result->total_pages = basic_result.total_pages;
+        result->current_page = basic_result.current_page;
+        for (int i = 0; i < basic_result.count; i++) {
+            result->records[i].timestamp = basic_result.records[i].timestamp;
+            memcpy(result->records[i].desc, basic_result.records[i].desc,
+                   sizeof(basic_result.records[i].desc));
+        }
+        return;
+    }
+
+    if (type == UI_LOG_REC_MANUAL) {
+        event_recorder_query_manual_records(start_ts, end_ts,
+            (evt_status_filter_t)status_filter, page, &manual_result);
+
+        result->count = manual_result.count;
+        result->total_matched = manual_result.total_matched;
+        result->total_pages = manual_result.total_pages;
+        result->current_page = manual_result.current_page;
+        for (int i = 0; i < manual_result.count; i++) {
+            result->records[i].timestamp = manual_result.records[i].start_ts;
+            result->records[i].planned_minutes = manual_result.records[i].planned_minutes;
+            result->records[i].actual_minutes = manual_result.records[i].actual_minutes;
+            memcpy(result->records[i].status, manual_result.records[i].status,
+                   sizeof(manual_result.records[i].status));
+            memcpy(result->records[i].detail, manual_result.records[i].detail,
+                   sizeof(manual_result.records[i].detail));
+        }
+        return;
+    }
+
+    event_recorder_query_program_records(start_ts, end_ts,
+        (evt_status_filter_t)status_filter, page, &program_result);
+
+    result->count = program_result.count;
+    result->total_matched = program_result.total_matched;
+    result->total_pages = program_result.total_pages;
+    result->current_page = program_result.current_page;
+    for (int i = 0; i < program_result.count; i++) {
+        result->records[i].timestamp = program_result.records[i].start_ts;
+        result->records[i].planned_minutes = program_result.records[i].planned_minutes;
+        result->records[i].actual_minutes = program_result.records[i].actual_minutes;
+        memcpy(result->records[i].program_name, program_result.records[i].program_name,
+               sizeof(program_result.records[i].program_name));
+        memcpy(result->records[i].trigger, program_result.records[i].trigger,
+               sizeof(program_result.records[i].trigger));
+        memcpy(result->records[i].status, program_result.records[i].status,
+               sizeof(program_result.records[i].status));
+        memcpy(result->records[i].detail, program_result.records[i].detail,
+               sizeof(program_result.records[i].detail));
     }
 }
 
@@ -701,6 +926,11 @@ static void on_device_control(uint32_t point_id, bool on)
     ESP_LOGI(TAG, "Device control: point_id=%lu type=0x%02X id=%u on=%d",
              (unsigned long)point_id, target.dev_type, target.dev_id, on);
     zigbee_bridge_send_control(target.dev_type, target.dev_id, on);
+
+    char desc[64];
+    snprintf(desc, sizeof(desc), "设备控制: point=%lu -> %s",
+             (unsigned long)point_id, on ? "开启" : "关闭");
+    event_recorder_add_control(desc);
 }
 
 
@@ -796,6 +1026,10 @@ static bool on_device_add(const ui_device_add_params_t *params)
     esp_err_t ret = device_registry_add(&dev);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Add device failed: %s", esp_err_to_name(ret));
+    } else {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 新增设备 id=%u", (unsigned)params->id);
+        event_recorder_add_operation(desc);
     }
     return (ret == ESP_OK);
 }
@@ -810,6 +1044,12 @@ static bool on_valve_add(const ui_valve_add_params_t *params)
     esp_err_t ret = valve_registry_add(&valve);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Add valve failed: %s", esp_err_to_name(ret));
+    } else {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 新增阀门 dev=%u ch=%u",
+                 (unsigned)params->parent_device_id,
+                 (unsigned)params->channel);
+        event_recorder_add_operation(desc);
     }
     return (ret == ESP_OK);
 }
@@ -828,6 +1068,11 @@ static bool on_sensor_add(const ui_sensor_add_params_t *params)
     esp_err_t ret = sensor_registry_add(&sensor);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Add sensor failed: %s", esp_err_to_name(ret));
+    } else {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 新增传感器 point=%lu",
+                 (unsigned long)params->point_id);
+        event_recorder_add_operation(desc);
     }
     return (ret == ESP_OK);
 }
@@ -835,18 +1080,33 @@ static bool on_sensor_add(const ui_sensor_add_params_t *params)
 static bool on_device_delete(uint16_t device_id)
 {
     esp_err_t ret = device_registry_remove(device_id);
+    if (ret == ESP_OK) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 删除设备 id=%u", (unsigned)device_id);
+        event_recorder_add_operation(desc);
+    }
     return (ret == ESP_OK);
 }
 
 static bool on_valve_delete(uint16_t valve_id)
 {
     esp_err_t ret = valve_registry_remove(valve_id);
+    if (ret == ESP_OK) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 删除阀门 id=%u", (unsigned)valve_id);
+        event_recorder_add_operation(desc);
+    }
     return (ret == ESP_OK);
 }
 
 static bool on_sensor_delete(uint32_t point_id)
 {
     esp_err_t ret = sensor_registry_remove(point_id);
+    if (ret == ESP_OK) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 删除传感器 point=%lu", (unsigned long)point_id);
+        event_recorder_add_operation(desc);
+    }
     return (ret == ESP_OK);
 }
 
@@ -857,6 +1117,11 @@ static bool on_device_edit(uint16_t id, const ui_device_edit_params_t *params)
     dev.port = params->port;
     snprintf(dev.name, sizeof(dev.name), "%s", params->name);
     bool ok = device_registry_update(id, &dev) == ESP_OK;
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 编辑设备 id=%u", (unsigned)id);
+        event_recorder_add_operation(desc);
+    }
     return ok;
 }
 
@@ -868,6 +1133,11 @@ static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
     valve.parent_device_id = params->parent_device_id;
     snprintf(valve.name, sizeof(valve.name), "%s", params->name);
     bool ok = valve_registry_update(id, &valve) == ESP_OK;
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 编辑阀门 id=%u", (unsigned)id);
+        event_recorder_add_operation(desc);
+    }
     return ok;
 }
 
@@ -877,6 +1147,11 @@ static bool on_sensor_edit(uint32_t point_id, const ui_sensor_edit_params_t *par
     sensor.type = params->type;
     snprintf(sensor.name, sizeof(sensor.name), "%s", params->name);
     bool ok = sensor_registry_update(point_id, &sensor) == ESP_OK;
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 编辑传感器 point=%lu", (unsigned long)point_id);
+        event_recorder_add_operation(desc);
+    }
     return ok;
 }
 
@@ -1022,12 +1297,22 @@ static bool on_zone_add(const ui_zone_add_params_t *params)
     memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
     memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
     bool ok = zone_registry_add(&zone) == ESP_OK;
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 新增灌区 %.20s", params->name);
+        event_recorder_add_operation(desc);
+    }
     return ok;
 }
 
 static bool on_zone_delete(int slot_index)
 {
     bool ok = zone_registry_remove(slot_index) == ESP_OK;
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 删除灌区 slot=%d", slot_index);
+        event_recorder_add_operation(desc);
+    }
     return ok;
 }
 
@@ -1040,6 +1325,11 @@ static bool on_zone_edit(int slot_index, const ui_zone_add_params_t *params)
     memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
     memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
     bool ok = zone_registry_update(slot_index, &zone) == ESP_OK;
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "设置: 编辑灌区 slot=%d", slot_index);
+        event_recorder_add_operation(desc);
+    }
     return ok;
 }
 
@@ -1154,7 +1444,11 @@ static void on_irrigation_status_get(void *arg)
 
 static bool on_home_auto_mode_set(bool enabled)
 {
-    return irrigation_scheduler_set_auto_enabled(enabled);
+    bool ok = irrigation_scheduler_set_auto_enabled(enabled);
+    if (ok) {
+        event_recorder_add_operation(enabled ? "首页操作: 开启自动模式" : "首页操作: 关闭自动模式");
+    }
+    return ok;
 }
 
 static bool on_home_auto_mode_get(void)
@@ -1164,7 +1458,13 @@ static bool on_home_auto_mode_get(void)
 
 static bool on_home_program_start(int index)
 {
-    return irrigation_scheduler_start_program(index);
+    bool ok = irrigation_scheduler_start_program(index);
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "首页操作: 启动程序 #%d", index + 1);
+        event_recorder_add_operation(desc);
+    }
+    return ok;
 }
 
 static bool on_home_manual_irrigation_start(const ui_manual_irrigation_request_t *req)
@@ -1179,7 +1479,14 @@ static bool on_home_manual_irrigation_start(const ui_manual_irrigation_request_t
         .total_duration = req->total_duration,
     };
     snprintf(backend_req.formula, sizeof(backend_req.formula), "%s", req->formula);
-    return irrigation_scheduler_start_manual_irrigation(&backend_req);
+
+    bool ok = irrigation_scheduler_start_manual_irrigation(&backend_req);
+    if (ok) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "首页操作: 启动手动灌溉 %.20s", req->formula);
+        event_recorder_add_operation(desc);
+    }
+    return ok;
 }
 
 static bool on_home_irrigation_status_get(ui_irrigation_runtime_status_t *out)
@@ -1239,10 +1546,17 @@ void app_main(void)
         ESP_LOGE(TAG, "Event recorder init failed: %s", esp_err_to_name(er_ret));
     } else {
         event_recorder_add_poweron("上电");
+        event_recorder_add_operation("系统启动");
+    }
+
+    esp_err_t alarm_ret = alarm_manager_init();
+    if (alarm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm manager init failed: %s", esp_err_to_name(alarm_ret));
     }
 
     /* Register display settings callbacks */
-    ui_display_register_brightness_cb(on_brightness_change);
+    ui_display_register_preview_brightness_cb(on_preview_brightness);
+    ui_display_register_save_brightness_cb(on_save_brightness);
     ui_display_register_timeout_cb(on_timeout_change);
 
     /* Initialize device registry (NVS-based, before UI init) */
@@ -1318,8 +1632,15 @@ void app_main(void)
     ui_network_register_restore_dhcp_cb(on_restore_dhcp);
     ui_network_register_get_info_cb(on_get_network_info);
 
+    /* Register alarm callbacks */
+    ui_alarm_register_query_current_cb(on_query_current_alarms);
+    ui_alarm_register_clear_current_cb(on_clear_current_alarms);
+    ui_alarm_register_load_settings_cb(on_load_alarm_settings);
+    ui_alarm_register_save_settings_cb(on_save_alarm_settings);
+
     /* Register event records query callback */
     ui_alarm_rec_register_query_cb(on_query_records);
+    ui_log_rec_register_query_cb(on_query_log_records);
 
     /* Register device control callback (UI → zigbee_bridge) */
     ui_device_register_control_cb(on_device_control);

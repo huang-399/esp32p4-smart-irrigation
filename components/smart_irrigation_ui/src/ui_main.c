@@ -4,6 +4,7 @@
  */
 
 #include "ui_common.h"
+#include "ui_log_records.h"
 #include "ui_numpad.h"
 #include "ui_keyboard.h"
 #include "ui_alarm.h"
@@ -135,6 +136,10 @@ void ui_switch_nav(nav_item_t nav)
     /* Invalidate device page pointers before destroying content
        to prevent zigbee async callbacks from accessing freed memory */
     ui_device_invalidate_objects();
+
+    /* Invalidate log record page pointers before destroying content
+       to prevent async refresh from accessing freed memory */
+    ui_log_rec_invalidate();
 
     /* 清空内容区 */
     lv_obj_clean(g_ui_main.content);

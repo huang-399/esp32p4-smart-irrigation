@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "zigbee_bridge.h"
+#include "event_recorder.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -43,6 +44,31 @@ typedef struct {
 static irr_queue_item_t s_queue[IRR_SCHED_QUEUE_LEN];
 static int s_queue_count = 0;
 
+typedef struct {
+    bool active;
+    int64_t start_ts;
+    uint16_t planned_minutes;
+    int pre_water;
+    int post_water;
+    char formula[32];
+} manual_run_ctx_t;
+
+typedef struct {
+    bool active;
+    int64_t start_ts;
+    uint16_t planned_minutes;
+    int valve_count;
+    char program_name[32];
+    char trigger[16];
+    char source[16];
+} program_run_ctx_t;
+
+static manual_run_ctx_t s_manual_run_ctx;
+static program_run_ctx_t s_program_run_ctx;
+static bool s_finishing_normally = false;
+
+static void update_elapsed_seconds(void);
+
 static void copy_text(char *dst, size_t dst_size, const char *src)
 {
     if (!dst || dst_size == 0) {
@@ -61,6 +87,217 @@ static void copy_text(char *dst, size_t dst_size, const char *src)
 
     memcpy(dst, src, len);
     dst[len] = '\0';
+}
+
+static const char *map_trigger_text(const char *source)
+{
+    if (!source) {
+        return "未知";
+    }
+    if (strcmp(source, "manual") == 0) {
+        return "手动";
+    }
+    if (strcmp(source, "auto") == 0) {
+        return "自动";
+    }
+    if (strcmp(source, "queued") == 0) {
+        return "排队";
+    }
+    return "未知";
+}
+
+static uint16_t elapsed_seconds_to_minutes(int elapsed_seconds)
+{
+    if (elapsed_seconds <= 0) {
+        return 0;
+    }
+    return (uint16_t)((elapsed_seconds + 59) / 60);
+}
+
+static void clear_run_contexts(void)
+{
+    memset(&s_manual_run_ctx, 0, sizeof(s_manual_run_ctx));
+    memset(&s_program_run_ctx, 0, sizeof(s_program_run_ctx));
+}
+
+static void persist_abnormal_manual_record(int64_t start_ts,
+                                          uint16_t planned_minutes,
+                                          uint16_t actual_minutes,
+                                          int pre_water,
+                                          int post_water,
+                                          const char *formula,
+                                          const char *status,
+                                          const char *detail)
+{
+    evt_manual_record_t record = {0};
+
+    record.start_ts = start_ts;
+    record.planned_minutes = planned_minutes;
+    record.actual_minutes = actual_minutes;
+    copy_text(record.status, sizeof(record.status), status);
+    snprintf(record.detail, sizeof(record.detail),
+             "前清水%d分 后清水%d分",
+             pre_water,
+             post_water);
+    if (formula && formula[0] != '\0') {
+        size_t len = strlen(record.detail);
+        if (len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      " 配方:");
+            len = strlen(record.detail);
+        }
+        if (len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      formula);
+            len = strlen(record.detail);
+        }
+    }
+    if (detail && detail[0] != '\0') {
+        size_t len = strlen(record.detail);
+        if (len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      " ");
+            len = strlen(record.detail);
+        }
+        if (len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      detail);
+        }
+    }
+    event_recorder_add_manual_record(&record);
+}
+
+static void persist_abnormal_program_record(const char *program_name,
+                                           const char *trigger,
+                                           int64_t start_ts,
+                                           uint16_t planned_minutes,
+                                           uint16_t actual_minutes,
+                                           int valve_count,
+                                           const char *source,
+                                           const char *status,
+                                           const char *detail)
+{
+    evt_program_record_t record = {0};
+
+    record.start_ts = start_ts;
+    record.planned_minutes = planned_minutes;
+    record.actual_minutes = actual_minutes;
+    copy_text(record.program_name, sizeof(record.program_name), program_name);
+    copy_text(record.trigger, sizeof(record.trigger), trigger);
+    copy_text(record.status, sizeof(record.status), status);
+    snprintf(record.detail, sizeof(record.detail), "阀门数:%d 来源:", valve_count);
+    {
+        size_t len = strlen(record.detail);
+        if (len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      (source && source[0] != '\0') ? source : "unknown");
+            len = strlen(record.detail);
+        }
+        if (detail && detail[0] != '\0' && len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      " ");
+            len = strlen(record.detail);
+        }
+        if (detail && detail[0] != '\0' && len < sizeof(record.detail) - 1) {
+            copy_text(record.detail + len,
+                      sizeof(record.detail) - len,
+                      detail);
+        }
+    }
+    event_recorder_add_program_record(&record);
+}
+
+static void persist_interrupted_run_if_needed(void)
+{
+    if (!s_runtime.busy || s_finishing_normally) {
+        return;
+    }
+
+    update_elapsed_seconds();
+
+    if (s_runtime.manual_irrigation_active && s_manual_run_ctx.active) {
+        persist_abnormal_manual_record(s_manual_run_ctx.start_ts,
+                                       s_manual_run_ctx.planned_minutes,
+                                       elapsed_seconds_to_minutes(s_runtime.elapsed_seconds),
+                                       s_manual_run_ctx.pre_water,
+                                       s_manual_run_ctx.post_water,
+                                       s_manual_run_ctx.formula,
+                                       "中断结束",
+                                       "运行提前结束");
+        return;
+    }
+
+    if (s_runtime.program_active && s_program_run_ctx.active) {
+        persist_abnormal_program_record(s_program_run_ctx.program_name,
+                                        s_program_run_ctx.trigger,
+                                        s_program_run_ctx.start_ts,
+                                        s_program_run_ctx.planned_minutes,
+                                        elapsed_seconds_to_minutes(s_runtime.elapsed_seconds),
+                                        s_program_run_ctx.valve_count,
+                                        s_program_run_ctx.source,
+                                        "中断结束",
+                                        "运行提前结束");
+    }
+}
+
+static void persist_completed_run(void)
+{
+    if (s_runtime.manual_irrigation_active && s_manual_run_ctx.active) {
+        evt_manual_record_t record = {0};
+
+        record.start_ts = s_manual_run_ctx.start_ts;
+        record.planned_minutes = s_manual_run_ctx.planned_minutes;
+        record.actual_minutes = elapsed_seconds_to_minutes(s_runtime.elapsed_seconds);
+        copy_text(record.status, sizeof(record.status), "正常");
+        snprintf(record.detail, sizeof(record.detail),
+                 "前清水%d分 后清水%d分",
+                 s_manual_run_ctx.pre_water,
+                 s_manual_run_ctx.post_water);
+        if (s_manual_run_ctx.formula[0] != '\0') {
+            size_t len = strlen(record.detail);
+            if (len < sizeof(record.detail) - 1) {
+                copy_text(record.detail + len,
+                          sizeof(record.detail) - len,
+                          " 配方:");
+                len = strlen(record.detail);
+            }
+            if (len < sizeof(record.detail) - 1) {
+                copy_text(record.detail + len,
+                          sizeof(record.detail) - len,
+                          s_manual_run_ctx.formula);
+            }
+        }
+        event_recorder_add_manual_record(&record);
+        return;
+    }
+
+    if (s_runtime.program_active && s_program_run_ctx.active) {
+        evt_program_record_t record = {0};
+
+        record.start_ts = s_program_run_ctx.start_ts;
+        record.planned_minutes = s_program_run_ctx.planned_minutes;
+        record.actual_minutes = elapsed_seconds_to_minutes(s_runtime.elapsed_seconds);
+        copy_text(record.program_name, sizeof(record.program_name), s_program_run_ctx.program_name);
+        copy_text(record.trigger, sizeof(record.trigger), s_program_run_ctx.trigger);
+        copy_text(record.status, sizeof(record.status), "正常");
+        snprintf(record.detail, sizeof(record.detail), "阀门数:%d 来源:",
+                 s_program_run_ctx.valve_count);
+        {
+            size_t len = strlen(record.detail);
+            if (len < sizeof(record.detail) - 1) {
+                copy_text(record.detail + len,
+                          sizeof(record.detail) - len,
+                          s_program_run_ctx.source[0] != '\0' ? s_program_run_ctx.source : "unknown");
+            }
+        }
+        event_recorder_add_program_record(&record);
+    }
 }
 
 static void update_elapsed_seconds(void)
@@ -208,6 +445,7 @@ static bool apply_program_targets(const irr_program_t *program)
 
 static void set_idle_status(void)
 {
+    persist_interrupted_run_if_needed();
     stop_active_valves();
     s_runtime.busy = false;
     s_runtime.program_active = false;
@@ -218,6 +456,7 @@ static void set_idle_status(void)
     s_runtime.elapsed_seconds = 0;
     s_runtime_started_at = 0;
     s_runtime_deadline_at = 0;
+    clear_run_contexts();
     copy_text(s_runtime.status_text, sizeof(s_runtime.status_text), "无手动轮灌&无程序运行");
 }
 
@@ -434,24 +673,52 @@ static bool start_program_internal(int index, const char *source)
     irr_program_t program = {0};
     int duration_minutes = 0;
     time_t now = 0;
+    const char *trigger = map_trigger_text(source);
 
     if (!irrigation_scheduler_get_program(index, &program)) {
         ESP_LOGW(TAG, "Start program failed, invalid index=%d", index);
-        return false;
-    }
-
-    if (!program_has_targets(&program)) {
-        ESP_LOGW(TAG, "Start program failed, no targets selected: index=%d", index);
-        return false;
-    }
-
-    if (!apply_program_targets(&program)) {
-        ESP_LOGW(TAG, "Start program failed, target actuation failed: index=%d", index);
+        persist_abnormal_program_record("未知程序",
+                                        trigger,
+                                        (int64_t)time(NULL),
+                                        0,
+                                        0,
+                                        0,
+                                        source,
+                                        "启动失败",
+                                        "程序索引无效");
         return false;
     }
 
     duration_minutes = get_effective_duration_minutes(&program);
     now = time(NULL);
+
+    if (!program_has_targets(&program)) {
+        ESP_LOGW(TAG, "Start program failed, no targets selected: index=%d", index);
+        persist_abnormal_program_record(program.name,
+                                        trigger,
+                                        (int64_t)now,
+                                        (uint16_t)duration_minutes,
+                                        0,
+                                        0,
+                                        source,
+                                        "启动失败",
+                                        "程序无可执行目标");
+        return false;
+    }
+
+    if (!apply_program_targets(&program)) {
+        ESP_LOGW(TAG, "Start program failed, target actuation failed: index=%d", index);
+        persist_abnormal_program_record(program.name,
+                                        trigger,
+                                        (int64_t)now,
+                                        (uint16_t)duration_minutes,
+                                        0,
+                                        0,
+                                        source,
+                                        "启动失败",
+                                        "未打开任何阀门");
+        return false;
+    }
 
     s_runtime.busy = true;
     s_runtime.program_active = true;
@@ -463,6 +730,16 @@ static bool start_program_internal(int index, const char *source)
     s_runtime_deadline_at = now + (time_t)duration_minutes * 60;
     copy_text(s_runtime.active_name, sizeof(s_runtime.active_name), program.name);
     snprintf(s_runtime.status_text, sizeof(s_runtime.status_text), "程序运行中：%s", program.name);
+
+    memset(&s_manual_run_ctx, 0, sizeof(s_manual_run_ctx));
+    memset(&s_program_run_ctx, 0, sizeof(s_program_run_ctx));
+    s_program_run_ctx.active = true;
+    s_program_run_ctx.start_ts = (int64_t)now;
+    s_program_run_ctx.planned_minutes = (uint16_t)duration_minutes;
+    s_program_run_ctx.valve_count = s_active_valve_count;
+    copy_text(s_program_run_ctx.program_name, sizeof(s_program_run_ctx.program_name), program.name);
+    copy_text(s_program_run_ctx.trigger, sizeof(s_program_run_ctx.trigger), trigger);
+    copy_text(s_program_run_ctx.source, sizeof(s_program_run_ctx.source), source ? source : "unknown");
 
     ESP_LOGI(TAG, "Program started[%s]: index=%d name=%s total=%d valves=%d",
              source ? source : "unknown", index, program.name, duration_minutes, s_active_valve_count);
@@ -488,6 +765,18 @@ static bool start_manual_irrigation_internal(const irr_manual_irrigation_request
 
     now = time(NULL);
 
+    if (req->pre_water <= 0 && req->post_water <= 0 && req->total_duration <= 0) {
+        persist_abnormal_manual_record((int64_t)now,
+                                       (uint16_t)duration_minutes,
+                                       0,
+                                       req->pre_water,
+                                       req->post_water,
+                                       req->formula,
+                                       "启动失败",
+                                       "手灌时长无效");
+        return false;
+    }
+
     s_runtime.busy = true;
     s_runtime.program_active = false;
     s_runtime.manual_irrigation_active = true;
@@ -499,6 +788,15 @@ static bool start_manual_irrigation_internal(const irr_manual_irrigation_request
     copy_text(s_runtime.active_name, sizeof(s_runtime.active_name), "手动轮灌");
     snprintf(s_runtime.status_text, sizeof(s_runtime.status_text),
              "手动轮灌中：前清水%d分 后清水%d分", req->pre_water, req->post_water);
+
+    memset(&s_program_run_ctx, 0, sizeof(s_program_run_ctx));
+    memset(&s_manual_run_ctx, 0, sizeof(s_manual_run_ctx));
+    s_manual_run_ctx.active = true;
+    s_manual_run_ctx.start_ts = (int64_t)now;
+    s_manual_run_ctx.planned_minutes = (uint16_t)duration_minutes;
+    s_manual_run_ctx.pre_water = req->pre_water;
+    s_manual_run_ctx.post_water = req->post_water;
+    copy_text(s_manual_run_ctx.formula, sizeof(s_manual_run_ctx.formula), req->formula);
 
     ESP_LOGI(TAG, "Manual irrigation started: pre=%d post=%d total=%d formula=%s",
              req->pre_water, req->post_water, duration_minutes, req->formula);
@@ -532,7 +830,10 @@ static void finish_current_run_if_needed(void)
     update_elapsed_seconds();
     ESP_LOGI(TAG, "Irrigation run completed: name=%s elapsed=%d valves=%d",
              s_runtime.active_name, s_runtime.elapsed_seconds, s_active_valve_count);
+    s_finishing_normally = true;
+    persist_completed_run();
     set_idle_status();
+    s_finishing_normally = false;
     try_start_next_queued_program();
 }
 
@@ -798,6 +1099,15 @@ bool irrigation_scheduler_start_program(int index)
 {
     if (s_runtime.busy) {
         ESP_LOGW(TAG, "Manual program start rejected, scheduler busy");
+        persist_abnormal_program_record("未知程序",
+                                        "手动",
+                                        (int64_t)time(NULL),
+                                        0,
+                                        0,
+                                        0,
+                                        "manual",
+                                        "启动失败",
+                                        "调度器忙碌");
         return false;
     }
 
@@ -812,6 +1122,14 @@ bool irrigation_scheduler_start_manual_irrigation(const irr_manual_irrigation_re
 
     if (s_runtime.busy) {
         ESP_LOGW(TAG, "Manual irrigation start rejected, scheduler busy");
+        persist_abnormal_manual_record((int64_t)time(NULL),
+                                       (uint16_t)0,
+                                       (uint16_t)0,
+                                       req->pre_water,
+                                       req->post_water,
+                                       req->formula,
+                                       "启动失败",
+                                       "调度器忙碌");
         return false;
     }
 
