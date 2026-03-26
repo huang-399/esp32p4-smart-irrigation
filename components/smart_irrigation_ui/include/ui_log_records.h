@@ -23,6 +23,12 @@ typedef enum {
     UI_LOG_REC_STATUS_ABNORMAL
 } ui_log_rec_status_filter_t;
 
+typedef enum {
+    UI_LOG_REC_QUERY_STATUS_OK = 0,
+    UI_LOG_REC_QUERY_STATUS_TF_UNAVAILABLE,
+    UI_LOG_REC_QUERY_STATUS_FAILED
+} ui_log_rec_query_status_t;
+
 typedef struct {
     int64_t timestamp;
     char desc[64];
@@ -42,30 +48,43 @@ typedef struct {
     uint16_t current_page;
 } ui_log_rec_result_t;
 
-typedef void (*ui_log_rec_query_fn)(ui_log_rec_type_t type,
-    int64_t start_ts, int64_t end_ts, uint16_t page,
-    ui_log_rec_status_filter_t status_filter,
-    ui_log_rec_result_t *result);
+typedef struct {
+    ui_log_rec_type_t type;
+    int64_t start_ts;
+    int64_t end_ts;
+    uint16_t page;
+    ui_log_rec_status_filter_t status_filter;
+    uint32_t request_id;
+} ui_log_rec_request_t;
 
-void ui_log_rec_register_query_cb(ui_log_rec_query_fn fn);
+typedef struct {
+    ui_log_rec_request_t request;
+    ui_log_rec_query_status_t status;
+    ui_log_rec_result_t result;
+} ui_log_rec_response_t;
+
+typedef void (*ui_log_rec_query_submit_fn)(const ui_log_rec_request_t *request);
+
+void ui_log_rec_register_query_cb(ui_log_rec_query_submit_fn fn);
+void ui_log_rec_apply_query_result(const ui_log_rec_response_t *response);
 
 void ui_log_rec_setup_control(lv_obj_t *input_start, lv_obj_t *input_end,
-    lv_obj_t *table_area, lv_obj_t *page_info,
+    lv_obj_t *table_area, lv_obj_t *page_info, lv_obj_t *query_btn,
     lv_obj_t *btn_first, lv_obj_t *btn_prev,
     lv_obj_t *btn_next, lv_obj_t *btn_last);
 
 void ui_log_rec_setup_operation(lv_obj_t *input_start, lv_obj_t *input_end,
-    lv_obj_t *table_area, lv_obj_t *page_info,
+    lv_obj_t *table_area, lv_obj_t *page_info, lv_obj_t *query_btn,
     lv_obj_t *btn_first, lv_obj_t *btn_prev,
     lv_obj_t *btn_next, lv_obj_t *btn_last);
 
 void ui_log_rec_setup_manual(lv_obj_t *input_start, lv_obj_t *input_end,
-    lv_obj_t *status_dropdown, lv_obj_t *table_area, lv_obj_t *page_info,
+    lv_obj_t *status_dropdown, lv_obj_t *table_area, lv_obj_t *page_info, lv_obj_t *query_btn,
     lv_obj_t *btn_first, lv_obj_t *btn_prev,
     lv_obj_t *btn_next, lv_obj_t *btn_last);
 
 void ui_log_rec_setup_program(lv_obj_t *input_start, lv_obj_t *input_end,
-    lv_obj_t *status_dropdown, lv_obj_t *table_area, lv_obj_t *page_info,
+    lv_obj_t *status_dropdown, lv_obj_t *table_area, lv_obj_t *page_info, lv_obj_t *query_btn,
     lv_obj_t *btn_first, lv_obj_t *btn_prev,
     lv_obj_t *btn_next, lv_obj_t *btn_last);
 

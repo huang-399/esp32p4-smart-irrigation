@@ -776,7 +776,7 @@ static void create_history_alarm_content(lv_obj_t *parent)
     lv_obj_center(label_last);
 
     ui_alarm_rec_setup_history_alarm(g_input_start_date, g_input_end_date,
-        table_area, page_info, btn_first, btn_prev, btn_next, btn_last);
+        table_area, page_info, btn_query, btn_first, btn_prev, btn_next, btn_last);
 }
 
 /**
@@ -1125,7 +1125,7 @@ static void create_offline_content(lv_obj_t *parent)
 
     /* 注册掉线记录模块 */
     ui_alarm_rec_setup_offline(input_start_date, input_end_date,
-        table_area, page_info, btn_first, btn_prev, btn_next, btn_last);
+        table_area, page_info, btn_query, btn_first, btn_prev, btn_next, btn_last);
 }
 
 /**
@@ -1331,7 +1331,7 @@ static void create_poweron_content(lv_obj_t *parent)
 
     /* 注册上电记录模块 */
     ui_alarm_rec_setup_poweron(input_start_date, input_end_date,
-        table_area, page_info, btn_first, btn_prev, btn_next, btn_last);
+        table_area, page_info, btn_query, btn_first, btn_prev, btn_next, btn_last);
 }
 
 static void ensure_settings_cache_loaded(void)

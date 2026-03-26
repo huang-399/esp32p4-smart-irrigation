@@ -6,6 +6,8 @@ extern "C" {
 #endif
 
 #include "esp_err.h"
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define EVT_RECORD_MAX   20
@@ -76,6 +78,7 @@ typedef struct {
 } evt_program_query_result_t;
 
 esp_err_t event_recorder_init(void);
+esp_err_t event_recorder_add_basic_record(evt_type_t type, const evt_record_t *record);
 esp_err_t event_recorder_add_offline(const char *desc);
 esp_err_t event_recorder_add_poweron(const char *desc);
 esp_err_t event_recorder_add_control(const char *desc);
@@ -93,6 +96,20 @@ esp_err_t event_recorder_query_program_records(int64_t start_ts, int64_t end_ts,
                                                 evt_status_filter_t status_filter,
                                                 uint16_t page,
                                                 evt_program_query_result_t *result);
+
+esp_err_t event_recorder_get_basic_records_snapshot(evt_type_t type,
+                                                    evt_record_t *records,
+                                                    size_t max_records,
+                                                    size_t *out_count);
+esp_err_t event_recorder_get_manual_records_snapshot(evt_manual_record_t *records,
+                                                     size_t max_records,
+                                                     size_t *out_count);
+esp_err_t event_recorder_get_program_records_snapshot(evt_program_record_t *records,
+                                                      size_t max_records,
+                                                      size_t *out_count);
+esp_err_t event_recorder_clear_legacy_storage(void);
+bool event_recorder_manual_record_equals(const evt_manual_record_t *a, const evt_manual_record_t *b);
+bool event_recorder_program_record_equals(const evt_program_record_t *a, const evt_program_record_t *b);
 
 /**
  * @brief Update all records with unsynchronized timestamps to current time.

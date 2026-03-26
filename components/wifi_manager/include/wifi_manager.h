@@ -87,6 +87,11 @@ const char *wifi_manager_get_connected_ssid(void);
 void wifi_manager_register_conn_cb(wifi_mgr_conn_status_cb_t cb, void *user_data);
 
 /**
+ * @brief Start delayed boot auto-connect after callbacks are ready.
+ */
+esp_err_t wifi_manager_start_auto_connect(void);
+
+/**
  * @brief Check if credentials are saved for a given SSID.
  */
 bool wifi_manager_has_saved_password(const char *ssid);

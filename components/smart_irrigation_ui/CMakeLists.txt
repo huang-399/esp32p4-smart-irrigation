@@ -16,6 +16,7 @@ idf_component_register(
         "src/ui_numpad.c"
         "src/ui_program.c"
         "src/ui_settings.c"
+        "src/ui_startup.c"
         "src/ui_wifi.c"
     INCLUDE_DIRS "include"
     REQUIRES lvgl nvs_flash log irrigation_scheduler

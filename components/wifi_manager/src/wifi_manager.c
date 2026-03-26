@@ -30,6 +30,7 @@ static bool s_scanning = false;
 static wifi_mgr_scan_done_cb_t s_scan_cb = NULL;
 static void *s_scan_user_data = NULL;
 static EventGroupHandle_t s_wifi_event_group = NULL;
+static TaskHandle_t s_auto_connect_task_handle = NULL;
 
 /* Connection state */
 static bool s_connected = false;
@@ -549,14 +550,10 @@ static void wifi_reconnect_task(void *pvParameters)
 
 static void auto_connect_task(void *pvParameters)
 {
-    /* Wait for system to fully initialize and callbacks to be registered */
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
     nvs_handle_t handle;
     if (nvs_open(WIFI_CRED_NVS_NS, NVS_READONLY, &handle) != ESP_OK) {
         ESP_LOGI(TAG, "No saved WiFi credentials for auto-connect");
-        vTaskDelete(NULL);
-        return;
+        goto exit;
     }
 
     uint8_t count = 0;
@@ -565,8 +562,7 @@ static void auto_connect_task(void *pvParameters)
     if (count == 0) {
         nvs_close(handle);
         ESP_LOGI(TAG, "No saved WiFi credentials for auto-connect");
-        vTaskDelete(NULL);
-        return;
+        goto exit;
     }
 
     /* Use most recent entry (highest index) */
@@ -580,8 +576,7 @@ static void auto_connect_task(void *pvParameters)
     esp_err_t err = nvs_get_str(handle, key_s, ssid, &len);
     if (err != ESP_OK || ssid[0] == '\0') {
         nvs_close(handle);
-        vTaskDelete(NULL);
-        return;
+        goto exit;
     }
 
     len = sizeof(password);
@@ -592,6 +587,8 @@ static void auto_connect_task(void *pvParameters)
     s_auto_connecting = true;
     wifi_manager_connect(ssid, password);
 
+exit:
+    s_auto_connect_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -638,8 +635,7 @@ esp_err_t wifi_manager_init(void)
     s_reconnect_timer = xTimerCreate("wifi_reconn", pdMS_TO_TICKS(10000),
                                       pdFALSE, NULL, reconnect_timer_cb);
 
-    /* Start auto-connect task (delayed, so callbacks can be registered first) */
-    xTaskCreate(auto_connect_task, "auto_conn", 4096, NULL, 4, NULL);
+    /* Auto-connect task is started after connection callback registration */
 
     s_initialized = true;
     ESP_LOGI(TAG, "WiFi manager initialized");
@@ -744,6 +740,21 @@ void wifi_manager_register_conn_cb(wifi_mgr_conn_status_cb_t cb, void *user_data
 {
     s_conn_cb = cb;
     s_conn_user_data = user_data;
+}
+
+esp_err_t wifi_manager_start_auto_connect(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_auto_connect_task_handle) {
+        return ESP_OK;
+    }
+
+    BaseType_t ok = xTaskCreate(auto_connect_task, "auto_conn", 4096, NULL, 4,
+                                &s_auto_connect_task_handle);
+    return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
 }
 
 bool wifi_manager_has_saved_password(const char *ssid)

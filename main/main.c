@@ -15,10 +15,12 @@
 #include "ui_alarm.h"
 #include "ui_alarm_records.h"
 #include "ui_log_records.h"
+#include "ui_startup.h"
 #include "wifi_manager.h"
 #include "display_manager.h"
 #include "alarm_manager.h"
 #include "event_recorder.h"
+#include "history_archive.h"
 #include "zigbee_bridge.h"
 #include "device_registry.h"
 #include "irrigation_scheduler.h"
@@ -31,6 +33,8 @@
 static const char *TAG = "smart_irrigation";
 
 static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out);
+static void sync_archive_from_nvs_snapshots(void);
+static void clear_legacy_event_storage_if_safe(void);
 
 /* NTP time sync state */
 static bool s_time_synced = false;
@@ -38,6 +42,60 @@ static bool s_ntp_started = false;
 static bool s_wifi_connected = false;
 static bool s_event_fix_scheduled = false;
 static bool s_event_fix_completed = false;
+static QueueHandle_t s_operation_log_queue = NULL;
+static QueueHandle_t s_history_query_queue = NULL;
+
+static void startup_progress_update(const char *stage_text, int progress)
+{
+    bsp_display_lock(-1);
+    ui_startup_update(stage_text, progress);
+    bsp_display_unlock();
+}
+
+static void restore_initial_network_ui_state(void)
+{
+    nvs_handle_t h;
+
+    if (nvs_open("wifi_ip", NVS_READONLY, &h) != ESP_OK) {
+        ui_network_set_initial_ip_mode(0, NULL, NULL, NULL, NULL);
+        return;
+    }
+
+    uint8_t mode = 0;
+    nvs_get_u8(h, "mode", &mode);
+    if (mode == 1) {
+        char ip[20] = {0};
+        char cidr[4] = {0};
+        char gw[20] = {0};
+        char dns[20] = {0};
+        size_t len;
+
+        len = sizeof(ip);
+        nvs_get_str(h, "ip", ip, &len);
+        len = sizeof(cidr);
+        nvs_get_str(h, "cidr", cidr, &len);
+        len = sizeof(gw);
+        nvs_get_str(h, "gw", gw, &len);
+        len = sizeof(dns);
+        nvs_get_str(h, "dns", dns, &len);
+        ui_network_set_initial_ip_mode(1, ip, cidr, gw, dns);
+    } else {
+        ui_network_set_initial_ip_mode(0, NULL, NULL, NULL, NULL);
+    }
+
+    nvs_close(h);
+}
+
+static void create_main_ui_with_initial_state(void)
+{
+    bsp_display_lock(-1);
+    ui_init();
+    ui_display_set_initial_values(
+        display_manager_get_brightness(),
+        display_manager_get_timeout_index()
+    );
+    bsp_display_unlock();
+}
 
 static bool is_nav_visible(nav_item_t nav)
 {
@@ -98,6 +156,496 @@ static void refresh_alarm_records_async(void *arg)
     }
 }
 
+typedef struct {
+    char desc[64];
+} operation_log_msg_t;
+
+static void persist_basic_event_now(evt_type_t type, const char *desc)
+{
+    evt_record_t record = {0};
+    time_t now;
+
+    if (!desc || !desc[0]) {
+        return;
+    }
+
+    time(&now);
+    record.timestamp = (int64_t)now;
+    snprintf(record.desc, sizeof(record.desc), "%s", desc);
+
+    esp_err_t ret = event_recorder_add_basic_record(type, &record);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist %d record: %s", (int)type, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = history_archive_enqueue_basic_record(type, &record);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Failed to enqueue %d archive record: %s", (int)type, esp_err_to_name(ret));
+    }
+}
+
+typedef enum {
+    HISTORY_QUERY_KIND_ALARM = 0,
+    HISTORY_QUERY_KIND_LOG
+} history_query_kind_t;
+
+typedef struct {
+    history_query_kind_t kind;
+    union {
+        ui_alarm_rec_request_t alarm;
+        ui_log_rec_request_t log;
+    } request;
+} history_query_msg_t;
+
+typedef struct {
+    ui_alarm_rec_response_t response;
+} alarm_query_async_result_t;
+
+typedef struct {
+    ui_log_rec_response_t response;
+} log_query_async_result_t;
+
+static void deliver_alarm_query_result_async(void *arg)
+{
+    alarm_query_async_result_t *payload = (alarm_query_async_result_t *)arg;
+
+    if (!payload) {
+        return;
+    }
+
+    ui_alarm_rec_apply_query_result(&payload->response);
+    free(payload);
+}
+
+static void deliver_log_query_result_async(void *arg)
+{
+    log_query_async_result_t *payload = (log_query_async_result_t *)arg;
+
+    if (!payload) {
+        return;
+    }
+
+    ui_log_rec_apply_query_result(&payload->response);
+    free(payload);
+}
+
+static void submit_alarm_query_failure_async(const ui_alarm_rec_request_t *request)
+{
+    alarm_query_async_result_t *payload;
+
+    if (!request) {
+        return;
+    }
+
+    payload = calloc(1, sizeof(*payload));
+    if (!payload) {
+        ESP_LOGW(TAG, "Failed to allocate alarm submit failure payload");
+        return;
+    }
+
+    payload->response.request = *request;
+    payload->response.status = UI_ALARM_REC_QUERY_STATUS_FAILED;
+    lv_async_call(deliver_alarm_query_result_async, payload);
+}
+
+static void submit_log_query_failure_async(const ui_log_rec_request_t *request)
+{
+    log_query_async_result_t *payload;
+
+    if (!request) {
+        return;
+    }
+
+    payload = calloc(1, sizeof(*payload));
+    if (!payload) {
+        ESP_LOGW(TAG, "Failed to allocate log submit failure payload");
+        return;
+    }
+
+    payload->response.request = *request;
+    payload->response.status = UI_LOG_REC_QUERY_STATUS_FAILED;
+    lv_async_call(deliver_log_query_result_async, payload);
+}
+
+static evt_type_t alarm_rec_type_to_evt_type(ui_alarm_rec_type_t type)
+{
+    switch (type) {
+        case UI_ALARM_REC_OFFLINE:
+            return EVT_TYPE_OFFLINE;
+        case UI_ALARM_REC_POWERON:
+            return EVT_TYPE_POWERON;
+        case UI_ALARM_REC_HISTORY_ALARM:
+            return EVT_TYPE_ALARM;
+        default:
+            return EVT_TYPE_MAX;
+    }
+}
+
+static evt_type_t log_rec_type_to_evt_type(ui_log_rec_type_t type)
+{
+    switch (type) {
+        case UI_LOG_REC_CONTROL:
+            return EVT_TYPE_CONTROL;
+        case UI_LOG_REC_OPERATION:
+            return EVT_TYPE_OPERATION;
+        default:
+            return EVT_TYPE_MAX;
+    }
+}
+
+static void populate_alarm_result_paging(uint16_t requested_page,
+                                         size_t total_count,
+                                         uint16_t *out_page,
+                                         uint16_t *out_total_pages,
+                                         size_t *out_start_index,
+                                         size_t *out_end_index)
+{
+    uint16_t total_pages = (uint16_t)((total_count + UI_ALARM_REC_PAGE_SIZE - 1) / UI_ALARM_REC_PAGE_SIZE);
+    uint16_t page = requested_page;
+
+    if (total_pages == 0) {
+        total_pages = 1;
+    }
+
+    if (page == UINT16_MAX || page >= total_pages) {
+        page = total_pages - 1;
+    }
+
+    *out_page = page;
+    *out_total_pages = total_pages;
+    *out_start_index = (size_t)page * UI_ALARM_REC_PAGE_SIZE;
+    *out_end_index = *out_start_index + UI_ALARM_REC_PAGE_SIZE;
+    if (*out_end_index > total_count) {
+        *out_end_index = total_count;
+    }
+}
+
+static void populate_log_result_paging(uint16_t requested_page,
+                                       size_t total_count,
+                                       uint16_t *out_page,
+                                       uint16_t *out_total_pages,
+                                       size_t *out_start_index,
+                                       size_t *out_end_index)
+{
+    uint16_t total_pages = (uint16_t)((total_count + UI_LOG_REC_PAGE_SIZE - 1) / UI_LOG_REC_PAGE_SIZE);
+    uint16_t page = requested_page;
+
+    if (total_pages == 0) {
+        total_pages = 1;
+    }
+
+    if (page == UINT16_MAX || page >= total_pages) {
+        page = total_pages - 1;
+    }
+
+    *out_page = page;
+    *out_total_pages = total_pages;
+    *out_start_index = (size_t)page * UI_LOG_REC_PAGE_SIZE;
+    *out_end_index = *out_start_index + UI_LOG_REC_PAGE_SIZE;
+    if (*out_end_index > total_count) {
+        *out_end_index = total_count;
+    }
+}
+
+static void process_alarm_history_query(const ui_alarm_rec_request_t *request)
+{
+    alarm_query_async_result_t *payload;
+    evt_record_t *records = NULL;
+    size_t count = 0;
+    size_t start_index = 0;
+    size_t end_index = 0;
+    uint16_t current_page = 0;
+    uint16_t total_pages = 0;
+    evt_type_t evt_type;
+    esp_err_t ret;
+
+    if (!request) {
+        return;
+    }
+
+    payload = calloc(1, sizeof(*payload));
+    if (!payload) {
+        ESP_LOGW(TAG, "Failed to allocate alarm query payload");
+        return;
+    }
+
+    payload->response.request = *request;
+    payload->response.status = UI_ALARM_REC_QUERY_STATUS_FAILED;
+
+    if (!history_archive_is_available()) {
+        payload->response.status = UI_ALARM_REC_QUERY_STATUS_TF_UNAVAILABLE;
+        lv_async_call(deliver_alarm_query_result_async, payload);
+        return;
+    }
+
+    evt_type = alarm_rec_type_to_evt_type(request->type);
+    if (evt_type == EVT_TYPE_MAX) {
+        lv_async_call(deliver_alarm_query_result_async, payload);
+        return;
+    }
+
+    ret = history_archive_query_basic_records(evt_type, request->start_ts, request->end_ts, &records, &count);
+    if (ret != ESP_OK) {
+        if (ret == ESP_ERR_INVALID_STATE) {
+            payload->response.status = UI_ALARM_REC_QUERY_STATUS_TF_UNAVAILABLE;
+        }
+        lv_async_call(deliver_alarm_query_result_async, payload);
+        return;
+    }
+
+    payload->response.status = UI_ALARM_REC_QUERY_STATUS_OK;
+    payload->response.result.total_matched = (uint16_t)count;
+    populate_alarm_result_paging(request->page, count, &current_page, &total_pages, &start_index, &end_index);
+    payload->response.result.current_page = current_page;
+    payload->response.result.total_pages = total_pages;
+
+    for (size_t i = start_index; i < end_index; i++) {
+        ui_alarm_rec_item_t *dst = &payload->response.result.records[payload->response.result.count++];
+        dst->timestamp = records[i].timestamp;
+        memcpy(dst->desc, records[i].desc, sizeof(dst->desc));
+    }
+
+    history_archive_free_query_result(records);
+    lv_async_call(deliver_alarm_query_result_async, payload);
+}
+
+static void process_log_history_query(const ui_log_rec_request_t *request)
+{
+    log_query_async_result_t *payload;
+    size_t start_index = 0;
+    size_t end_index = 0;
+    uint16_t current_page = 0;
+    uint16_t total_pages = 0;
+    esp_err_t ret;
+
+    if (!request) {
+        return;
+    }
+
+    payload = calloc(1, sizeof(*payload));
+    if (!payload) {
+        ESP_LOGW(TAG, "Failed to allocate log query payload");
+        return;
+    }
+
+    payload->response.request = *request;
+    payload->response.status = UI_LOG_REC_QUERY_STATUS_FAILED;
+
+    if (!history_archive_is_available()) {
+        payload->response.status = UI_LOG_REC_QUERY_STATUS_TF_UNAVAILABLE;
+        lv_async_call(deliver_log_query_result_async, payload);
+        return;
+    }
+
+    if (request->type == UI_LOG_REC_CONTROL || request->type == UI_LOG_REC_OPERATION) {
+        evt_record_t *records = NULL;
+        size_t count = 0;
+        evt_type_t evt_type = log_rec_type_to_evt_type(request->type);
+
+        if (evt_type == EVT_TYPE_MAX) {
+            lv_async_call(deliver_log_query_result_async, payload);
+            return;
+        }
+
+        ret = history_archive_query_basic_records(evt_type, request->start_ts, request->end_ts, &records, &count);
+        if (ret != ESP_OK) {
+            if (ret == ESP_ERR_INVALID_STATE) {
+                payload->response.status = UI_LOG_REC_QUERY_STATUS_TF_UNAVAILABLE;
+            }
+            lv_async_call(deliver_log_query_result_async, payload);
+            return;
+        }
+
+        payload->response.status = UI_LOG_REC_QUERY_STATUS_OK;
+        payload->response.result.total_matched = (uint16_t)count;
+        populate_log_result_paging(request->page, count, &current_page, &total_pages, &start_index, &end_index);
+        payload->response.result.current_page = current_page;
+        payload->response.result.total_pages = total_pages;
+
+        for (size_t i = start_index; i < end_index; i++) {
+            ui_log_rec_item_t *dst = &payload->response.result.records[payload->response.result.count++];
+            dst->timestamp = records[i].timestamp;
+            memcpy(dst->desc, records[i].desc, sizeof(dst->desc));
+        }
+
+        history_archive_free_query_result(records);
+        lv_async_call(deliver_log_query_result_async, payload);
+        return;
+    }
+
+    if (request->type == UI_LOG_REC_MANUAL) {
+        evt_manual_record_t *records = NULL;
+        size_t count = 0;
+
+        ret = history_archive_query_manual_records(request->start_ts,
+                                                   request->end_ts,
+                                                   (evt_status_filter_t)request->status_filter,
+                                                   &records,
+                                                   &count);
+        if (ret != ESP_OK) {
+            if (ret == ESP_ERR_INVALID_STATE) {
+                payload->response.status = UI_LOG_REC_QUERY_STATUS_TF_UNAVAILABLE;
+            }
+            lv_async_call(deliver_log_query_result_async, payload);
+            return;
+        }
+
+        payload->response.status = UI_LOG_REC_QUERY_STATUS_OK;
+        payload->response.result.total_matched = (uint16_t)count;
+        populate_log_result_paging(request->page, count, &current_page, &total_pages, &start_index, &end_index);
+        payload->response.result.current_page = current_page;
+        payload->response.result.total_pages = total_pages;
+
+        for (size_t i = start_index; i < end_index; i++) {
+            ui_log_rec_item_t *dst = &payload->response.result.records[payload->response.result.count++];
+            dst->timestamp = records[i].start_ts;
+            dst->planned_minutes = records[i].planned_minutes;
+            dst->actual_minutes = records[i].actual_minutes;
+            memcpy(dst->status, records[i].status, sizeof(dst->status));
+            memcpy(dst->detail, records[i].detail, sizeof(dst->detail));
+        }
+
+        history_archive_free_query_result(records);
+        lv_async_call(deliver_log_query_result_async, payload);
+        return;
+    }
+
+    if (request->type == UI_LOG_REC_PROGRAM) {
+        evt_program_record_t *records = NULL;
+        size_t count = 0;
+
+        ret = history_archive_query_program_records(request->start_ts,
+                                                    request->end_ts,
+                                                    (evt_status_filter_t)request->status_filter,
+                                                    &records,
+                                                    &count);
+        if (ret != ESP_OK) {
+            if (ret == ESP_ERR_INVALID_STATE) {
+                payload->response.status = UI_LOG_REC_QUERY_STATUS_TF_UNAVAILABLE;
+            }
+            lv_async_call(deliver_log_query_result_async, payload);
+            return;
+        }
+
+        payload->response.status = UI_LOG_REC_QUERY_STATUS_OK;
+        payload->response.result.total_matched = (uint16_t)count;
+        populate_log_result_paging(request->page, count, &current_page, &total_pages, &start_index, &end_index);
+        payload->response.result.current_page = current_page;
+        payload->response.result.total_pages = total_pages;
+
+        for (size_t i = start_index; i < end_index; i++) {
+            ui_log_rec_item_t *dst = &payload->response.result.records[payload->response.result.count++];
+            dst->timestamp = records[i].start_ts;
+            dst->planned_minutes = records[i].planned_minutes;
+            dst->actual_minutes = records[i].actual_minutes;
+            memcpy(dst->program_name, records[i].program_name, sizeof(dst->program_name));
+            memcpy(dst->trigger, records[i].trigger, sizeof(dst->trigger));
+            memcpy(dst->status, records[i].status, sizeof(dst->status));
+            memcpy(dst->detail, records[i].detail, sizeof(dst->detail));
+        }
+
+        history_archive_free_query_result(records);
+        lv_async_call(deliver_log_query_result_async, payload);
+        return;
+    }
+
+    lv_async_call(deliver_log_query_result_async, payload);
+}
+
+static void history_query_task(void *arg)
+{
+    history_query_msg_t msg;
+
+    (void)arg;
+
+    while (xQueueReceive(s_history_query_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        if (msg.kind == HISTORY_QUERY_KIND_ALARM) {
+            process_alarm_history_query(&msg.request.alarm);
+        } else {
+            process_log_history_query(&msg.request.log);
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void on_submit_alarm_record_query(const ui_alarm_rec_request_t *request)
+{
+    history_query_msg_t msg = {0};
+
+    if (!request) {
+        return;
+    }
+
+    if (!s_history_query_queue) {
+        ESP_LOGW(TAG, "History query queue unavailable, failing alarm request %lu", (unsigned long)request->request_id);
+        submit_alarm_query_failure_async(request);
+        return;
+    }
+
+    msg.kind = HISTORY_QUERY_KIND_ALARM;
+    msg.request.alarm = *request;
+    if (xQueueSend(s_history_query_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "History query queue full, failing alarm request %lu", (unsigned long)request->request_id);
+        submit_alarm_query_failure_async(request);
+    }
+}
+
+static void on_submit_log_record_query(const ui_log_rec_request_t *request)
+{
+    history_query_msg_t msg = {0};
+
+    if (!request) {
+        return;
+    }
+
+    if (!s_history_query_queue) {
+        ESP_LOGW(TAG, "History query queue unavailable, failing log request %lu", (unsigned long)request->request_id);
+        submit_log_query_failure_async(request);
+        return;
+    }
+
+    msg.kind = HISTORY_QUERY_KIND_LOG;
+    msg.request.log = *request;
+    if (xQueueSend(s_history_query_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "History query queue full, failing log request %lu", (unsigned long)request->request_id);
+        submit_log_query_failure_async(request);
+    }
+}
+
+static void operation_log_task(void *arg)
+{
+    operation_log_msg_t msg;
+
+    (void)arg;
+
+    while (xQueueReceive(s_operation_log_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        persist_basic_event_now(EVT_TYPE_OPERATION, msg.desc);
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void enqueue_operation_log(const char *desc)
+{
+    operation_log_msg_t msg = {0};
+
+    if (!desc || !desc[0]) {
+        return;
+    }
+
+    if (!s_operation_log_queue) {
+        ESP_LOGW(TAG, "Operation log queue unavailable, dropping: %s", desc);
+        return;
+    }
+
+    snprintf(msg.desc, sizeof(msg.desc), "%s", desc);
+    if (xQueueSend(s_operation_log_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Operation log queue full, dropping: %s", msg.desc);
+    }
+}
+
 static void fix_event_timestamps_task(void *arg)
 {
     (void)arg;
@@ -106,6 +654,7 @@ static void fix_event_timestamps_task(void *arg)
 
     esp_err_t ret = event_recorder_fix_timestamps();
     if (ret == ESP_OK) {
+        sync_archive_from_nvs_snapshots();
         s_event_fix_completed = true;
         lv_async_call(refresh_alarm_records_async, NULL);
         lv_async_call(refresh_log_records_async, NULL);
@@ -125,7 +674,7 @@ static void schedule_event_timestamp_fix(void)
 
     BaseType_t ok = xTaskCreate(fix_event_timestamps_task,
                                 "evt_ts_fix",
-                                4096,
+                                6144,
                                 NULL,
                                 4,
                                 NULL);
@@ -240,7 +789,7 @@ static void on_wifi_conn_status(wifi_mgr_conn_status_t status, const char *ssid,
         if (msg->ssid[0] != '\0') {
             char desc[64];
             snprintf(desc, sizeof(desc), "WiFi连接: %s", msg->ssid);
-            event_recorder_add_operation(desc);
+            persist_basic_event_now(EVT_TYPE_OPERATION, desc);
         }
     } else if (status == WIFI_MGR_CONNECT_FAILED) {
         ESP_LOGW(TAG, "WiFi connect failed: %s", msg->ssid);
@@ -251,7 +800,7 @@ static void on_wifi_conn_status(wifi_mgr_conn_status_t status, const char *ssid,
         /* Record disconnect event */
         char desc[64];
         snprintf(desc, sizeof(desc), "WiFi断开: %s", msg->ssid);
-        event_recorder_add_offline(desc);
+        persist_basic_event_now(EVT_TYPE_OFFLINE, desc);
     }
 
     lv_async_call(update_ui_conn_status, msg);
@@ -274,7 +823,7 @@ static void request_wifi_connect(const char *ssid, const char *password)
     } else {
         char desc[64];
         snprintf(desc, sizeof(desc), "WiFi操作: 连接 %.24s", ssid ? ssid : "");
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
 }
 
@@ -285,7 +834,7 @@ static void request_wifi_disconnect(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi disconnect failed: %s", esp_err_to_name(ret));
     } else {
-        event_recorder_add_operation("WiFi操作: 主动断开连接");
+        persist_basic_event_now(EVT_TYPE_OPERATION, "WiFi操作: 主动断开连接");
     }
 }
 
@@ -298,7 +847,7 @@ static void request_wifi_connect_saved(const char *ssid)
     } else {
         char desc[64];
         snprintf(desc, sizeof(desc), "WiFi操作: 连接已保存网络 %.20s", ssid ? ssid : "");
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
 }
 
@@ -315,7 +864,7 @@ static void on_save_brightness(int percent)
 
     char desc[64];
     snprintf(desc, sizeof(desc), "显示设置: 亮度 %d%%", percent);
-    event_recorder_add_operation(desc);
+    persist_basic_event_now(EVT_TYPE_OPERATION, desc);
 }
 
 static void on_timeout_change(int index)
@@ -324,7 +873,7 @@ static void on_timeout_change(int index)
 
     char desc[64];
     snprintf(desc, sizeof(desc), "显示设置: 熄屏时间索引 %d", index);
-    event_recorder_add_operation(desc);
+    persist_basic_event_now(EVT_TYPE_OPERATION, desc);
 }
 
 /* ---- Network settings bridge callbacks ---- */
@@ -342,7 +891,7 @@ static ui_net_result_t on_apply_static_ip(const char *ip, const char *mask,
     if (ret == ESP_OK) {
         char desc[64];
         snprintf(desc, sizeof(desc), "网络设置: 应用静态IP %s/%s", ip, mask);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK) ? UI_NET_RESULT_OK : UI_NET_RESULT_FAIL;
 }
@@ -352,7 +901,7 @@ static ui_net_result_t on_restore_dhcp(void)
     ESP_LOGI(TAG, "DHCP restore requested");
     esp_err_t ret = wifi_manager_restore_dhcp();
     if (ret == ESP_OK) {
-        event_recorder_add_operation("网络设置: 恢复DHCP");
+        persist_basic_event_now(EVT_TYPE_OPERATION, "网络设置: 恢复DHCP");
     }
     return (ret == ESP_OK) ? UI_NET_RESULT_OK : UI_NET_RESULT_FAIL;
 }
@@ -412,47 +961,87 @@ static void on_get_network_info(char *buf, int buf_size)
     (void)pos;
 }
 
-/* ---- Event records bridge callback ---- */
-
-static void on_query_records(ui_alarm_rec_type_t type, int64_t start_ts,
-    int64_t end_ts, uint16_t page, ui_alarm_rec_result_t *result)
+static void clear_legacy_event_storage_if_safe(void)
 {
-    static evt_query_result_t r;
-    evt_type_t evt_type;
-
-    if (!result) {
+    if (!history_archive_is_available()) {
+        return;
+    }
+    if (!s_event_fix_completed && !s_time_synced) {
         return;
     }
 
-    memset(result, 0, sizeof(*result));
-
-    switch (type) {
-        case UI_ALARM_REC_OFFLINE:
-            evt_type = EVT_TYPE_OFFLINE;
-            break;
-        case UI_ALARM_REC_POWERON:
-            evt_type = EVT_TYPE_POWERON;
-            break;
-        case UI_ALARM_REC_HISTORY_ALARM:
-            evt_type = EVT_TYPE_ALARM;
-            break;
-        default:
-            return;
-    }
-
-    if (event_recorder_query(evt_type, start_ts, end_ts, page, &r) != ESP_OK) {
-        return;
-    }
-
-    result->count = r.count;
-    result->total_matched = r.total_matched;
-    result->total_pages = r.total_pages;
-    result->current_page = r.current_page;
-    for (int i = 0; i < r.count; i++) {
-        result->records[i].timestamp = r.records[i].timestamp;
-        memcpy(result->records[i].desc, r.records[i].desc, sizeof(result->records[i].desc));
+    esp_err_t ret = event_recorder_clear_legacy_storage();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Failed to clear legacy event NVS: %s", esp_err_to_name(ret));
     }
 }
+
+static void sync_archive_from_nvs_snapshots(void)
+{
+    static const evt_type_t basic_types[] = {
+        EVT_TYPE_OFFLINE,
+        EVT_TYPE_POWERON,
+        EVT_TYPE_CONTROL,
+        EVT_TYPE_OPERATION,
+        EVT_TYPE_ALARM,
+    };
+    evt_record_t *basic_records = calloc(EVT_RECORD_MAX, sizeof(evt_record_t));
+    evt_manual_record_t *manual_records = calloc(EVT_RECORD_MAX, sizeof(evt_manual_record_t));
+    evt_program_record_t *program_records = calloc(EVT_RECORD_MAX, sizeof(evt_program_record_t));
+    size_t manual_count = 0;
+    size_t program_count = 0;
+    bool sync_ok = true;
+
+    if (!basic_records || !manual_records || !program_records) {
+        ESP_LOGW(TAG, "Failed to allocate snapshot buffers for archive sync");
+        free(basic_records);
+        free(manual_records);
+        free(program_records);
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(basic_types) / sizeof(basic_types[0]); i++) {
+        size_t basic_count = 0;
+        if (event_recorder_get_basic_records_snapshot(basic_types[i], basic_records, EVT_RECORD_MAX, &basic_count) == ESP_OK &&
+            basic_count > 0) {
+            esp_err_t ret = history_archive_sync_basic_records(basic_types[i], basic_records, basic_count);
+            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+                sync_ok = false;
+                ESP_LOGW(TAG, "Failed to sync basic archive type %d after timestamp fix: %s",
+                         (int)basic_types[i],
+                         esp_err_to_name(ret));
+            }
+        }
+    }
+
+    if (event_recorder_get_manual_records_snapshot(manual_records, EVT_RECORD_MAX, &manual_count) == ESP_OK &&
+        manual_count > 0) {
+        esp_err_t ret = history_archive_sync_manual_records(manual_records, manual_count);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            sync_ok = false;
+            ESP_LOGW(TAG, "Failed to sync manual archive after timestamp fix: %s", esp_err_to_name(ret));
+        }
+    }
+
+    if (event_recorder_get_program_records_snapshot(program_records, EVT_RECORD_MAX, &program_count) == ESP_OK &&
+        program_count > 0) {
+        esp_err_t ret = history_archive_sync_program_records(program_records, program_count);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            sync_ok = false;
+            ESP_LOGW(TAG, "Failed to sync program archive after timestamp fix: %s", esp_err_to_name(ret));
+        }
+    }
+
+    free(basic_records);
+    free(manual_records);
+    free(program_records);
+
+    if (sync_ok) {
+        clear_legacy_event_storage_if_safe();
+    }
+}
+
+/* ---- Event records bridge callback ---- */
 
 static esp_err_t on_query_current_alarms(ui_alarm_current_item_t *items,
     size_t max_items, size_t *out_count)
@@ -532,75 +1121,6 @@ static esp_err_t on_save_alarm_settings(const ui_alarm_settings_t *settings)
     return alarm_manager_save_settings(&backend_settings);
 }
 
-static void on_query_log_records(ui_log_rec_type_t type, int64_t start_ts,
-    int64_t end_ts, uint16_t page, ui_log_rec_status_filter_t status_filter,
-    ui_log_rec_result_t *result)
-{
-    static evt_query_result_t basic_result;
-    static evt_manual_query_result_t manual_result;
-    static evt_program_query_result_t program_result;
-    evt_type_t evt_type;
-
-    memset(result, 0, sizeof(*result));
-
-    if (type == UI_LOG_REC_CONTROL || type == UI_LOG_REC_OPERATION) {
-        evt_type = (type == UI_LOG_REC_CONTROL) ? EVT_TYPE_CONTROL : EVT_TYPE_OPERATION;
-        event_recorder_query(evt_type, start_ts, end_ts, page, &basic_result);
-
-        result->count = basic_result.count;
-        result->total_matched = basic_result.total_matched;
-        result->total_pages = basic_result.total_pages;
-        result->current_page = basic_result.current_page;
-        for (int i = 0; i < basic_result.count; i++) {
-            result->records[i].timestamp = basic_result.records[i].timestamp;
-            memcpy(result->records[i].desc, basic_result.records[i].desc,
-                   sizeof(basic_result.records[i].desc));
-        }
-        return;
-    }
-
-    if (type == UI_LOG_REC_MANUAL) {
-        event_recorder_query_manual_records(start_ts, end_ts,
-            (evt_status_filter_t)status_filter, page, &manual_result);
-
-        result->count = manual_result.count;
-        result->total_matched = manual_result.total_matched;
-        result->total_pages = manual_result.total_pages;
-        result->current_page = manual_result.current_page;
-        for (int i = 0; i < manual_result.count; i++) {
-            result->records[i].timestamp = manual_result.records[i].start_ts;
-            result->records[i].planned_minutes = manual_result.records[i].planned_minutes;
-            result->records[i].actual_minutes = manual_result.records[i].actual_minutes;
-            memcpy(result->records[i].status, manual_result.records[i].status,
-                   sizeof(manual_result.records[i].status));
-            memcpy(result->records[i].detail, manual_result.records[i].detail,
-                   sizeof(manual_result.records[i].detail));
-        }
-        return;
-    }
-
-    event_recorder_query_program_records(start_ts, end_ts,
-        (evt_status_filter_t)status_filter, page, &program_result);
-
-    result->count = program_result.count;
-    result->total_matched = program_result.total_matched;
-    result->total_pages = program_result.total_pages;
-    result->current_page = program_result.current_page;
-    for (int i = 0; i < program_result.count; i++) {
-        result->records[i].timestamp = program_result.records[i].start_ts;
-        result->records[i].planned_minutes = program_result.records[i].planned_minutes;
-        result->records[i].actual_minutes = program_result.records[i].actual_minutes;
-        memcpy(result->records[i].program_name, program_result.records[i].program_name,
-               sizeof(program_result.records[i].program_name));
-        memcpy(result->records[i].trigger, program_result.records[i].trigger,
-               sizeof(program_result.records[i].trigger));
-        memcpy(result->records[i].status, program_result.records[i].status,
-               sizeof(program_result.records[i].status));
-        memcpy(result->records[i].detail, program_result.records[i].detail,
-               sizeof(program_result.records[i].detail));
-    }
-}
-
 /* ---- WiFi background init task ---- */
 
 static void wifi_init_task(void *pvParameters)
@@ -617,6 +1137,21 @@ static void wifi_init_task(void *pvParameters)
 
     /* Register connection status callback (needs event loop from wifi_manager_init) */
     wifi_manager_register_conn_cb(on_wifi_conn_status, NULL);
+
+    conn_status_msg_t *msg = malloc(sizeof(conn_status_msg_t));
+    if (msg) {
+        msg->status = wifi_manager_is_connected() ? WIFI_MGR_CONNECTED : WIFI_MGR_DISCONNECTED;
+        snprintf(msg->ssid, sizeof(msg->ssid), "%s",
+                 wifi_manager_is_connected() ? wifi_manager_get_connected_ssid() : "");
+        lv_async_call(update_ui_conn_status, msg);
+    } else {
+        ESP_LOGW(TAG, "Failed to allocate initial WiFi status message");
+    }
+
+    ret = wifi_manager_start_auto_connect();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi auto-connect task start failed: %s", esp_err_to_name(ret));
+    }
 
     vTaskDelete(NULL);
 }
@@ -930,7 +1465,7 @@ static void on_device_control(uint32_t point_id, bool on)
     char desc[64];
     snprintf(desc, sizeof(desc), "设备控制: point=%lu -> %s",
              (unsigned long)point_id, on ? "开启" : "关闭");
-    event_recorder_add_control(desc);
+    persist_basic_event_now(EVT_TYPE_CONTROL, desc);
 }
 
 
@@ -1029,7 +1564,7 @@ static bool on_device_add(const ui_device_add_params_t *params)
     } else {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 新增设备 id=%u", (unsigned)params->id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
 }
@@ -1049,7 +1584,7 @@ static bool on_valve_add(const ui_valve_add_params_t *params)
         snprintf(desc, sizeof(desc), "设置: 新增阀门 dev=%u ch=%u",
                  (unsigned)params->parent_device_id,
                  (unsigned)params->channel);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
 }
@@ -1072,7 +1607,7 @@ static bool on_sensor_add(const ui_sensor_add_params_t *params)
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 新增传感器 point=%lu",
                  (unsigned long)params->point_id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
 }
@@ -1083,7 +1618,7 @@ static bool on_device_delete(uint16_t device_id)
     if (ret == ESP_OK) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 删除设备 id=%u", (unsigned)device_id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
 }
@@ -1094,7 +1629,7 @@ static bool on_valve_delete(uint16_t valve_id)
     if (ret == ESP_OK) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 删除阀门 id=%u", (unsigned)valve_id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
 }
@@ -1105,7 +1640,7 @@ static bool on_sensor_delete(uint32_t point_id)
     if (ret == ESP_OK) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 删除传感器 point=%lu", (unsigned long)point_id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
 }
@@ -1120,7 +1655,7 @@ static bool on_device_edit(uint16_t id, const ui_device_edit_params_t *params)
     if (ok) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 编辑设备 id=%u", (unsigned)id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
 }
@@ -1136,7 +1671,7 @@ static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
     if (ok) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 编辑阀门 id=%u", (unsigned)id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
 }
@@ -1150,7 +1685,7 @@ static bool on_sensor_edit(uint32_t point_id, const ui_sensor_edit_params_t *par
     if (ok) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 编辑传感器 point=%lu", (unsigned long)point_id);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
 }
@@ -1300,7 +1835,7 @@ static bool on_zone_add(const ui_zone_add_params_t *params)
     if (ok) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 新增灌区 %.20s", params->name);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
 }
@@ -1311,7 +1846,7 @@ static bool on_zone_delete(int slot_index)
     if (ok) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 删除灌区 slot=%d", slot_index);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
 }
@@ -1328,7 +1863,7 @@ static bool on_zone_edit(int slot_index, const ui_zone_add_params_t *params)
     if (ok) {
         char desc[64];
         snprintf(desc, sizeof(desc), "设置: 编辑灌区 slot=%d", slot_index);
-        event_recorder_add_operation(desc);
+        persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
 }
@@ -1446,7 +1981,7 @@ static bool on_home_auto_mode_set(bool enabled)
 {
     bool ok = irrigation_scheduler_set_auto_enabled(enabled);
     if (ok) {
-        event_recorder_add_operation(enabled ? "首页操作: 开启自动模式" : "首页操作: 关闭自动模式");
+        enqueue_operation_log(enabled ? "首页操作: 启用自动模式" : "首页操作: 禁用自动模式");
     }
     return ok;
 }
@@ -1461,8 +1996,8 @@ static bool on_home_program_start(int index)
     bool ok = irrigation_scheduler_start_program(index);
     if (ok) {
         char desc[64];
-        snprintf(desc, sizeof(desc), "首页操作: 启动程序 #%d", index + 1);
-        event_recorder_add_operation(desc);
+        snprintf(desc, sizeof(desc), "首页操作: 手动运行程序 #%d", index + 1);
+        enqueue_operation_log(desc);
     }
     return ok;
 }
@@ -1483,8 +2018,8 @@ static bool on_home_manual_irrigation_start(const ui_manual_irrigation_request_t
     bool ok = irrigation_scheduler_start_manual_irrigation(&backend_req);
     if (ok) {
         char desc[64];
-        snprintf(desc, sizeof(desc), "首页操作: 启动手动灌溉 %.20s", req->formula);
-        event_recorder_add_operation(desc);
+        snprintf(desc, sizeof(desc), "首页操作: 手动灌溉 %u分钟", (unsigned)req->total_duration);
+        enqueue_operation_log(desc);
     }
     return ok;
 }
@@ -1499,152 +2034,39 @@ static bool on_home_irrigation_status_get(ui_irrigation_runtime_status_t *out)
     return true;
 }
 
-void app_main(void)
+static void register_ui_callbacks(void)
 {
-    ESP_LOGI(TAG, "Starting Smart Irrigation System");
-
-    /* Configure display: rotate to landscape 1280x800 */
-    bsp_display_cfg_t cfg = {
-        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
-        .rotation = ESP_LV_ADAPTER_ROTATE_90,
-        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
-        .touch_flags = {
-            .swap_xy = 1,
-            .mirror_x = 1,
-            .mirror_y = 0,
-        },
-    };
-    cfg.lv_adapter_cfg.task_stack_size = 16 * 1024; /* 16KB，默认 8KB 不够 */
-
-    /* Initialize BSP display + touch + LVGL task */
-    lv_display_t *disp = bsp_display_start_with_config(&cfg);
-    if (disp == NULL) {
-        ESP_LOGE(TAG, "Display init failed!");
-        return;
-    }
-    /* Turn on backlight immediately to avoid black flash before display_manager loads NVS */
-    bsp_display_brightness_set(80);
-
-    /* Initialize NVS early — needed by display_manager, event_recorder, and wifi_manager */
-    esp_err_t nvs_ret = nvs_flash_init();
-    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_ret = nvs_flash_init();
-    }
-
-    /* Initialize display manager (NVS settings, GPIO35 wake, auto-off monitor) */
-    esp_err_t dm_ret = display_manager_init();
-    if (dm_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Display manager init failed: %s", esp_err_to_name(dm_ret));
-        bsp_display_backlight_on();  /* Fallback: turn on backlight manually */
-    }
-
-    /* Initialize event recorder (NVS-based) */
-    esp_err_t er_ret = event_recorder_init();
-    if (er_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Event recorder init failed: %s", esp_err_to_name(er_ret));
-    } else {
-        event_recorder_add_poweron("上电");
-        event_recorder_add_operation("系统启动");
-    }
-
-    esp_err_t alarm_ret = alarm_manager_init();
-    if (alarm_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Alarm manager init failed: %s", esp_err_to_name(alarm_ret));
-    }
-
-    /* Register display settings callbacks */
     ui_display_register_preview_brightness_cb(on_preview_brightness);
     ui_display_register_save_brightness_cb(on_save_brightness);
     ui_display_register_timeout_cb(on_timeout_change);
 
-    /* Initialize device registry (NVS-based, before UI init) */
-    esp_err_t dr_ret = device_registry_init();
-    if (dr_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Device registry init failed: %s", esp_err_to_name(dr_ret));
-    }
-
-    /* Initialize irrigation scheduler after NVS init */
-    esp_err_t irr_ret = irrigation_scheduler_init();
-    if (irr_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Irrigation scheduler init failed: %s", esp_err_to_name(irr_ret));
-    }
-    irrigation_scheduler_set_time_valid(s_time_synced);
-
-    /* Load programs & formulas from NVS (before UI init so lists are populated) */
-    ui_program_store_init();
-
-    /* Initialize UI first (before WiFi, so screen shows immediately) */
-    bsp_display_lock(-1);
-
-    ui_init();
-
-    /* Set display settings initial values from NVS */
-    ui_display_set_initial_values(
-        display_manager_get_brightness(),
-        display_manager_get_timeout_index()
-    );
-
-    /* Restore static IP UI state from NVS (so settings page shows correct mode after reboot) */
-    {
-        nvs_handle_t h;
-        if (nvs_open("wifi_ip", NVS_READONLY, &h) == ESP_OK) {
-            uint8_t mode = 0;
-            nvs_get_u8(h, "mode", &mode);
-            if (mode == 1) {
-                char ip[20] = {0}, cidr[4] = {0}, gw[20] = {0}, dns[20] = {0};
-                size_t len;
-                len = sizeof(ip);   nvs_get_str(h, "ip", ip, &len);
-                len = sizeof(cidr); nvs_get_str(h, "cidr", cidr, &len);
-                len = sizeof(gw);   nvs_get_str(h, "gw", gw, &len);
-                len = sizeof(dns);  nvs_get_str(h, "dns", dns, &len);
-                ui_network_set_initial_ip_mode(1, ip, cidr, gw, dns);
-            }
-            nvs_close(h);
-        }
-    }
-
-    bsp_display_unlock();
-
-    /* Register home irrigation callbacks */
     ui_home_register_auto_mode_set_cb(on_home_auto_mode_set);
     ui_home_register_auto_mode_get_cb(on_home_auto_mode_get);
     ui_home_register_program_start_cb(on_home_program_start);
     ui_home_register_manual_irrigation_start_cb(on_home_manual_irrigation_start);
     ui_home_register_irrigation_status_get_cb(on_home_irrigation_status_get);
     ui_home_register_runtime_refresh_cb(refresh_all_zb_ui);
-    ui_home_register_zone_query_cbs(
-        on_get_zone_count,
-        on_get_zone_list,
-        on_get_zone_detail
-    );
+    ui_home_register_zone_query_cbs(on_get_zone_count, on_get_zone_list, on_get_zone_detail);
     ui_home_register_zone_field_resolve_cb(on_home_zone_field_resolve);
 
-    /* Register WiFi callbacks for UI (just function pointers, safe before WiFi init) */
     ui_wifi_register_scan_callback(request_wifi_scan);
     ui_wifi_register_connect_callback(request_wifi_connect);
     ui_wifi_register_disconnect_callback(request_wifi_disconnect);
     ui_wifi_register_connect_saved_callback(request_wifi_connect_saved);
 
-    /* Register network settings callbacks */
     ui_network_register_apply_static_ip_cb(on_apply_static_ip);
     ui_network_register_restore_dhcp_cb(on_restore_dhcp);
     ui_network_register_get_info_cb(on_get_network_info);
 
-    /* Register alarm callbacks */
     ui_alarm_register_query_current_cb(on_query_current_alarms);
     ui_alarm_register_clear_current_cb(on_clear_current_alarms);
     ui_alarm_register_load_settings_cb(on_load_alarm_settings);
     ui_alarm_register_save_settings_cb(on_save_alarm_settings);
 
-    /* Register event records query callback */
-    ui_alarm_rec_register_query_cb(on_query_records);
-    ui_log_rec_register_query_cb(on_query_log_records);
+    ui_alarm_rec_register_query_cb(on_submit_alarm_record_query);
+    ui_log_rec_register_query_cb(on_submit_log_record_query);
 
-    /* Register device control callback (UI → zigbee_bridge) */
     ui_device_register_control_cb(on_device_control);
-
     ui_device_register_query_cbs(
         on_get_valve_count,
         on_get_valve_list,
@@ -1655,10 +2077,7 @@ void app_main(void)
         on_get_zone_detail
     );
 
-    /* Register sensor search callback */
     ui_settings_register_search_sensor_cb(on_search_sensor);
-
-    /* Register device registry callbacks (UI → device_registry) */
     ui_settings_register_device_add_cb(on_device_add);
     ui_settings_register_valve_add_cb(on_valve_add);
     ui_settings_register_sensor_add_cb(on_sensor_add);
@@ -1681,19 +2100,16 @@ void app_main(void)
         on_next_sensor_point_no,
         on_parse_device_id
     );
-
-    /* Register duplicate-check callbacks */
     ui_settings_register_device_name_check_cb(on_device_name_taken);
     ui_settings_register_device_id_check_cb(on_device_id_taken);
     ui_settings_register_valve_name_check_cb(on_valve_name_taken);
     ui_settings_register_sensor_name_check_cb(on_sensor_name_taken);
     ui_settings_register_zone_name_check_cb(on_zone_name_taken);
-
-    /* Register zone callbacks */
     ui_settings_register_zone_add_cb(on_zone_add);
     ui_settings_register_zone_delete_cb(on_zone_delete);
     ui_settings_register_zone_edit_cb(on_zone_edit);
     ui_settings_register_zone_query_cbs(on_get_zone_count, on_get_zone_list, on_get_zone_detail);
+
     ui_program_register_selection_query_cbs(
         on_get_valve_count,
         on_get_valve_list,
@@ -1701,6 +2117,123 @@ void app_main(void)
         on_get_zone_list,
         on_get_zone_detail
     );
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting Smart Irrigation System");
+
+    /* Configure display: rotate to landscape 1280x800 */
+    bsp_display_cfg_t cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_90,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL,
+        .touch_flags = {
+            .swap_xy = 1,
+            .mirror_x = 1,
+            .mirror_y = 0,
+        },
+    };
+    cfg.lv_adapter_cfg.task_stack_size = 16 * 1024; /* 16KB，默认 8KB 不够 */
+
+    /* Initialize BSP display + touch + LVGL task */
+    lv_display_t *disp = bsp_display_start_with_config(&cfg);
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "Display init failed!");
+        return;
+    }
+
+    /* Turn on backlight immediately to avoid black flash before display_manager loads NVS */
+    bsp_display_brightness_set(80);
+
+    bsp_display_lock(-1);
+    ui_startup_show("正在准备系统...", 5);
+    bsp_display_unlock();
+
+    startup_progress_update("正在初始化NVS...", 12);
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_ret = nvs_flash_init();
+    }
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
+    }
+
+    startup_progress_update("正在加载显示配置...", 22);
+    esp_err_t dm_ret = display_manager_init();
+    if (dm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Display manager init failed: %s", esp_err_to_name(dm_ret));
+        bsp_display_backlight_on();  /* Fallback: turn on backlight manually */
+    }
+
+    startup_progress_update("正在加载事件与历史记录...", 34);
+    esp_err_t er_ret = event_recorder_init();
+    if (er_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Event recorder init failed: %s", esp_err_to_name(er_ret));
+    }
+
+    esp_err_t ha_ret = history_archive_init();
+    if (ha_ret != ESP_OK) {
+        ESP_LOGW(TAG, "History archive init failed: %s", esp_err_to_name(ha_ret));
+    }
+
+    if (er_ret == ESP_OK) {
+        persist_basic_event_now(EVT_TYPE_POWERON, "上电");
+        persist_basic_event_now(EVT_TYPE_OPERATION, "系统启动");
+
+        s_operation_log_queue = xQueueCreate(16, sizeof(operation_log_msg_t));
+        if (!s_operation_log_queue) {
+            ESP_LOGW(TAG, "Failed to create operation log queue");
+        } else if (xTaskCreate(operation_log_task, "op_log", 4096, NULL, 1, NULL) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to create operation log task");
+            vQueueDelete(s_operation_log_queue);
+            s_operation_log_queue = NULL;
+        }
+    }
+
+    s_history_query_queue = xQueueCreate(8, sizeof(history_query_msg_t));
+    if (!s_history_query_queue) {
+        ESP_LOGW(TAG, "Failed to create history query queue");
+    } else if (xTaskCreate(history_query_task, "hist_query", 6144, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create history query task");
+        vQueueDelete(s_history_query_queue);
+        s_history_query_queue = NULL;
+    }
+
+    if (er_ret == ESP_OK && ha_ret == ESP_OK) {
+        sync_archive_from_nvs_snapshots();
+        clear_legacy_event_storage_if_safe();
+    }
+
+    startup_progress_update("正在加载报警配置...", 46);
+    esp_err_t alarm_ret = alarm_manager_init();
+    if (alarm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm manager init failed: %s", esp_err_to_name(alarm_ret));
+    }
+
+    startup_progress_update("正在加载设备配置...", 60);
+    esp_err_t dr_ret = device_registry_init();
+    if (dr_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Device registry init failed: %s", esp_err_to_name(dr_ret));
+    }
+
+    startup_progress_update("正在加载灌溉程序...", 74);
+    esp_err_t irr_ret = irrigation_scheduler_init();
+    if (irr_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Irrigation scheduler init failed: %s", esp_err_to_name(irr_ret));
+    }
+    irrigation_scheduler_set_time_valid(s_time_synced);
+
+    ui_program_store_init();
+
+    startup_progress_update("正在准备界面数据...", 84);
+    restore_initial_network_ui_state();
+    register_ui_callbacks();
+
+    startup_progress_update("正在创建主界面...", 94);
+    create_main_ui_with_initial_state();
 
     /* Initialize Zigbee bridge (UART1: TX=GPIO49, RX=GPIO50) */
     esp_err_t zb_ret = zigbee_bridge_init(49, 50);
@@ -1716,6 +2249,11 @@ void app_main(void)
 
     /* Start time update task */
     xTaskCreate(time_update_task, "time_update", 4096, NULL, 3, NULL);
+
+    bsp_display_lock(-1);
+    ui_startup_update("启动完成", 100);
+    ui_startup_close();
+    bsp_display_unlock();
 
     ESP_LOGI(TAG, "Smart Irrigation UI started successfully");
 }

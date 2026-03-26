@@ -474,7 +474,7 @@ static void parallelogram_draw_event_cb(lv_event_t *e)
             lv_draw_triangle_dsc_t tri_dsc;
             lv_draw_triangle_dsc_init(&tri_dsc);
             tri_dsc.color = bg_color;
-            tri_dsc.opa = LV_OPA_90;
+            tri_dsc.opa = LV_OPA_COVER;
 
             tri_dsc.p[0] = p1;
             tri_dsc.p[1] = p2;
@@ -537,7 +537,7 @@ static void parallelogram_draw_event_cb(lv_event_t *e)
             lv_draw_triangle_dsc_t tri_dsc;
             lv_draw_triangle_dsc_init(&tri_dsc);
             tri_dsc.color = bg_color;
-            tri_dsc.opa = LV_OPA_90;
+            tri_dsc.opa = LV_OPA_COVER;
 
             tri_dsc.p[0] = p1;
             tri_dsc.p[1] = p2;

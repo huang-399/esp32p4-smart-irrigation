@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "esp_log.h"
+
+static const char *TAG = "ui_home";
 
 /*********************
  *  STATIC PROTOTYPES
@@ -38,10 +41,18 @@ static void btn_uniform_set_cb(lv_event_t *e);
 static void show_uniform_set_confirm_dialog(void);
 static void uniform_set_confirm_cb(lv_event_t *e);
 static void uniform_set_cancel_cb(lv_event_t *e);
+static void apply_auto_mode_ui_state(bool enabled);
 static void enable_auto_mode(void);
 static void disable_auto_mode(void);
 static void textarea_click_cb(lv_event_t *e);
 static void close_home_dialog(void);
+static void reset_home_dialog_state(void);
+static lv_obj_t *create_home_dialog_overlay(void);
+static lv_obj_t *reuse_home_dialog_overlay(void);
+static void close_home_dialog_async(void *param);
+static void enable_auto_mode_from_dialog_async(void *param);
+static void irrigation_confirm_async(void *param);
+static void program_start_confirm_async(void *param);
 static void refresh_runtime_status_display(void);
 static void format_runtime_status_text(const ui_irrigation_runtime_status_t *status, char *buf, int buf_size);
 static void format_elapsed_text(int elapsed_seconds, char *buf, int buf_size);
@@ -69,6 +80,9 @@ static lv_obj_t *g_manual_input_pre_water = NULL;
 static lv_obj_t *g_manual_input_post_water = NULL;
 static lv_obj_t *g_manual_input_duration = NULL;
 static lv_obj_t *g_manual_dropdown_formula = NULL;
+static lv_obj_t *g_manual_error_label = NULL;
+static ui_manual_irrigation_request_t g_pending_manual_request = {0};
+static int g_pending_program_index = -1;
 static lv_obj_t *g_schedule_card = NULL;   /* 首页计划卡片 */
 static lv_obj_t *g_schedule_rows[4] = {NULL};
 static lv_obj_t *g_schedule_labels[4][6] = {{NULL}};
@@ -158,21 +172,69 @@ static void runtime_status_timer_cb(lv_timer_t *timer)
     refresh_schedule_table_display();
 }
 
-static void close_home_dialog(void)
+static void reset_home_dialog_state(void)
 {
-    if (g_dialog != NULL) {
-        lv_obj_del(g_dialog);
-        g_dialog = NULL;
-    }
     g_manual_input_pre_water = NULL;
     g_manual_input_post_water = NULL;
     g_manual_input_duration = NULL;
     g_manual_dropdown_formula = NULL;
+    g_manual_error_label = NULL;
     g_program_checkbox_count = 0;
-    if (g_runtime_status_timer) {
-        lv_timer_del(g_runtime_status_timer);
-        g_runtime_status_timer = NULL;
+    g_pending_program_index = -1;
+    memset(&g_pending_manual_request, 0, sizeof(g_pending_manual_request));
+}
+
+static void close_home_dialog(void)
+{
+    if (g_dialog != NULL) {
+        lv_obj_delete_async(g_dialog);
+        g_dialog = NULL;
     }
+    reset_home_dialog_state();
+}
+
+static void close_home_dialog_async(void *param)
+{
+    (void)param;
+    close_home_dialog();
+}
+
+static lv_obj_t *reuse_home_dialog_overlay(void)
+{
+    if (g_dialog == NULL) {
+        return create_home_dialog_overlay();
+    }
+
+    lv_obj_clean(g_dialog);
+    reset_home_dialog_state();
+    return g_dialog;
+}
+
+static void enable_auto_mode_from_dialog_async(void *param)
+{
+    (void)param;
+    ESP_LOGI(TAG, "async enable auto mode from dialog");
+    enable_auto_mode();
+    close_home_dialog();
+}
+
+static lv_obj_t *create_home_dialog_overlay(void)
+{
+    ui_main_t *ui_main = ui_get_main();
+    lv_obj_t *parent = (ui_main && ui_main->screen) ? ui_main->screen : lv_scr_act();
+
+    g_dialog = lv_obj_create(parent);
+    lv_obj_remove_style_all(g_dialog);
+    lv_obj_set_size(g_dialog, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_pos(g_dialog, 0, 0);
+    lv_obj_set_style_bg_color(g_dialog, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_dialog, LV_OPA_40, 0);
+    lv_obj_set_style_border_width(g_dialog, 0, 0);
+    lv_obj_set_style_radius(g_dialog, 0, 0);
+    lv_obj_add_flag(g_dialog, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+    return g_dialog;
 }
 
 /* Zigbee 设备状态标签（首页"当前设备状态"区域） */
@@ -491,9 +553,7 @@ void ui_home_create(lv_obj_t *parent)
         g_auto_mode_enabled = g_auto_mode_get_cb();
     }
 
-    if (!g_auto_mode_enabled) {
-        disable_auto_mode();
-    }
+    apply_auto_mode_ui_state(g_auto_mode_enabled);
 
     refresh_selected_field_display();
     refresh_home_device_status_summary();
@@ -595,10 +655,28 @@ static void create_mode_circle(lv_obj_t *parent)
     lv_obj_set_size(g_btn_toggle, 150, 42);
     lv_obj_set_pos(g_btn_toggle, 67, 270);  /* 居中：(284-150)/2 = 67 */
     lv_obj_set_style_bg_color(g_btn_toggle, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(g_btn_toggle, lv_color_white(), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(g_btn_toggle, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(g_btn_toggle, LV_OPA_COVER, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(g_btn_toggle, 2, 0);
+    lv_obj_set_style_border_width(g_btn_toggle, 2, LV_STATE_PRESSED);
     lv_obj_set_style_border_color(g_btn_toggle, COLOR_ERROR, 0);
     lv_obj_set_style_radius(g_btn_toggle, 19, 0);
+    lv_obj_set_style_radius(g_btn_toggle, 19, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(g_btn_toggle, 0, 0);
+    lv_obj_set_style_shadow_width(g_btn_toggle, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_outline_width(g_btn_toggle, 0, 0);
+    lv_obj_set_style_outline_width(g_btn_toggle, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_x(g_btn_toggle, 0, 0);
+    lv_obj_set_style_translate_x(g_btn_toggle, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_y(g_btn_toggle, 0, 0);
+    lv_obj_set_style_translate_y(g_btn_toggle, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_scale(g_btn_toggle, LV_SCALE_NONE, 0);
+    lv_obj_set_style_transform_scale(g_btn_toggle, LV_SCALE_NONE, LV_STATE_PRESSED);
+    lv_obj_set_style_anim_duration(g_btn_toggle, 0, 0);
+    lv_obj_set_style_anim_duration(g_btn_toggle, 0, LV_STATE_PRESSED);
     lv_obj_add_event_cb(g_btn_toggle, btn_disable_auto_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_clear_flag(g_btn_toggle, LV_OBJ_FLAG_SCROLLABLE);
 
     g_btn_label = lv_label_create(g_btn_toggle);
     lv_label_set_text(g_btn_label, "禁用自动化");
@@ -910,14 +988,46 @@ static void btn_disable_auto_cb(lv_event_t *e)
 {
     (void)e;
 
+    ESP_LOGI(TAG, "toggle button clicked, auto_mode=%d", g_auto_mode_enabled);
+
     if (g_auto_mode_enabled) {
-        /* 当前是启用状态，点击后要禁用 - 直接禁用 */
+        /* 禁用路径不涉及弹窗销毁，直接执行以减少点击迟滞 */
         disable_auto_mode();
     }
     else {
         /* 当前是禁用状态，点击后要启用 - 显示确认对话框 */
         show_enable_auto_dialog();
     }
+}
+
+/**
+ * @brief 启用自动模式
+ */
+static void apply_auto_mode_ui_state(bool enabled)
+{
+    g_auto_mode_enabled = enabled;
+
+    if (!g_arc || !g_mode_label || !g_btn_toggle || !g_btn_label) {
+        return;
+    }
+
+    lv_color_t accent_color = enabled ? COLOR_PRIMARY : COLOR_ERROR;
+    lv_color_t btn_color = enabled ? COLOR_ERROR : COLOR_SUCCESS;
+
+    lv_obj_set_style_arc_color(g_arc, accent_color, LV_PART_INDICATOR);
+    for (int i = 0; i < g_tick_count; i++) {
+        if (g_tick_lines[i]) {
+            lv_obj_set_style_line_color(g_tick_lines[i], accent_color, 0);
+        }
+    }
+
+    lv_label_set_text(g_mode_label, enabled ? "自动模式" : "自动模式\n已关闭");
+    lv_obj_set_style_text_color(g_mode_label, accent_color, 0);
+
+    lv_obj_set_style_border_color(g_btn_toggle, btn_color, 0);
+    lv_obj_set_style_border_color(g_btn_toggle, btn_color, LV_STATE_PRESSED);
+    lv_label_set_text(g_btn_label, enabled ? "禁用自动化" : "启用自动化");
+    lv_obj_set_style_text_color(g_btn_label, btn_color, 0);
 }
 
 /**
@@ -930,26 +1040,7 @@ static void enable_auto_mode(void)
         return;
     }
 
-    g_auto_mode_enabled = true;
-
-    /* 圆环变为蓝色 */
-    lv_obj_set_style_arc_color(g_arc, COLOR_PRIMARY, LV_PART_INDICATOR);
-
-    /* 刻度线变为蓝色 */
-    for (int i = 0; i < g_tick_count; i++) {
-        lv_obj_set_style_line_color(g_tick_lines[i], COLOR_PRIMARY, 0);
-    }
-
-    /* 文字变为蓝色 "自动模式" */
-    lv_label_set_text(g_mode_label, "自动模式");
-    lv_obj_set_style_text_color(g_mode_label, COLOR_PRIMARY, 0);
-
-    /* 按钮变为红色边框，白色背景 */
-    lv_obj_set_style_border_color(g_btn_toggle, COLOR_ERROR, 0);
-    lv_obj_set_style_bg_color(g_btn_toggle, lv_color_white(), 0);
-    lv_label_set_text(g_btn_label, "禁用自动化");
-    lv_obj_set_style_text_color(g_btn_label, COLOR_ERROR, 0);
-    lv_obj_center(g_btn_label);
+    apply_auto_mode_ui_state(true);
 }
 
 /**
@@ -962,26 +1053,7 @@ static void disable_auto_mode(void)
         return;
     }
 
-    g_auto_mode_enabled = false;
-
-    /* 圆环变为红色 */
-    lv_obj_set_style_arc_color(g_arc, COLOR_ERROR, LV_PART_INDICATOR);
-
-    /* 刻度线变为红色 */
-    for (int i = 0; i < g_tick_count; i++) {
-        lv_obj_set_style_line_color(g_tick_lines[i], COLOR_ERROR, 0);
-    }
-
-    /* 文字变为红色 "自动模式\n已关闭" */
-    lv_label_set_text(g_mode_label, "自动模式\n已关闭");
-    lv_obj_set_style_text_color(g_mode_label, COLOR_ERROR, 0);
-
-    /* 按钮变为绿色边框，白色背景 */
-    lv_obj_set_style_border_color(g_btn_toggle, COLOR_SUCCESS, 0);
-    lv_obj_set_style_bg_color(g_btn_toggle, lv_color_white(), 0);
-    lv_label_set_text(g_btn_label, "启用自动化");
-    lv_obj_set_style_text_color(g_btn_label, COLOR_SUCCESS, 0);
-    lv_obj_center(g_btn_label);
+    apply_auto_mode_ui_state(false);
 }
 
 /**
@@ -991,18 +1063,20 @@ static void show_enable_auto_dialog(void)
 {
     close_home_dialog();
 
+    lv_obj_t *overlay = create_home_dialog_overlay();
+
     /* 创建外层蓝色背景（直角） */
-    g_dialog = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(g_dialog, 630, 390);
-    lv_obj_center(g_dialog);
-    lv_obj_set_style_bg_color(g_dialog, COLOR_PRIMARY, 0);
-    lv_obj_set_style_border_width(g_dialog, 0, 0);
-    lv_obj_set_style_radius(g_dialog, 0, 0);  /* 直角 */
-    lv_obj_set_style_pad_all(g_dialog, 5, 0);  /* 5px内边距 */
-    lv_obj_clear_flag(g_dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *frame = lv_obj_create(overlay);
+    lv_obj_set_size(frame, 630, 390);
+    lv_obj_center(frame);
+    lv_obj_set_style_bg_color(frame, COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(frame, 0, 0);
+    lv_obj_set_style_radius(frame, 0, 0);  /* 直角 */
+    lv_obj_set_style_pad_all(frame, 5, 0);  /* 5px内边距 */
+    lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 创建内层白色背景（圆角） */
-    lv_obj_t *content = lv_obj_create(g_dialog);
+    lv_obj_t *content = lv_obj_create(frame);
     lv_obj_set_size(content, 620, 380);  /* 减去2×5px边距 */
     lv_obj_center(content);
     lv_obj_set_style_bg_color(content, lv_color_white(), 0);
@@ -1031,9 +1105,27 @@ static void show_enable_auto_dialog(void)
     lv_obj_set_size(btn_cancel, 140, 50);
     lv_obj_set_pos(btn_cancel, 180, 300);
     lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(0x808080), 0);  /* 灰色 */
+    lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(0x808080), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(btn_cancel, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(btn_cancel, LV_OPA_COVER, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(btn_cancel, 0, 0);
+    lv_obj_set_style_border_width(btn_cancel, 0, LV_STATE_PRESSED);
     lv_obj_set_style_radius(btn_cancel, 25, 0);
+    lv_obj_set_style_radius(btn_cancel, 25, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(btn_cancel, 0, 0);
+    lv_obj_set_style_shadow_width(btn_cancel, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_outline_width(btn_cancel, 0, 0);
+    lv_obj_set_style_outline_width(btn_cancel, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_x(btn_cancel, 0, 0);
+    lv_obj_set_style_translate_x(btn_cancel, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_y(btn_cancel, 0, 0);
+    lv_obj_set_style_translate_y(btn_cancel, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_scale(btn_cancel, LV_SCALE_NONE, 0);
+    lv_obj_set_style_transform_scale(btn_cancel, LV_SCALE_NONE, LV_STATE_PRESSED);
+    lv_obj_set_style_anim_duration(btn_cancel, 0, 0);
+    lv_obj_set_style_anim_duration(btn_cancel, 0, LV_STATE_PRESSED);
     lv_obj_add_event_cb(btn_cancel, dialog_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_clear_flag(btn_cancel, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *label_cancel = lv_label_create(btn_cancel);
     lv_label_set_text(label_cancel, "取消");
@@ -1046,9 +1138,27 @@ static void show_enable_auto_dialog(void)
     lv_obj_set_size(btn_confirm, 140, 50);
     lv_obj_set_pos(btn_confirm, 340, 300);
     lv_obj_set_style_bg_color(btn_confirm, COLOR_PRIMARY, 0);  /* 蓝色 */
+    lv_obj_set_style_bg_color(btn_confirm, COLOR_PRIMARY, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(btn_confirm, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(btn_confirm, LV_OPA_COVER, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(btn_confirm, 0, 0);
+    lv_obj_set_style_border_width(btn_confirm, 0, LV_STATE_PRESSED);
     lv_obj_set_style_radius(btn_confirm, 25, 0);
+    lv_obj_set_style_radius(btn_confirm, 25, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(btn_confirm, 0, 0);
+    lv_obj_set_style_shadow_width(btn_confirm, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_outline_width(btn_confirm, 0, 0);
+    lv_obj_set_style_outline_width(btn_confirm, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_x(btn_confirm, 0, 0);
+    lv_obj_set_style_translate_x(btn_confirm, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_y(btn_confirm, 0, 0);
+    lv_obj_set_style_translate_y(btn_confirm, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_scale(btn_confirm, LV_SCALE_NONE, 0);
+    lv_obj_set_style_transform_scale(btn_confirm, LV_SCALE_NONE, LV_STATE_PRESSED);
+    lv_obj_set_style_anim_duration(btn_confirm, 0, 0);
+    lv_obj_set_style_anim_duration(btn_confirm, 0, LV_STATE_PRESSED);
     lv_obj_add_event_cb(btn_confirm, dialog_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_clear_flag(btn_confirm, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *label_confirm = lv_label_create(btn_confirm);
     lv_label_set_text(label_confirm, "确认");
@@ -1064,10 +1174,8 @@ static void dialog_confirm_cb(lv_event_t *e)
 {
     (void)e;
 
-    /* 启用自动模式 */
-    enable_auto_mode();
-
-        close_home_dialog();
+    /* 点击事件结束后再执行状态切换和弹窗关闭，避免整屏瞬时露底 */
+    lv_async_call(enable_auto_mode_from_dialog_async, NULL);
 }
 
 /**
@@ -1077,11 +1185,8 @@ static void dialog_cancel_cb(lv_event_t *e)
 {
     (void)e;
 
-    /* 关闭对话框，不做任何改变 */
-    if (g_dialog != NULL) {
-        lv_obj_del(g_dialog);
-        g_dialog = NULL;
-    }
+    /* 点击事件结束后再关闭弹窗，避免整屏瞬时露底 */
+    lv_async_call(close_home_dialog_async, NULL);
 }
 
 /**
@@ -1091,7 +1196,7 @@ static void dialog_ok_cb(lv_event_t *e)
 {
     (void)e;
 
-        close_home_dialog();
+    lv_async_call(close_home_dialog_async, NULL);
 }
 
 /**
@@ -1101,20 +1206,20 @@ static void dialog_ok_cb(lv_event_t *e)
  */
 static void show_warning_dialog(const char *title, const char *message)
 {
-    close_home_dialog();
+    lv_obj_t *overlay = reuse_home_dialog_overlay();
 
     /* 创建外层蓝色背景（直角） */
-    g_dialog = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(g_dialog, 630, 390);
-    lv_obj_center(g_dialog);
-    lv_obj_set_style_bg_color(g_dialog, COLOR_PRIMARY, 0);
-    lv_obj_set_style_border_width(g_dialog, 0, 0);
-    lv_obj_set_style_radius(g_dialog, 0, 0);  /* 直角 */
-    lv_obj_set_style_pad_all(g_dialog, 5, 0);  /* 5px内边距 */
-    lv_obj_clear_flag(g_dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *frame = lv_obj_create(overlay);
+    lv_obj_set_size(frame, 630, 390);
+    lv_obj_center(frame);
+    lv_obj_set_style_bg_color(frame, COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(frame, 0, 0);
+    lv_obj_set_style_radius(frame, 0, 0);  /* 直角 */
+    lv_obj_set_style_pad_all(frame, 5, 0);  /* 5px内边距 */
+    lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 创建内层白色背景（圆角） */
-    lv_obj_t *content = lv_obj_create(g_dialog);
+    lv_obj_t *content = lv_obj_create(frame);
     lv_obj_set_size(content, 620, 380);  /* 减去2×5px边距 */
     lv_obj_center(content);
     lv_obj_set_style_bg_color(content, lv_color_white(), 0);
@@ -1157,35 +1262,51 @@ static void show_warning_dialog(const char *title, const char *message)
 /**
  * @brief 轮灌确认启动按钮回调
  */
-static void irrigation_confirm_cb(lv_event_t *e)
+static void irrigation_confirm_async(void *param)
 {
-    (void)e;
+    (void)param;
 
-    ui_manual_irrigation_request_t req = {0};
-    if (g_manual_input_pre_water) {
-        req.pre_water = atoi(lv_textarea_get_text(g_manual_input_pre_water));
-    }
-    if (g_manual_input_post_water) {
-        req.post_water = atoi(lv_textarea_get_text(g_manual_input_post_water));
-    }
-    if (g_manual_input_duration) {
-        req.total_duration = atoi(lv_textarea_get_text(g_manual_input_duration));
-    }
-    if (g_manual_dropdown_formula) {
-        lv_dropdown_get_selected_str(g_manual_dropdown_formula, req.formula, sizeof(req.formula));
-    } else {
-        snprintf(req.formula, sizeof(req.formula), "无");
-    }
-
-    if (g_manual_irrigation_start_cb && !g_manual_irrigation_start_cb(&req)) {
-        show_warning_dialog("告警提示", "手动轮灌启动失败，请检查配置后重试！");
+    if (g_manual_irrigation_start_cb && !g_manual_irrigation_start_cb(&g_pending_manual_request)) {
+        if (g_manual_error_label) {
+            lv_label_set_text(g_manual_error_label, "启动失败：当前有程序运行，请稍后再试");
+        }
         return;
     }
 
     refresh_runtime_status_display();
-
     close_home_dialog();
 }
+
+static void irrigation_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+
+    memset(&g_pending_manual_request, 0, sizeof(g_pending_manual_request));
+
+    if (g_manual_error_label) {
+        lv_label_set_text(g_manual_error_label, "");
+    }
+
+    if (g_manual_input_pre_water) {
+        g_pending_manual_request.pre_water = atoi(lv_textarea_get_text(g_manual_input_pre_water));
+    }
+    if (g_manual_input_post_water) {
+        g_pending_manual_request.post_water = atoi(lv_textarea_get_text(g_manual_input_post_water));
+    }
+    if (g_manual_input_duration) {
+        g_pending_manual_request.total_duration = atoi(lv_textarea_get_text(g_manual_input_duration));
+    }
+    if (g_manual_dropdown_formula) {
+        lv_dropdown_get_selected_str(g_manual_dropdown_formula,
+                                     g_pending_manual_request.formula,
+                                     sizeof(g_pending_manual_request.formula));
+    } else {
+        snprintf(g_pending_manual_request.formula, sizeof(g_pending_manual_request.formula), "无");
+    }
+
+    lv_async_call(irrigation_confirm_async, NULL);
+}
+
 
 /**
  * @brief 轮灌取消启动按钮回调
@@ -1200,31 +1321,37 @@ static void irrigation_cancel_cb(lv_event_t *e)
 /**
  * @brief 程序启动确认按钮回调
  */
-static void program_start_confirm_cb(lv_event_t *e)
+static void program_start_confirm_async(void *param)
 {
-    (void)e;
+    (void)param;
 
-    int selected_index = -1;
-    for (int i = 0; i < g_program_checkbox_count; i++) {
-        if (lv_obj_has_state(g_program_checkboxes[i], LV_STATE_CHECKED)) {
-            selected_index = i;
-            break;
-        }
-    }
-
-    if (selected_index < 0) {
+    if (g_pending_program_index < 0) {
         show_warning_dialog("告警提示", "请先选择一个程序！");
         return;
     }
 
-    if (g_program_start_cb && !g_program_start_cb(selected_index)) {
+    if (g_program_start_cb && !g_program_start_cb(g_pending_program_index)) {
         show_warning_dialog("告警提示", "程序启动失败，请稍后重试！");
         return;
     }
 
     refresh_runtime_status_display();
-
     close_home_dialog();
+}
+
+static void program_start_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+
+    g_pending_program_index = -1;
+    for (int i = 0; i < g_program_checkbox_count; i++) {
+        if (lv_obj_has_state(g_program_checkboxes[i], LV_STATE_CHECKED)) {
+            g_pending_program_index = i;
+            break;
+        }
+    }
+
+    lv_async_call(program_start_confirm_async, NULL);
 }
 
 /**
@@ -1242,20 +1369,20 @@ static void program_start_cancel_cb(lv_event_t *e)
  */
 static void show_program_selection_dialog(void)
 {
-    close_home_dialog();
+    lv_obj_t *overlay = reuse_home_dialog_overlay();
 
     /* 创建外层蓝色背景（直角） */
-    g_dialog = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(g_dialog, 1050, 650);
-    lv_obj_center(g_dialog);
-    lv_obj_set_style_bg_color(g_dialog, COLOR_PRIMARY, 0);
-    lv_obj_set_style_border_width(g_dialog, 0, 0);
-    lv_obj_set_style_radius(g_dialog, 0, 0);  /* 直角 */
-    lv_obj_set_style_pad_all(g_dialog, 5, 0);  /* 5px内边距 */
-    lv_obj_clear_flag(g_dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *frame = lv_obj_create(overlay);
+    lv_obj_set_size(frame, 1050, 650);
+    lv_obj_center(frame);
+    lv_obj_set_style_bg_color(frame, COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(frame, 0, 0);
+    lv_obj_set_style_radius(frame, 0, 0);  /* 直角 */
+    lv_obj_set_style_pad_all(frame, 5, 0);  /* 5px内边距 */
+    lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 创建内层白色背景（圆角） */
-    lv_obj_t *content = lv_obj_create(g_dialog);
+    lv_obj_t *content = lv_obj_create(frame);
     lv_obj_set_size(content, 1040, 640);  /* 减去2×5px边距 */
     lv_obj_center(content);
     lv_obj_set_style_bg_color(content, lv_color_white(), 0);
@@ -1401,26 +1528,26 @@ static void show_program_selection_dialog(void)
  */
 static void show_manual_irrigation_dialog(void)
 {
-    close_home_dialog();
+    lv_obj_t *overlay = reuse_home_dialog_overlay();
 
     /* 创建外层蓝色边框 */
-    g_dialog = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(g_dialog, 1000, 630);
-    lv_obj_center(g_dialog);
-    lv_obj_set_style_bg_color(g_dialog, lv_color_white(), 0);
-    lv_obj_set_style_border_width(g_dialog, 3, 0);
-    lv_obj_set_style_border_color(g_dialog, COLOR_PRIMARY, 0);  /* 蓝色边框 */
-    lv_obj_set_style_radius(g_dialog, 0, 0);
-    lv_obj_set_style_pad_all(g_dialog, 20, 0);
-    lv_obj_clear_flag(g_dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *dialog = lv_obj_create(overlay);
+    lv_obj_set_size(dialog, 1000, 630);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, lv_color_white(), 0);
+    lv_obj_set_style_border_width(dialog, 3, 0);
+    lv_obj_set_style_border_color(dialog, COLOR_PRIMARY, 0);  /* 蓝色边框 */
+    lv_obj_set_style_radius(dialog, 0, 0);
+    lv_obj_set_style_pad_all(dialog, 20, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 肥前清水 */
-    lv_obj_t *label_pre_water = lv_label_create(g_dialog);
+    lv_obj_t *label_pre_water = lv_label_create(dialog);
     lv_label_set_text(label_pre_water, "肥前清水(分):");
     lv_obj_set_pos(label_pre_water, 20, 20);
     lv_obj_set_style_text_font(label_pre_water, &my_font_cn_16, 0);
 
-    lv_obj_t *input_pre_water = lv_textarea_create(g_dialog);
+    lv_obj_t *input_pre_water = lv_textarea_create(dialog);
     lv_obj_set_size(input_pre_water, 200, 40);
     lv_obj_set_pos(input_pre_water, 180, 15);
     lv_textarea_set_one_line(input_pre_water, true);
@@ -1430,12 +1557,12 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_add_event_cb(input_pre_water, textarea_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 施肥配方 */
-    lv_obj_t *label_formula = lv_label_create(g_dialog);
+    lv_obj_t *label_formula = lv_label_create(dialog);
     lv_label_set_text(label_formula, "施肥配方:");
     lv_obj_set_pos(label_formula, 450, 20);
     lv_obj_set_style_text_font(label_formula, &my_font_cn_16, 0);
 
-    lv_obj_t *dropdown_formula = lv_dropdown_create(g_dialog);
+    lv_obj_t *dropdown_formula = lv_dropdown_create(dialog);
     lv_obj_set_size(dropdown_formula, 200, 40);
     lv_obj_set_pos(dropdown_formula, 580, 15);
     lv_dropdown_set_options(dropdown_formula, "无");
@@ -1444,7 +1571,7 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_add_event_cb(dropdown_formula, ui_dropdown_list_font_cb, LV_EVENT_READY, NULL);
 
     /* 选择灌区按钮 */
-    lv_obj_t *btn_select_zone = lv_btn_create(g_dialog);
+    lv_obj_t *btn_select_zone = lv_btn_create(dialog);
     lv_obj_set_size(btn_select_zone, 120, 40);
     lv_obj_set_pos(btn_select_zone, 850, 15);
     lv_obj_set_style_bg_color(btn_select_zone, COLOR_PRIMARY, 0);
@@ -1457,12 +1584,12 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_center(label_select_zone);
 
     /* 肥后清水 */
-    lv_obj_t *label_post_water = lv_label_create(g_dialog);
+    lv_obj_t *label_post_water = lv_label_create(dialog);
     lv_label_set_text(label_post_water, "肥后清水(分):");
     lv_obj_set_pos(label_post_water, 20, 70);
     lv_obj_set_style_text_font(label_post_water, &my_font_cn_16, 0);
 
-    lv_obj_t *input_post_water = lv_textarea_create(g_dialog);
+    lv_obj_t *input_post_water = lv_textarea_create(dialog);
     lv_obj_set_size(input_post_water, 200, 40);
     lv_obj_set_pos(input_post_water, 180, 65);
     lv_textarea_set_one_line(input_post_water, true);
@@ -1472,7 +1599,7 @@ static void show_manual_irrigation_dialog(void)
     g_manual_input_post_water = input_post_water;
 
     /* 上移、下移按钮 */
-    lv_obj_t *btn_up = lv_btn_create(g_dialog);
+    lv_obj_t *btn_up = lv_btn_create(dialog);
     lv_obj_set_size(btn_up, 100, 40);
     lv_obj_set_pos(btn_up, 580, 65);
     lv_obj_set_style_bg_color(btn_up, COLOR_PRIMARY, 0);
@@ -1484,7 +1611,7 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_set_style_text_font(label_up, &my_font_cn_16, 0);
     lv_obj_center(label_up);
 
-    lv_obj_t *btn_down = lv_btn_create(g_dialog);
+    lv_obj_t *btn_down = lv_btn_create(dialog);
     lv_obj_set_size(btn_down, 100, 40);
     lv_obj_set_pos(btn_down, 700, 65);
     lv_obj_set_style_bg_color(btn_down, COLOR_PRIMARY, 0);
@@ -1497,7 +1624,7 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_center(label_down);
 
     /* 表格区域 */
-    lv_obj_t *table_bg = lv_obj_create(g_dialog);
+    lv_obj_t *table_bg = lv_obj_create(dialog);
     lv_obj_set_size(table_bg, 960, 370);
     lv_obj_set_pos(table_bg, 20, 120);
     lv_obj_set_style_bg_color(table_bg, lv_color_hex(0xf5f5f5), 0);
@@ -1519,12 +1646,12 @@ static void show_manual_irrigation_dialog(void)
     }
 
     /* 底部运行时长 */
-    lv_obj_t *label_duration = lv_label_create(g_dialog);
+    lv_obj_t *label_duration = lv_label_create(dialog);
     lv_label_set_text(label_duration, "运行时长(分):");
     lv_obj_set_pos(label_duration, 20, 520);
     lv_obj_set_style_text_font(label_duration, &my_font_cn_16, 0);
 
-    lv_obj_t *input_duration = lv_textarea_create(g_dialog);
+    lv_obj_t *input_duration = lv_textarea_create(dialog);
     lv_obj_set_size(input_duration, 150, 40);
     lv_obj_set_pos(input_duration, 180, 515);
     lv_textarea_set_one_line(input_duration, true);
@@ -1534,7 +1661,7 @@ static void show_manual_irrigation_dialog(void)
     g_manual_input_duration = input_duration;
 
     /* 统一设置按钮 */
-    lv_obj_t *btn_set_all = lv_btn_create(g_dialog);
+    lv_obj_t *btn_set_all = lv_btn_create(dialog);
     lv_obj_set_size(btn_set_all, 140, 45);
     lv_obj_set_pos(btn_set_all, 450, 515);
     lv_obj_set_style_bg_color(btn_set_all, COLOR_PRIMARY, 0);
@@ -1547,8 +1674,17 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_set_style_text_font(label_set_all, &my_font_cn_16, 0);
     lv_obj_center(label_set_all);
 
+    g_manual_error_label = lv_label_create(dialog);
+    lv_label_set_text(g_manual_error_label, "");
+    lv_obj_set_size(g_manual_error_label, 520, LV_SIZE_CONTENT);
+    lv_obj_set_pos(g_manual_error_label, 20, 570);
+    lv_obj_set_style_text_font(g_manual_error_label, &my_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_manual_error_label, COLOR_ERROR, 0);
+    lv_obj_set_style_text_align(g_manual_error_label, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(g_manual_error_label, LV_LABEL_LONG_WRAP);
+
     /* 取消启动按钮 */
-    lv_obj_t *btn_cancel = lv_btn_create(g_dialog);
+    lv_obj_t *btn_cancel = lv_btn_create(dialog);
     lv_obj_set_size(btn_cancel, 140, 45);
     lv_obj_set_pos(btn_cancel, 620, 515);
     lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(0x808080), 0);
@@ -1562,7 +1698,7 @@ static void show_manual_irrigation_dialog(void)
     lv_obj_center(label_cancel);
 
     /* 确认启动按钮 */
-    lv_obj_t *btn_confirm = lv_btn_create(g_dialog);
+    lv_obj_t *btn_confirm = lv_btn_create(dialog);
     lv_obj_set_size(btn_confirm, 140, 45);
     lv_obj_set_pos(btn_confirm, 790, 515);
     lv_obj_set_style_bg_color(btn_confirm, COLOR_PRIMARY, 0);
@@ -1642,18 +1778,32 @@ static void show_uniform_set_confirm_dialog(void)
 {
     /* 注意：不删除原对话框，新对话框显示在上层 */
 
-    /* 创建外层蓝色背景（直角） */
-    lv_obj_t *confirm_dialog = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(confirm_dialog, 630, 390);
-    lv_obj_center(confirm_dialog);
-    lv_obj_set_style_bg_color(confirm_dialog, COLOR_PRIMARY, 0);
+    ui_main_t *ui_main = ui_get_main();
+    lv_obj_t *parent = (ui_main && ui_main->screen) ? ui_main->screen : lv_scr_act();
+
+    lv_obj_t *confirm_dialog = lv_obj_create(parent);
+    lv_obj_remove_style_all(confirm_dialog);
+    lv_obj_set_size(confirm_dialog, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_pos(confirm_dialog, 0, 0);
+    lv_obj_set_style_bg_color(confirm_dialog, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(confirm_dialog, LV_OPA_40, 0);
     lv_obj_set_style_border_width(confirm_dialog, 0, 0);
-    lv_obj_set_style_radius(confirm_dialog, 0, 0);  /* 直角 */
-    lv_obj_set_style_pad_all(confirm_dialog, 5, 0);  /* 5px内边距 */
+    lv_obj_set_style_radius(confirm_dialog, 0, 0);
+    lv_obj_add_flag(confirm_dialog, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(confirm_dialog, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 创建外层蓝色背景（直角） */
+    lv_obj_t *frame = lv_obj_create(confirm_dialog);
+    lv_obj_set_size(frame, 630, 390);
+    lv_obj_center(frame);
+    lv_obj_set_style_bg_color(frame, COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(frame, 0, 0);
+    lv_obj_set_style_radius(frame, 0, 0);  /* 直角 */
+    lv_obj_set_style_pad_all(frame, 5, 0);  /* 5px内边距 */
+    lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
+
     /* 创建内层白色背景（圆角） */
-    lv_obj_t *content = lv_obj_create(confirm_dialog);
+    lv_obj_t *content = lv_obj_create(frame);
     lv_obj_set_size(content, 620, 380);  /* 减去2×5px边距 */
     lv_obj_center(content);
     lv_obj_set_style_bg_color(content, lv_color_white(), 0);
@@ -1719,7 +1869,7 @@ static void uniform_set_confirm_cb(lv_event_t *e)
 
     /* 关闭确认对话框 */
     if (confirm_dialog != NULL) {
-        lv_obj_del(confirm_dialog);
+        lv_obj_delete_async(confirm_dialog);
     }
 }
 
@@ -1732,7 +1882,7 @@ static void uniform_set_cancel_cb(lv_event_t *e)
 
     /* 关闭确认对话框 */
     if (confirm_dialog != NULL) {
-        lv_obj_del(confirm_dialog);
+        lv_obj_delete_async(confirm_dialog);
     }
 }
 

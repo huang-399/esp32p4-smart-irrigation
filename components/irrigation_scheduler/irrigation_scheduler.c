@@ -6,9 +6,14 @@
 #include "esp_log.h"
 #include "zigbee_bridge.h"
 #include "event_recorder.h"
+#include "history_archive.h"
+#include "nvs.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#define IRR_RUNTIME_NVS_NS  "irr_runtime"
+#define IRR_NVS_KEY_AUTO_EN "auto_en"
 
 esp_err_t irrigation_store_init(void);
 
@@ -68,6 +73,8 @@ static program_run_ctx_t s_program_run_ctx;
 static bool s_finishing_normally = false;
 
 static void update_elapsed_seconds(void);
+static void load_runtime_settings(void);
+static esp_err_t save_auto_enabled_setting(bool enabled);
 
 static void copy_text(char *dst, size_t dst_size, const char *src)
 {
@@ -169,6 +176,12 @@ static void persist_abnormal_manual_record(int64_t start_ts,
         }
     }
     event_recorder_add_manual_record(&record);
+    if (s_time_valid && record.start_ts > 0) {
+        esp_err_t ret = history_archive_enqueue_manual_record(&record);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to enqueue manual archive record: %s", esp_err_to_name(ret));
+        }
+    }
 }
 
 static void persist_abnormal_program_record(const char *program_name,
@@ -211,6 +224,12 @@ static void persist_abnormal_program_record(const char *program_name,
         }
     }
     event_recorder_add_program_record(&record);
+    if (s_time_valid && record.start_ts > 0) {
+        esp_err_t ret = history_archive_enqueue_program_record(&record);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to enqueue program archive record: %s", esp_err_to_name(ret));
+        }
+    }
 }
 
 static void persist_interrupted_run_if_needed(void)
@@ -274,6 +293,12 @@ static void persist_completed_run(void)
             }
         }
         event_recorder_add_manual_record(&record);
+        if (s_time_valid && record.start_ts > 0) {
+            esp_err_t ret = history_archive_enqueue_manual_record(&record);
+            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "Failed to enqueue manual archive record: %s", esp_err_to_name(ret));
+            }
+        }
         return;
     }
 
@@ -297,6 +322,12 @@ static void persist_completed_run(void)
             }
         }
         event_recorder_add_program_record(&record);
+        if (s_time_valid && record.start_ts > 0) {
+            esp_err_t ret = history_archive_enqueue_program_record(&record);
+            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "Failed to enqueue program archive record: %s", esp_err_to_name(ret));
+            }
+        }
     }
 }
 
@@ -314,6 +345,41 @@ static void update_elapsed_seconds(void)
     }
 
     s_runtime.elapsed_seconds = (int)(now - s_runtime_started_at);
+}
+
+static void load_runtime_settings(void)
+{
+    nvs_handle_t handle;
+    uint8_t auto_enabled = s_runtime.auto_enabled ? 1 : 0;
+
+    if (nvs_open(IRR_RUNTIME_NVS_NS, NVS_READONLY, &handle) != ESP_OK) {
+        ESP_LOGI(TAG, "No saved runtime settings, using defaults");
+        return;
+    }
+
+    if (nvs_get_u8(handle, IRR_NVS_KEY_AUTO_EN, &auto_enabled) == ESP_OK) {
+        s_runtime.auto_enabled = (auto_enabled != 0);
+    }
+
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Loaded runtime settings: auto_enabled=%d", s_runtime.auto_enabled);
+}
+
+static esp_err_t save_auto_enabled_setting(bool enabled)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(IRR_RUNTIME_NVS_NS, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_u8(handle, IRR_NVS_KEY_AUTO_EN, enabled ? 1 : 0);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    return ret;
 }
 
 static bool valve_id_exists(const uint16_t *ids, int count, uint16_t valve_id)
@@ -1049,6 +1115,7 @@ esp_err_t irrigation_scheduler_init(void)
         s_queue_count = 0;
         set_idle_status();
         s_runtime.auto_enabled = true;
+        load_runtime_settings();
 
         BaseType_t ok = xTaskCreate(
             irrigation_scheduler_task,
@@ -1082,6 +1149,12 @@ bool irrigation_scheduler_get_time_valid(void)
 
 bool irrigation_scheduler_set_auto_enabled(bool enabled)
 {
+    esp_err_t ret = save_auto_enabled_setting(enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Save auto mode failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
     s_runtime.auto_enabled = enabled;
     if (!enabled) {
         clear_queued_programs();

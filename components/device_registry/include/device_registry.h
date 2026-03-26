@@ -10,7 +10,7 @@ extern "C" {
 
 #define DEV_REG_MAX_DEVICES   16
 #define DEV_REG_MAX_VALVES    32
-#define DEV_REG_MAX_SENSORS   64
+#define DEV_REG_MAX_SENSORS   128
 #define DEV_REG_MAX_ZONES     16
 #define DEV_REG_ZONE_MAX_VALVES  16
 #define DEV_REG_ZONE_MAX_DEVICES  8

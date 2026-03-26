@@ -1990,22 +1990,6 @@ static void add_zone_confirm_cb(lv_event_t *e)
         }
     }
 
-    /* NVS 写入（添加灌区视图仍可见，flash 抖动被遮住） */
-    bool ok = false;
-    if (g_is_editing_zone && g_zone_edit_cb) {
-        ok = g_zone_edit_cb(g_editing_zone_slot, &params);
-    } else if (g_zone_add_cb) {
-        ok = g_zone_add_cb(&params);
-    }
-
-    g_is_editing_zone = false;
-    g_editing_zone_slot = -1;
-
-    if (!ok) {
-        show_settings_warning_dialog("操作失败", "灌区保存失败，请重试");
-        return;
-    }
-
     if (g_add_zone_view != NULL) {
         lv_obj_del(g_add_zone_view);
         g_add_zone_view = NULL;
@@ -2021,6 +2005,22 @@ static void add_zone_confirm_cb(lv_event_t *e)
     if (g_zone_management_view) {
         lv_obj_clear_flag(g_zone_management_view, LV_OBJ_FLAG_HIDDEN);
     }
+
+    bool ok = false;
+    if (g_is_editing_zone && g_zone_edit_cb) {
+        ok = g_zone_edit_cb(g_editing_zone_slot, &params);
+    } else if (g_zone_add_cb) {
+        ok = g_zone_add_cb(&params);
+    }
+
+    g_is_editing_zone = false;
+    g_editing_zone_slot = -1;
+
+    if (!ok) {
+        show_settings_warning_dialog("操作失败", "灌区保存失败，请重试");
+        return;
+    }
+
     ui_settings_refresh_zone_table();
 }
 
@@ -2796,17 +2796,6 @@ static void add_device_confirm_cb(lv_event_t *e)
         }
     }
 
-    /* NVS 写入（对话框仍可见，flash 抖动被遮住） */
-    bool ok = false;
-    if (g_is_editing_device && g_device_edit_cb) {
-        ok = g_device_edit_cb(g_editing_device_id, &edit_params);
-    } else if (g_device_add_cb) {
-        ok = g_device_add_cb(&add_params);
-    }
-    int64_t t1 = esp_timer_get_time();
-
-    g_is_editing_device = false;
-
     if (g_add_device_bg) {
         lv_obj_del(g_add_device_bg);
         g_add_device_bg = NULL;
@@ -2816,7 +2805,17 @@ static void add_device_confirm_cb(lv_event_t *e)
         g_device_id_input = NULL;
         g_device_port_dropdown = NULL;
     }
+    int64_t t1 = esp_timer_get_time();
+
+    bool ok = false;
+    if (g_is_editing_device && g_device_edit_cb) {
+        ok = g_device_edit_cb(g_editing_device_id, &edit_params);
+    } else if (g_device_add_cb) {
+        ok = g_device_add_cb(&add_params);
+    }
     int64_t t2 = esp_timer_get_time();
+
+    g_is_editing_device = false;
 
     if (ok) ui_settings_refresh_device_table();
     int64_t t3 = esp_timer_get_time();
@@ -2889,16 +2888,6 @@ static void add_sensor_confirm_cb(lv_event_t *e)
         }
     }
 
-    bool ok = false;
-    if (g_is_editing_sensor && g_sensor_edit_cb) {
-        ok = g_sensor_edit_cb(g_editing_sensor_point_id, &edit_params);
-    } else if (g_sensor_add_cb) {
-        ok = g_sensor_add_cb(&add_params);
-    }
-    int64_t t1 = esp_timer_get_time();
-
-    g_is_editing_sensor = false;
-
     if (g_add_sensor_bg) {
         lv_obj_del(g_add_sensor_bg);
         g_add_sensor_bg = NULL;
@@ -2911,7 +2900,17 @@ static void add_sensor_confirm_cb(lv_event_t *e)
         g_sensor_point_no_input = NULL;
         g_sensor_point_id_label = NULL;
     }
+    int64_t t1 = esp_timer_get_time();
+
+    bool ok = false;
+    if (g_is_editing_sensor && g_sensor_edit_cb) {
+        ok = g_sensor_edit_cb(g_editing_sensor_point_id, &edit_params);
+    } else if (g_sensor_add_cb) {
+        ok = g_sensor_add_cb(&add_params);
+    }
     int64_t t2 = esp_timer_get_time();
+
+    g_is_editing_sensor = false;
 
     if (ok) ui_settings_refresh_sensor_table();
     int64_t t3 = esp_timer_get_time();
@@ -4781,17 +4780,6 @@ static void add_valve_confirm_cb(lv_event_t *e)
         }
     }
 
-    /* NVS 写入（对话框仍可见，flash 抖动被遮住） */
-    bool ok = false;
-    if (g_is_editing_valve && g_valve_edit_cb) {
-        ok = g_valve_edit_cb(g_editing_valve_id, &params);
-    } else if (g_valve_add_cb) {
-        ok = g_valve_add_cb(&params);
-    }
-    int64_t t1 = esp_timer_get_time();
-
-    g_is_editing_valve = false;
-
     if (g_add_valve_bg) {
         lv_obj_del(g_add_valve_bg);
         g_add_valve_bg = NULL;
@@ -4801,7 +4789,17 @@ static void add_valve_confirm_cb(lv_event_t *e)
         g_valve_parent_dropdown = NULL;
         g_valve_channel_dropdown = NULL;
     }
+    int64_t t1 = esp_timer_get_time();
+
+    bool ok = false;
+    if (g_is_editing_valve && g_valve_edit_cb) {
+        ok = g_valve_edit_cb(g_editing_valve_id, &params);
+    } else if (g_valve_add_cb) {
+        ok = g_valve_add_cb(&params);
+    }
     int64_t t2 = esp_timer_get_time();
+
+    g_is_editing_valve = false;
 
     if (ok) ui_settings_refresh_valve_table();
     int64_t t3 = esp_timer_get_time();
@@ -4939,7 +4937,7 @@ static void update_device_default_id(void)
 {
     if (!g_device_id_input || g_is_editing_device) return;
 
-    uint16_t next_id = 1;
+    uint16_t next_id = 1001;
     while (next_id < UINT16_MAX && is_device_id_used(next_id)) {
         next_id++;
     }

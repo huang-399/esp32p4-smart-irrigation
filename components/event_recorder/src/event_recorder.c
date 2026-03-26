@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
@@ -19,6 +20,33 @@ static const char *TAG = "event_recorder";
 #define NVS_KEY_MANUAL "manual_rec"
 #define NVS_KEY_PROGRAM "program_rec"
 #define TIME_SYNC_THRESHOLD 1704067200LL  /* 2024-01-01 00:00:00 UTC */
+#define FLUSH_TASK_STACK_SIZE 4096
+#define FLUSH_TASK_PRIORITY 3
+#define FLUSH_POLL_MS 200
+#define FLUSH_IDLE_MS 800
+#define FLUSH_RETRY_DELAY_MS 1000
+#define FLUSH_TASK_NAME "evt_flush"
+#define MAX_FLUSH_FAILURE_LOGS 5
+#define FLUSH_FAILURE_LOG_INTERVAL 10
+/* 实机已确认：event_recorder 触发 NVS/Flash 真正落盘时会引发蓝闪。
+ * 当前先固定为“RAM 近期缓存”模式，保留查询与运行期记录能力，
+ * 暂不把事件记录异步刷入 NVS，后续再切到 TF 历史归档/更安全的后台持久化策略。 */
+#define EVT_RAM_CACHE_ONLY 1
+#define EVT_PENDING_FLUSH_BASIC_MASK(type) (1U << (type))
+#define EVT_PENDING_FLUSH_MANUAL_BIT       (1U << EVT_TYPE_MANUAL_RECORD)
+#define EVT_PENDING_FLUSH_PROGRAM_BIT      (1U << EVT_TYPE_PROGRAM_RECORD)
+
+static TaskHandle_t s_flush_task = NULL;
+static volatile uint32_t s_pending_flush_mask = 0;
+static volatile bool s_flush_task_stop = false;
+static uint32_t s_flush_failure_count = 0;
+static TickType_t s_last_dirty_tick = 0;
+
+static esp_err_t schedule_flush_locked(uint32_t pending_bits);
+static void flush_task(void *arg);
+static esp_err_t flush_pending_stores(void);
+static void log_flush_failure(esp_err_t ret);
+static bool flush_failure_should_log(uint32_t failure_count);
 
 typedef struct {
     uint16_t count;
@@ -47,6 +75,7 @@ static bool s_program_dirty = false;
 static SemaphoreHandle_t s_mutex = NULL;
 static nvs_handle_t s_nvs_handle;
 static bool s_initialized = false;
+static bool s_legacy_storage_cleared = false;
 
 static const char *s_basic_nvs_keys[EVT_TYPE_ALARM + 1] = {
     NVS_KEY_OFFLINE,
@@ -59,6 +88,111 @@ static const char *s_basic_nvs_keys[EVT_TYPE_ALARM + 1] = {
 static esp_err_t set_manual_store_blob(void);
 static esp_err_t set_program_store_blob(void);
 static esp_err_t flush_dirty_stores_locked(void);
+static esp_err_t clear_legacy_storage_locked(void);
+static esp_err_t clear_legacy_storage_if_needed_locked(void);
+
+static esp_err_t schedule_flush_locked(uint32_t pending_bits)
+{
+    if (pending_bits == 0) {
+        return ESP_OK;
+    }
+
+#if EVT_RAM_CACHE_ONLY
+    (void)pending_bits;
+    return ESP_OK;
+#else
+    s_pending_flush_mask |= pending_bits;
+    s_last_dirty_tick = xTaskGetTickCount();
+
+    if (s_flush_task != NULL) {
+        xTaskNotifyGive(s_flush_task);
+    }
+
+    return ESP_OK;
+#endif
+}
+
+static bool flush_failure_should_log(uint32_t failure_count)
+{
+    return failure_count <= MAX_FLUSH_FAILURE_LOGS ||
+           (failure_count % FLUSH_FAILURE_LOG_INTERVAL) == 0;
+}
+
+static void log_flush_failure(esp_err_t ret)
+{
+    s_flush_failure_count++;
+    if (flush_failure_should_log(s_flush_failure_count)) {
+        ESP_LOGW(TAG, "Async flush failed (%lu): %s",
+                 (unsigned long)s_flush_failure_count,
+                 esp_err_to_name(ret));
+    }
+}
+
+static esp_err_t flush_pending_stores(void)
+{
+    if (s_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    uint32_t pending_mask = s_pending_flush_mask;
+    if (pending_mask == 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_OK;
+    }
+
+    esp_err_t ret = flush_dirty_stores_locked();
+    if (ret == ESP_OK) {
+        s_pending_flush_mask &= ~pending_mask;
+        if (s_pending_flush_mask == 0) {
+            s_last_dirty_tick = 0;
+        }
+        s_flush_failure_count = 0;
+    }
+
+    xSemaphoreGive(s_mutex);
+    return ret;
+}
+
+static void flush_task(void *arg)
+{
+    (void)arg;
+
+    while (!s_flush_task_stop) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FLUSH_POLL_MS));
+
+        while (!s_flush_task_stop) {
+            TickType_t pending_age = 0;
+
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_pending_flush_mask != 0 && s_last_dirty_tick != 0) {
+                pending_age = xTaskGetTickCount() - s_last_dirty_tick;
+            }
+            xSemaphoreGive(s_mutex);
+
+            if (pending_age == 0) {
+                break;
+            }
+
+            if (pending_age < pdMS_TO_TICKS(FLUSH_IDLE_MS)) {
+                vTaskDelay(pdMS_TO_TICKS(FLUSH_POLL_MS));
+                continue;
+            }
+
+            esp_err_t ret = flush_pending_stores();
+            if (ret == ESP_OK) {
+                break;
+            }
+
+            log_flush_failure(ret);
+            vTaskDelay(pdMS_TO_TICKS(FLUSH_RETRY_DELAY_MS));
+        }
+    }
+
+    s_flush_task = NULL;
+    vTaskDelete(NULL);
+}
 
 static bool is_basic_type(evt_type_t type)
 {
@@ -108,6 +242,35 @@ static esp_err_t set_basic_store_blob(evt_type_t type)
 {
     return nvs_set_blob(s_nvs_handle, s_basic_nvs_keys[type],
                         &s_basic_stores[type], sizeof(evt_store_t));
+}
+
+static esp_err_t clear_legacy_storage_locked(void)
+{
+    if (s_nvs_handle == 0) {
+        s_legacy_storage_cleared = true;
+        return ESP_OK;
+    }
+
+    esp_err_t ret = nvs_erase_all(s_nvs_handle);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(s_nvs_handle);
+    }
+    if (ret == ESP_OK) {
+        s_legacy_storage_cleared = true;
+        memset(s_basic_dirty, 0, sizeof(s_basic_dirty));
+        s_manual_dirty = false;
+        s_program_dirty = false;
+        ESP_LOGI(TAG, "Cleared legacy event NVS after TF archive sync");
+    }
+    return ret;
+}
+
+static esp_err_t clear_legacy_storage_if_needed_locked(void)
+{
+    if (s_legacy_storage_cleared) {
+        return ESP_OK;
+    }
+    return clear_legacy_storage_locked();
 }
 
 static esp_err_t flush_dirty_stores_locked(void)
@@ -160,7 +323,7 @@ static esp_err_t flush_dirty_stores_locked(void)
 static esp_err_t save_basic_store(evt_type_t type)
 {
     s_basic_dirty[type] = true;
-    return flush_dirty_stores_locked();
+    return schedule_flush_locked(EVT_PENDING_FLUSH_BASIC_MASK(type));
 }
 
 static esp_err_t load_manual_store(void)
@@ -183,7 +346,7 @@ static esp_err_t set_manual_store_blob(void)
 static esp_err_t save_manual_store(void)
 {
     s_manual_dirty = true;
-    return flush_dirty_stores_locked();
+    return schedule_flush_locked(EVT_PENDING_FLUSH_MANUAL_BIT);
 }
 
 static esp_err_t load_program_store(void)
@@ -206,7 +369,7 @@ static esp_err_t set_program_store_blob(void)
 static esp_err_t save_program_store(void)
 {
     s_program_dirty = true;
-    return flush_dirty_stores_locked();
+    return schedule_flush_locked(EVT_PENDING_FLUSH_PROGRAM_BIT);
 }
 
 static const char *record_type_name(evt_type_t type)
@@ -233,20 +396,29 @@ static const char *record_type_name(evt_type_t type)
 
 static esp_err_t add_record(evt_type_t type, const char *desc)
 {
-    if (!s_initialized || !is_basic_type(type)) {
-        return ESP_ERR_INVALID_STATE;
+    evt_record_t record = {0};
+    time_t now;
+
+    time(&now);
+    record.timestamp = (int64_t)now;
+    snprintf(record.desc, sizeof(record.desc), "%s", desc ? desc : "");
+    return event_recorder_add_basic_record(type, &record);
+}
+
+esp_err_t event_recorder_add_basic_record(evt_type_t type, const evt_record_t *record)
+{
+    if (!s_initialized || !is_basic_type(type) || !record) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     evt_store_t *store = &s_basic_stores[type];
     evt_record_t *rec = &store->records[store->write_idx];
-    time_t now;
 
-    time(&now);
     memset(rec, 0, sizeof(*rec));
-    rec->timestamp = (int64_t)now;
-    strncpy(rec->desc, desc ? desc : "", sizeof(rec->desc) - 1);
+    rec->timestamp = record->timestamp;
+    snprintf(rec->desc, sizeof(rec->desc), "%s", record->desc);
 
     store->write_idx = (store->write_idx + 1) % EVT_RECORD_MAX;
     if (store->count < EVT_RECORD_MAX) {
@@ -259,13 +431,132 @@ static esp_err_t add_record(evt_type_t type, const char *desc)
 
     ESP_LOGI(TAG, "Added %s record: %s (total: %d)",
              record_type_name(type),
-             desc ? desc : "", store->count);
+             record->desc,
+             store->count);
 
     return ret;
 }
 
-static bool manual_record_equals(const evt_manual_record_t *a, const evt_manual_record_t *b)
+esp_err_t event_recorder_get_basic_records_snapshot(evt_type_t type,
+                                                    evt_record_t *records,
+                                                    size_t max_records,
+                                                    size_t *out_count)
 {
+    if (!s_initialized || !is_basic_type(type) || !records || !out_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    size_t count = s_basic_stores[type].count;
+    if (count > max_records) {
+        count = max_records;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        int idx = (s_basic_stores[type].write_idx - (int)count + (int)i + EVT_RECORD_MAX) % EVT_RECORD_MAX;
+        memcpy(&records[i], &s_basic_stores[type].records[idx], sizeof(evt_record_t));
+    }
+
+    xSemaphoreGive(s_mutex);
+    *out_count = count;
+    return ESP_OK;
+}
+
+esp_err_t event_recorder_add_offline(const char *desc)
+{
+    return add_record(EVT_TYPE_OFFLINE, desc);
+}
+
+esp_err_t event_recorder_add_poweron(const char *desc)
+{
+    return add_record(EVT_TYPE_POWERON, desc);
+}
+
+esp_err_t event_recorder_add_control(const char *desc)
+{
+    return add_record(EVT_TYPE_CONTROL, desc);
+}
+
+esp_err_t event_recorder_add_operation(const char *desc)
+{
+    return add_record(EVT_TYPE_OPERATION, desc);
+}
+
+esp_err_t event_recorder_add_alarm(const char *desc)
+{
+    return add_record(EVT_TYPE_ALARM, desc);
+}
+
+esp_err_t event_recorder_add_manual_record(const evt_manual_record_t *record)
+{
+    if (!s_initialized || !record) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    evt_manual_record_t *dst = &s_manual_store.records[s_manual_store.write_idx];
+
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst, record, sizeof(*dst));
+
+    s_manual_store.write_idx = (s_manual_store.write_idx + 1) % EVT_RECORD_MAX;
+    if (s_manual_store.count < EVT_RECORD_MAX) {
+        s_manual_store.count++;
+    }
+
+    esp_err_t ret = save_manual_store();
+
+    xSemaphoreGive(s_mutex);
+
+    ESP_LOGI(TAG, "Added manual record: start=%lld planned=%u actual=%u status=%s detail=%s",
+             (long long)record->start_ts,
+             record->planned_minutes,
+             record->actual_minutes,
+             record->status,
+             record->detail);
+
+    return ret;
+}
+
+esp_err_t event_recorder_add_program_record(const evt_program_record_t *record)
+{
+    if (!s_initialized || !record) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    evt_program_record_t *dst = &s_program_store.records[s_program_store.write_idx];
+
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst, record, sizeof(*dst));
+
+    s_program_store.write_idx = (s_program_store.write_idx + 1) % EVT_RECORD_MAX;
+    if (s_program_store.count < EVT_RECORD_MAX) {
+        s_program_store.count++;
+    }
+
+    esp_err_t ret = save_program_store();
+
+    xSemaphoreGive(s_mutex);
+
+    ESP_LOGI(TAG, "Added program record: name=%s start=%lld status=%s total=%d",
+             record->program_name,
+             (long long)record->start_ts,
+             record->status,
+             s_program_store.count);
+
+    return ret;
+}
+
+bool event_recorder_manual_record_equals(const evt_manual_record_t *a, const evt_manual_record_t *b)
+{
+    if (!a || !b) {
+        return false;
+    }
+
     return a->start_ts == b->start_ts &&
            a->planned_minutes == b->planned_minutes &&
            a->actual_minutes == b->actual_minutes &&
@@ -273,8 +564,12 @@ static bool manual_record_equals(const evt_manual_record_t *a, const evt_manual_
            strcmp(a->detail, b->detail) == 0;
 }
 
-static bool program_record_equals(const evt_program_record_t *a, const evt_program_record_t *b)
+bool event_recorder_program_record_equals(const evt_program_record_t *a, const evt_program_record_t *b)
 {
+    if (!a || !b) {
+        return false;
+    }
+
     return a->start_ts == b->start_ts &&
            a->planned_minutes == b->planned_minutes &&
            a->actual_minutes == b->actual_minutes &&
@@ -333,7 +628,7 @@ static void dedupe_manual_store(void)
         bool dup = false;
 
         for (int j = 0; j < temp_count; j++) {
-            if (manual_record_equals(&temp[j], &s_manual_store.records[idx])) {
+            if (event_recorder_manual_record_equals(&temp[j], &s_manual_store.records[idx])) {
                 dup = true;
                 break;
             }
@@ -367,7 +662,7 @@ static void dedupe_program_store(void)
         bool dup = false;
 
         for (int j = 0; j < temp_count; j++) {
-            if (program_record_equals(&temp[j], &s_program_store.records[idx])) {
+            if (event_recorder_program_record_equals(&temp[j], &s_program_store.records[idx])) {
                 dup = true;
                 break;
             }
@@ -424,6 +719,22 @@ esp_err_t event_recorder_init(void)
         memset(&s_program_store, 0, sizeof(s_program_store));
     }
 
+    s_flush_task_stop = false;
+    BaseType_t task_ok = xTaskCreate(flush_task,
+                                     FLUSH_TASK_NAME,
+                                     FLUSH_TASK_STACK_SIZE,
+                                     NULL,
+                                     FLUSH_TASK_PRIORITY,
+                                     &s_flush_task);
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create flush task");
+        nvs_close(s_nvs_handle);
+        s_nvs_handle = 0;
+        vSemaphoreDelete(s_mutex);
+        s_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     s_initialized = true;
     ESP_LOGI(TAG,
              "Event recorder initialized (offline:%d, poweron:%d, control:%d, operation:%d, alarm:%d, manual:%d, program:%d)",
@@ -438,87 +749,15 @@ esp_err_t event_recorder_init(void)
     return ESP_OK;
 }
 
-esp_err_t event_recorder_add_offline(const char *desc)
+esp_err_t event_recorder_clear_legacy_storage(void)
 {
-    return add_record(EVT_TYPE_OFFLINE, desc);
-}
-
-esp_err_t event_recorder_add_poweron(const char *desc)
-{
-    return add_record(EVT_TYPE_POWERON, desc);
-}
-
-esp_err_t event_recorder_add_control(const char *desc)
-{
-    return add_record(EVT_TYPE_CONTROL, desc);
-}
-
-esp_err_t event_recorder_add_operation(const char *desc)
-{
-    return add_record(EVT_TYPE_OPERATION, desc);
-}
-
-esp_err_t event_recorder_add_alarm(const char *desc)
-{
-    return add_record(EVT_TYPE_ALARM, desc);
-}
-
-esp_err_t event_recorder_add_manual_record(const evt_manual_record_t *record)
-{
-    if (!s_initialized || !record) {
-        return ESP_ERR_INVALID_ARG;
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-
-    evt_manual_record_t *dst = &s_manual_store.records[s_manual_store.write_idx];
-    memset(dst, 0, sizeof(*dst));
-    memcpy(dst, record, sizeof(*dst));
-
-    s_manual_store.write_idx = (s_manual_store.write_idx + 1) % EVT_RECORD_MAX;
-    if (s_manual_store.count < EVT_RECORD_MAX) {
-        s_manual_store.count++;
-    }
-
-    esp_err_t ret = save_manual_store();
-
+    esp_err_t ret = clear_legacy_storage_if_needed_locked();
     xSemaphoreGive(s_mutex);
-
-    ESP_LOGI(TAG, "Added manual record: start=%lld status=%s total=%d",
-             (long long)record->start_ts,
-             record->status,
-             s_manual_store.count);
-
-    return ret;
-}
-
-esp_err_t event_recorder_add_program_record(const evt_program_record_t *record)
-{
-    if (!s_initialized || !record) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-
-    evt_program_record_t *dst = &s_program_store.records[s_program_store.write_idx];
-    memset(dst, 0, sizeof(*dst));
-    memcpy(dst, record, sizeof(*dst));
-
-    s_program_store.write_idx = (s_program_store.write_idx + 1) % EVT_RECORD_MAX;
-    if (s_program_store.count < EVT_RECORD_MAX) {
-        s_program_store.count++;
-    }
-
-    esp_err_t ret = save_program_store();
-
-    xSemaphoreGive(s_mutex);
-
-    ESP_LOGI(TAG, "Added program record: name=%s start=%lld status=%s total=%d",
-             record->program_name,
-             (long long)record->start_ts,
-             record->status,
-             s_program_store.count);
-
     return ret;
 }
 
@@ -692,6 +931,56 @@ esp_err_t event_recorder_query_program_records(int64_t start_ts, int64_t end_ts,
     return ESP_OK;
 }
 
+esp_err_t event_recorder_get_manual_records_snapshot(evt_manual_record_t *records,
+                                                     size_t max_records,
+                                                     size_t *out_count)
+{
+    if (!s_initialized || !records || !out_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    size_t count = s_manual_store.count;
+    if (count > max_records) {
+        count = max_records;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        int idx = (s_manual_store.write_idx - (int)count + (int)i + EVT_RECORD_MAX) % EVT_RECORD_MAX;
+        memcpy(&records[i], &s_manual_store.records[idx], sizeof(evt_manual_record_t));
+    }
+
+    xSemaphoreGive(s_mutex);
+    *out_count = count;
+    return ESP_OK;
+}
+
+esp_err_t event_recorder_get_program_records_snapshot(evt_program_record_t *records,
+                                                      size_t max_records,
+                                                      size_t *out_count)
+{
+    if (!s_initialized || !records || !out_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    size_t count = s_program_store.count;
+    if (count > max_records) {
+        count = max_records;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        int idx = (s_program_store.write_idx - (int)count + (int)i + EVT_RECORD_MAX) % EVT_RECORD_MAX;
+        memcpy(&records[i], &s_program_store.records[idx], sizeof(evt_program_record_t));
+    }
+
+    xSemaphoreGive(s_mutex);
+    *out_count = count;
+    return ESP_OK;
+}
+
 esp_err_t event_recorder_fix_timestamps(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
@@ -701,6 +990,8 @@ esp_err_t event_recorder_fix_timestamps(void)
     if ((int64_t)now < TIME_SYNC_THRESHOLD) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    uint32_t pending_bits = 0;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
@@ -723,6 +1014,7 @@ esp_err_t event_recorder_fix_timestamps(void)
 
         if (modified) {
             s_basic_dirty[t] = true;
+            pending_bits |= EVT_PENDING_FLUSH_BASIC_MASK(t);
             any_modified = true;
             ESP_LOGI(TAG, "Updated %s timestamps to %lld (deferred save)",
                      record_type_name((evt_type_t)t),
@@ -743,6 +1035,7 @@ esp_err_t event_recorder_fix_timestamps(void)
         }
         if (modified) {
             s_manual_dirty = true;
+            pending_bits |= EVT_PENDING_FLUSH_MANUAL_BIT;
             any_modified = true;
             ESP_LOGI(TAG, "Updated manual record timestamps to %lld (deferred save)", (long long)now);
         }
@@ -761,11 +1054,17 @@ esp_err_t event_recorder_fix_timestamps(void)
         }
         if (modified) {
             s_program_dirty = true;
+            pending_bits |= EVT_PENDING_FLUSH_PROGRAM_BIT;
             any_modified = true;
             ESP_LOGI(TAG, "Updated program record timestamps to %lld (deferred save)", (long long)now);
         }
     }
 
+    esp_err_t schedule_ret = ESP_OK;
+    if (any_modified) {
+        schedule_ret = schedule_flush_locked(pending_bits);
+    }
+
     xSemaphoreGive(s_mutex);
-    return ESP_OK;
+    return schedule_ret;
 }

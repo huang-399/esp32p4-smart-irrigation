@@ -38,6 +38,7 @@ static lv_obj_t *g_input_start_date = NULL;   /* 开始日期输入框 */
 static lv_obj_t *g_input_end_date = NULL;     /* 结束日期输入框 */
 static lv_obj_t *g_control_table_area = NULL; /* 控制日志表格区域 */
 static lv_obj_t *g_control_page_info = NULL;  /* 控制日志页码 */
+static lv_obj_t *g_control_query_btn = NULL;  /* 控制日志查询按钮 */
 static lv_obj_t *g_control_btn_first = NULL;  /* 控制日志首页 */
 static lv_obj_t *g_control_btn_prev = NULL;   /* 控制日志上一页 */
 static lv_obj_t *g_control_btn_next = NULL;   /* 控制日志下一页 */
@@ -258,6 +259,7 @@ static void create_control_log_view(lv_obj_t *parent)
         g_input_end_date,
         g_control_table_area,
         g_control_page_info,
+        g_control_query_btn,
         g_control_btn_first,
         g_control_btn_prev,
         g_control_btn_next,
@@ -375,15 +377,15 @@ static void create_filter_section(lv_obj_t *parent)
     lv_obj_set_style_text_font(lv_dropdown_get_list(dropdown), &my_font_cn_16, 0);
 
     /* 查询按钮 */
-    lv_obj_t *query_btn = lv_btn_create(parent);
-    lv_obj_set_size(query_btn, 100, 30);
-    lv_obj_set_pos(query_btn, 1000, y_pos + 3);
-    lv_obj_set_style_bg_color(query_btn, COLOR_PRIMARY, 0);
-    lv_obj_set_style_border_width(query_btn, 0, 0);
-    lv_obj_set_style_radius(query_btn, 5, 0);
-    lv_obj_add_event_cb(query_btn, ui_log_rec_control_query_btn_cb, LV_EVENT_CLICKED, NULL);
+    g_control_query_btn = lv_btn_create(parent);
+    lv_obj_set_size(g_control_query_btn, 100, 30);
+    lv_obj_set_pos(g_control_query_btn, 1000, y_pos + 3);
+    lv_obj_set_style_bg_color(g_control_query_btn, COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(g_control_query_btn, 0, 0);
+    lv_obj_set_style_radius(g_control_query_btn, 5, 0);
+    lv_obj_add_event_cb(g_control_query_btn, ui_log_rec_control_query_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *query_label = lv_label_create(query_btn);
+    lv_obj_t *query_label = lv_label_create(g_control_query_btn);
     lv_label_set_text(query_label, "查询");
     lv_obj_set_style_text_color(query_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(query_label, &my_font_cn_16, 0);
@@ -1169,6 +1171,7 @@ static void create_operation_log_view(lv_obj_t *parent)
         input_end,
         g_operation_table_area,
         g_operation_page_info,
+        query_btn,
         g_operation_btn_first,
         g_operation_btn_prev,
         g_operation_btn_next,
@@ -1389,6 +1392,7 @@ static void create_manual_record_view(lv_obj_t *parent)
         g_manual_status_dropdown,
         g_manual_table_area,
         g_manual_page_info,
+        query_btn,
         g_manual_btn_first,
         g_manual_btn_prev,
         g_manual_btn_next,
@@ -1609,6 +1613,7 @@ static void create_program_record_view(lv_obj_t *parent)
         g_program_status_dropdown,
         g_program_table_area,
         g_program_page_info,
+        query_btn,
         g_program_btn_first,
         g_program_btn_prev,
         g_program_btn_next,

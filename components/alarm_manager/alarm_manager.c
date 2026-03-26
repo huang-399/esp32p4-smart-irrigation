@@ -1,5 +1,6 @@
 #include "alarm_manager.h"
 #include "event_recorder.h"
+#include "history_archive.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
@@ -116,10 +117,23 @@ esp_err_t alarm_manager_clear_current_alarms(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     for (uint16_t i = 0; i < s_current_store.count; i++) {
-        esp_err_t ret = event_recorder_add_alarm(s_current_store.items[i].desc);
+        evt_record_t record = {0};
+        esp_err_t ret;
+
+        record.timestamp = s_current_store.items[i].timestamp;
+        snprintf(record.desc, sizeof(record.desc), "%s", s_current_store.items[i].desc);
+
+        ret = event_recorder_add_basic_record(EVT_TYPE_ALARM, &record);
         if (ret != ESP_OK) {
             xSemaphoreGive(s_mutex);
             ESP_LOGE(TAG, "Failed to archive alarm: %s", esp_err_to_name(ret));
+            return ret;
+        }
+
+        ret = history_archive_enqueue_basic_record(EVT_TYPE_ALARM, &record);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            xSemaphoreGive(s_mutex);
+            ESP_LOGE(TAG, "Failed to enqueue alarm archive: %s", esp_err_to_name(ret));
             return ret;
         }
     }

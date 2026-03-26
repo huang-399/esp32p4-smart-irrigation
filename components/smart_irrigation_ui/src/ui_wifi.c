@@ -141,7 +141,7 @@ static lv_color_t rssi_to_color(int8_t rssi)
 static void close_connect_dialog(void)
 {
     if (s_connect_dialog) {
-        lv_obj_del(s_connect_dialog);
+        lv_obj_delete_async(s_connect_dialog);
         s_connect_dialog = NULL;
         s_pwd_textarea = NULL;
     }
@@ -297,7 +297,7 @@ static void show_connect_dialog(const char *ssid, uint8_t authmode)
 static void close_connecting_dialog(void)
 {
     if (s_connecting_dialog) {
-        lv_obj_del(s_connecting_dialog);
+        lv_obj_delete_async(s_connecting_dialog);
         s_connecting_dialog = NULL;
     }
 }
@@ -348,7 +348,7 @@ static void show_connecting_dialog(void)
 static void close_fail_dialog(void)
 {
     if (s_fail_dialog) {
-        lv_obj_del(s_fail_dialog);
+        lv_obj_delete_async(s_fail_dialog);
         s_fail_dialog = NULL;
     }
 }
@@ -624,8 +624,17 @@ void ui_wifi_update_scan_results(const ui_wifi_scan_result_t *result)
 
 void ui_wifi_set_connected(bool connected, const char *ssid)
 {
+    bool state_changed = (s_wifi_connected != connected);
+    bool ssid_changed = false;
+
     /* Close connecting dialog on any result */
     close_connecting_dialog();
+
+    if (connected && ssid) {
+        ssid_changed = (strncmp(s_connected_ssid, ssid, sizeof(s_connected_ssid) - 1) != 0);
+    } else {
+        ssid_changed = (s_connected_ssid[0] != '\0');
+    }
 
     s_wifi_connected = connected;
     if (connected && ssid) {
@@ -637,6 +646,12 @@ void ui_wifi_set_connected(bool connected, const char *ssid)
 
     /* Update bottom status bar */
     ui_statusbar_set_wifi_connected(connected);
+
+    /* Avoid full list rebuild when only connection state/status text changes */
+    if (s_has_scan_results && (state_changed || ssid_changed)) {
+        update_status_label(s_last_scan.ap_count);
+        return;
+    }
 
     /* Re-render the WiFi list if we have scan results */
     if (s_has_scan_results) {
