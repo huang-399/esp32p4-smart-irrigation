@@ -20,7 +20,7 @@ static const char *TAG = "dev_reg";
 #define NVS_NAMESPACE        "dev_reg"
 #define TF_CONFIG_DIR        "config"
 #define TF_SNAPSHOT_FILE     "device_registry.bin"
-#define TF_SNAPSHOT_VERSION  1
+#define TF_SNAPSHOT_VERSION  2
 #define TF_SNAPSHOT_MAGIC    "DEVREG1"
 
 typedef struct __attribute__((packed)) {
@@ -35,6 +35,62 @@ typedef struct __attribute__((packed)) {
     uint32_t sensor_size;
     uint32_t zone_size;
 } dev_registry_snapshot_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t    valid;
+    uint8_t    type;
+    uint8_t    channel;
+    uint8_t    reserved;
+    uint16_t   parent_device_id;
+    uint16_t   id;
+    char       name[DEV_REG_NAME_LEN];
+} dev_valve_info_v1_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t    valid;
+    uint8_t    valve_count;
+    uint8_t    device_count;
+    uint8_t    reserved;
+    uint16_t   valve_ids[DEV_REG_ZONE_MAX_VALVES];
+    uint16_t   device_ids[DEV_REG_ZONE_MAX_DEVICES];
+    char       name[DEV_REG_NAME_LEN];
+} dev_zone_info_v1_t;
+
+static void convert_valve_v1_to_v2(dev_valve_info_t *dst, const dev_valve_info_v1_t *src)
+{
+    if (!dst || !src) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    dst->valid = src->valid;
+    dst->type = src->type;
+    dst->channel = src->channel;
+    dst->reserved = src->reserved;
+    dst->parent_device_id = src->parent_device_id;
+    dst->id = src->id;
+    memcpy(dst->name, src->name, sizeof(src->name));
+    dst->name[DEV_REG_NAME_LEN - 1] = '\0';
+}
+
+static void convert_zone_v1_to_v2(dev_zone_info_t *dst, const dev_zone_info_v1_t *src)
+{
+    if (!dst || !src) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    dst->valid = src->valid;
+    dst->valve_count = src->valve_count;
+    dst->device_count = src->device_count;
+    dst->reserved = src->reserved;
+    for (int i = 0; i < DEV_REG_ZONE_MAX_VALVES; i++) {
+        dst->valve_ids[i] = src->valve_ids[i];
+    }
+    memcpy(dst->device_ids, src->device_ids, sizeof(src->device_ids));
+    memcpy(dst->name, src->name, sizeof(src->name));
+    dst->name[DEV_REG_NAME_LEN - 1] = '\0';
+}
 
 /* ---- 静态数据 ---- */
 static dev_device_info_t s_devices[DEV_REG_MAX_DEVICES];
@@ -57,8 +113,65 @@ static QueueHandle_t s_persist_queue = NULL;
 /* ---- 类型名称表 ---- */
 static const char *s_dev_type_names[] = {
     "8路控制器", "16路控制器", "32路控制器",
-    "Zigbee传感节点", "Zigbee控制节点", "虚拟节点"
+    "Zigbee终端节点", "Zigbee终端节点", "虚拟节点"
 };
+
+static uint8_t next_valve_suffix_for_parent(uint16_t parent_device_id)
+{
+    bool used[100] = {false};
+
+    for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+        if (!s_valves[i].valid || s_valves[i].parent_device_id != parent_device_id) {
+            continue;
+        }
+
+        uint32_t base_id = (uint32_t)parent_device_id * 100U;
+        if (s_valves[i].id <= base_id) {
+            continue;
+        }
+
+        uint32_t suffix = s_valves[i].id - base_id;
+        if (suffix >= 1U && suffix <= 99U) {
+            used[suffix] = true;
+        }
+    }
+
+    for (uint8_t suffix = 1; suffix <= 99; suffix++) {
+        if (!used[suffix]) {
+            return suffix;
+        }
+    }
+
+    return 0;
+}
+
+static bool valve_registry_is_id_taken_locked(uint32_t id)
+{
+    for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+        if (s_valves[i].valid && s_valves[i].id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool device_registry_exists_locked(uint16_t id)
+{
+    for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+        if (s_devices[i].valid && s_devices[i].id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static esp_err_t read_snapshot_section(FILE *fp, void *buf, size_t size)
+{
+    if (fread(buf, size, 1, fp) != 1) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
 
 static const char *s_port_names[] = {
     "RS485-1", "RS485-2", "RS485-3", "RS485-4", "串口连接"
@@ -242,6 +355,7 @@ static esp_err_t load_snapshot_from_tf(void)
     FILE *fp;
     dev_registry_snapshot_header_t header;
     esp_err_t ret = ensure_tf_ready();
+    bool migrated = false;
 
     if (ret != ESP_OK) {
         return ret;
@@ -259,27 +373,67 @@ static esp_err_t load_snapshot_from_tf(void)
     }
 
     if (memcmp(header.magic, TF_SNAPSHOT_MAGIC, sizeof(header.magic)) != 0 ||
-        header.version != TF_SNAPSHOT_VERSION ||
         header.device_size != sizeof(dev_device_info_t) ||
-        header.valve_size != sizeof(dev_valve_info_t) ||
-        header.sensor_size != sizeof(dev_sensor_info_t) ||
-        header.zone_size != sizeof(dev_zone_info_t)) {
+        header.sensor_size != sizeof(dev_sensor_info_t)) {
         fclose(fp);
         ESP_LOGW(TAG, "TF snapshot header mismatch, ignore file");
         return ESP_ERR_INVALID_VERSION;
     }
 
-    if (fread(s_devices, sizeof(s_devices), 1, fp) != 1 ||
-        fread(s_valves, sizeof(s_valves), 1, fp) != 1 ||
-        fread(s_sensors, sizeof(s_sensors), 1, fp) != 1 ||
-        fread(s_zones, sizeof(s_zones), 1, fp) != 1) {
+    if (header.version == TF_SNAPSHOT_VERSION &&
+        header.valve_size == sizeof(dev_valve_info_t) &&
+        header.zone_size == sizeof(dev_zone_info_t)) {
+        ret = read_snapshot_section(fp, s_devices, sizeof(s_devices));
+        if (ret == ESP_OK) ret = read_snapshot_section(fp, s_valves, sizeof(s_valves));
+        if (ret == ESP_OK) ret = read_snapshot_section(fp, s_sensors, sizeof(s_sensors));
+        if (ret == ESP_OK) ret = read_snapshot_section(fp, s_zones, sizeof(s_zones));
+        if (ret != ESP_OK) {
+            fclose(fp);
+            ESP_LOGW(TAG, "TF snapshot content incomplete, ignore file");
+            return ret;
+        }
+    } else if (header.version == 1 &&
+               header.valve_size == sizeof(dev_valve_info_v1_t) &&
+               header.zone_size == sizeof(dev_zone_info_v1_t)) {
+        dev_valve_info_v1_t old_valves[DEV_REG_MAX_VALVES] = {0};
+        dev_zone_info_v1_t old_zones[DEV_REG_MAX_ZONES] = {0};
+
+        ret = read_snapshot_section(fp, s_devices, sizeof(s_devices));
+        if (ret == ESP_OK) ret = read_snapshot_section(fp, old_valves, sizeof(old_valves));
+        if (ret == ESP_OK) ret = read_snapshot_section(fp, s_sensors, sizeof(s_sensors));
+        if (ret == ESP_OK) ret = read_snapshot_section(fp, old_zones, sizeof(old_zones));
+        if (ret != ESP_OK) {
+            fclose(fp);
+            ESP_LOGW(TAG, "TF snapshot v1 content incomplete, ignore file");
+            return ret;
+        }
+
+        memset(s_valves, 0, sizeof(s_valves));
+        memset(s_zones, 0, sizeof(s_zones));
+        for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+            convert_valve_v1_to_v2(&s_valves[i], &old_valves[i]);
+        }
+        for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
+            convert_zone_v1_to_v2(&s_zones[i], &old_zones[i]);
+        }
+        migrated = true;
+    } else {
         fclose(fp);
-        ESP_LOGW(TAG, "TF snapshot content incomplete, ignore file");
-        return ESP_ERR_INVALID_SIZE;
+        ESP_LOGW(TAG, "TF snapshot version/size mismatch, ignore file");
+        return ESP_ERR_INVALID_VERSION;
     }
 
     fclose(fp);
     s_storage_available = true;
+
+    if (migrated) {
+        ESP_LOGI(TAG, "Migrated TF snapshot v1 to v2 in memory");
+        ret = save_snapshot_to_tf_locked();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Rewrite TF snapshot to v2 failed: %s", esp_err_to_name(ret));
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -315,6 +469,66 @@ static esp_err_t clear_legacy_nvs_if_safe(void)
         return ESP_OK;
     }
     return clear_legacy_nvs_namespace();
+}
+
+static esp_err_t load_valves_from_nvs_entry(nvs_handle_t handle, const char *key, dev_valve_info_t *out)
+{
+    size_t len = 0;
+    esp_err_t ret;
+
+    if (!key || !out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = nvs_get_blob(handle, key, NULL, &len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (len == sizeof(dev_valve_info_t)) {
+        return nvs_get_blob(handle, key, out, &len);
+    }
+
+    if (len == sizeof(dev_valve_info_v1_t)) {
+        dev_valve_info_v1_t old_valve = {0};
+        ret = nvs_get_blob(handle, key, &old_valve, &len);
+        if (ret == ESP_OK) {
+            convert_valve_v1_to_v2(out, &old_valve);
+        }
+        return ret;
+    }
+
+    return ESP_ERR_INVALID_SIZE;
+}
+
+static esp_err_t load_zones_from_nvs_entry(nvs_handle_t handle, const char *key, dev_zone_info_t *out)
+{
+    size_t len = 0;
+    esp_err_t ret;
+
+    if (!key || !out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = nvs_get_blob(handle, key, NULL, &len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (len == sizeof(dev_zone_info_t)) {
+        return nvs_get_blob(handle, key, out, &len);
+    }
+
+    if (len == sizeof(dev_zone_info_v1_t)) {
+        dev_zone_info_v1_t old_zone = {0};
+        ret = nvs_get_blob(handle, key, &old_zone, &len);
+        if (ret == ESP_OK) {
+            convert_zone_v1_to_v2(out, &old_zone);
+        }
+        return ret;
+    }
+
+    return ESP_ERR_INVALID_SIZE;
 }
 
 static esp_err_t load_from_nvs(void)
@@ -369,13 +583,33 @@ static esp_err_t load_from_nvs(void)
         }
         nvs_erase_key(handle, "valves");
         migrated = true;
+    } else if (ret == ESP_ERR_NVS_INVALID_LENGTH && len == sizeof(dev_valve_info_v1_t) * DEV_REG_MAX_VALVES) {
+        dev_valve_info_v1_t old_valves[DEV_REG_MAX_VALVES] = {0};
+        ret = nvs_get_blob(handle, "valves", old_valves, &len);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Migrating valves from old v1 blob format");
+            memset(s_valves, 0, sizeof(s_valves));
+            for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
+                convert_valve_v1_to_v2(&s_valves[i], &old_valves[i]);
+                if (s_valves[i].valid) {
+                    char key[8];
+                    snprintf(key, sizeof(key), "v_%d", i);
+                    nvs_set_blob(handle, key, &s_valves[i], sizeof(dev_valve_info_t));
+                }
+            }
+            nvs_erase_key(handle, "valves");
+            migrated = true;
+        }
     } else {
         for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
             char key[8];
             snprintf(key, sizeof(key), "v_%d", i);
-            len = sizeof(dev_valve_info_t);
-            ret = nvs_get_blob(handle, key, &s_valves[i], &len);
-            if (ret != ESP_OK) {
+            ret = load_valves_from_nvs_entry(handle, key, &s_valves[i]);
+            if (ret == ESP_OK) {
+                if (nvs_set_blob(handle, key, &s_valves[i], sizeof(dev_valve_info_t)) == ESP_OK) {
+                    migrated = true;
+                }
+            } else {
                 memset(&s_valves[i], 0, sizeof(dev_valve_info_t));
             }
         }
@@ -419,13 +653,33 @@ static esp_err_t load_from_nvs(void)
         }
         nvs_erase_key(handle, "zones");
         migrated = true;
+    } else if (ret == ESP_ERR_NVS_INVALID_LENGTH && len == sizeof(dev_zone_info_v1_t) * DEV_REG_MAX_ZONES) {
+        dev_zone_info_v1_t old_zones[DEV_REG_MAX_ZONES] = {0};
+        ret = nvs_get_blob(handle, "zones", old_zones, &len);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Migrating zones from old v1 blob format");
+            memset(s_zones, 0, sizeof(s_zones));
+            for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
+                convert_zone_v1_to_v2(&s_zones[i], &old_zones[i]);
+                if (s_zones[i].valid) {
+                    char key[8];
+                    snprintf(key, sizeof(key), "z_%d", i);
+                    nvs_set_blob(handle, key, &s_zones[i], sizeof(dev_zone_info_t));
+                }
+            }
+            nvs_erase_key(handle, "zones");
+            migrated = true;
+        }
     } else {
         for (int i = 0; i < DEV_REG_MAX_ZONES; i++) {
             char key[8];
             snprintf(key, sizeof(key), "z_%d", i);
-            len = sizeof(dev_zone_info_t);
-            ret = nvs_get_blob(handle, key, &s_zones[i], &len);
-            if (ret != ESP_OK) {
+            ret = load_zones_from_nvs_entry(handle, key, &s_zones[i]);
+            if (ret == ESP_OK) {
+                if (nvs_set_blob(handle, key, &s_zones[i], sizeof(dev_zone_info_t)) == ESP_OK) {
+                    migrated = true;
+                }
+            } else {
                 memset(&s_zones[i], 0, sizeof(dev_zone_info_t));
             }
         }
@@ -684,6 +938,12 @@ esp_err_t valve_registry_add(const dev_valve_info_t *valve)
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
+    if (!device_registry_exists_locked(valve->parent_device_id)) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "Valve parent device %u not found", valve->parent_device_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+
     int slot = -1;
     for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
         if (!s_valves[i].valid) {
@@ -697,24 +957,31 @@ esp_err_t valve_registry_add(const dev_valve_info_t *valve)
         return ESP_ERR_NO_MEM;
     }
 
+    uint8_t suffix = next_valve_suffix_for_parent(valve->parent_device_id);
+    if (suffix == 0) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "Valve suffix exhausted for parent %u", valve->parent_device_id);
+        return ESP_ERR_NO_MEM;
+    }
+
+    uint32_t new_id = (uint32_t)valve->parent_device_id * 100U + suffix;
+    if (valve_registry_is_id_taken_locked(new_id)) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "Valve ID %lu already exists", (unsigned long)new_id);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     memcpy(&s_valves[slot], valve, sizeof(dev_valve_info_t));
     s_valves[slot].valid = 1;
+    s_valves[slot].id = new_id;
     s_valves[slot].name[DEV_REG_NAME_LEN - 1] = '\0';
-
-    uint16_t max_id = 0;
-    for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
-        if (s_valves[i].valid && s_valves[i].id > max_id) {
-            max_id = s_valves[i].id;
-        }
-    }
-    s_valves[slot].id = max_id + 1;
 
     xSemaphoreGive(s_mutex);
     persist_post(1, slot);
     return ESP_OK;
 }
 
-esp_err_t valve_registry_remove(uint16_t id)
+esp_err_t valve_registry_remove(uint32_t id)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
@@ -731,10 +998,16 @@ esp_err_t valve_registry_remove(uint16_t id)
     return ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t valve_registry_update(uint16_t id, const dev_valve_info_t *valve)
+esp_err_t valve_registry_update(uint32_t id, const dev_valve_info_t *valve)
 {
     if (!valve) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    if (!device_registry_exists_locked(valve->parent_device_id)) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "Valve parent device %u not found", valve->parent_device_id);
+        return ESP_ERR_NOT_FOUND;
+    }
 
     for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
         if (s_valves[i].valid && s_valves[i].id == id) {

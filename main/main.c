@@ -24,6 +24,7 @@
 #include "zigbee_bridge.h"
 #include "device_registry.h"
 #include "irrigation_scheduler.h"
+#include "cloud_manager.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include <stdlib.h>
@@ -690,6 +691,7 @@ static void sntp_sync_cb(struct timeval *tv)
     ESP_LOGI(TAG, "NTP time synchronized");
     s_time_synced = true;
     irrigation_scheduler_set_time_valid(true);
+    cloud_manager_notify_time_synced(true);
     schedule_event_timestamp_fix();
 }
 
@@ -785,6 +787,13 @@ static void on_wifi_conn_status(wifi_mgr_conn_status_t status, const char *ssid,
     if (status == WIFI_MGR_CONNECTED) {
         ESP_LOGI(TAG, "WiFi connected: %s", msg->ssid);
         s_wifi_connected = true;
+        cloud_manager_notify_wifi(true);
+
+        esp_err_t cloud_start_ret = cloud_manager_start();
+        if (cloud_start_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Cloud manager start failed: %s", esp_err_to_name(cloud_start_ret));
+        }
+
         start_ntp();
         if (msg->ssid[0] != '\0') {
             char desc[64];
@@ -796,6 +805,7 @@ static void on_wifi_conn_status(wifi_mgr_conn_status_t status, const char *ssid,
     } else {
         ESP_LOGI(TAG, "WiFi disconnected: %s", msg->ssid);
         s_wifi_connected = false;
+        cloud_manager_notify_wifi(false);
         stop_ntp();
         /* Record disconnect event */
         char desc[64];
@@ -1178,16 +1188,43 @@ static bool is_sensor_point_registered(uint32_t point_id)
     return false;
 }
 
+static int collect_valve_parent_device_ids(uint16_t *out_ids, int max_ids)
+{
+    const dev_device_info_t *all = device_registry_get_all();
+    int count = 0;
+
+    if (!out_ids || max_ids <= 0) {
+        return 0;
+    }
+
+    for (uint16_t parent_id = 2000U; parent_id <= 2006U && count < max_ids; parent_id++) {
+        for (int i = 0; i < DEV_REG_MAX_DEVICES; i++) {
+            if (!all[i].valid || all[i].id != parent_id) {
+                continue;
+            }
+            out_ids[count++] = all[i].id;
+            break;
+        }
+    }
+
+    return count;
+}
+
 static bool is_pipe_valve_registered(int pipe_id)
 {
     const dev_valve_info_t *all = valve_registry_get_all();
+    uint16_t parent_device_id;
 
-    if (pipe_id <= 0 || pipe_id >= ZB_MAX_PIPES) {
+    if (pipe_id < 0 || pipe_id >= ZB_MAX_PIPES) {
         return false;
     }
 
+    parent_device_id = (uint16_t)(2000U + (uint32_t)pipe_id);
     for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
-        if (all[i].valid && all[i].channel == (uint8_t)pipe_id) {
+        if (!all[i].valid) {
+            continue;
+        }
+        if (all[i].parent_device_id == parent_device_id) {
             return true;
         }
     }
@@ -1448,24 +1485,230 @@ static void refresh_all_zb_ui(void)
     ui_home_update_zigbee_status(any_online, s_zb_frame_count);
 }
 
-/* 设备控制回调（UI → zigbee_bridge） */
-static void on_device_control(uint32_t point_id, bool on)
+/* 设备控制/云控桥接 */
+static void set_cloud_rpc_result(cloud_rpc_result_t *result, bool success, const char *code, const char *message)
+{
+    if (!result) {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->success = success;
+    snprintf(result->code, sizeof(result->code), "%s", code ? code : (success ? "OK" : "ERROR"));
+    snprintf(result->message, sizeof(result->message), "%s", message ? message : (success ? "操作成功" : "操作失败"));
+}
+
+static void request_cloud_report_now(void)
+{
+    esp_err_t ret = cloud_manager_request_report_now();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Cloud report request failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static bool execute_device_control(uint32_t point_id, bool on, const char *log_prefix)
 {
     zb_control_target_t target;
+    esp_err_t ret;
+    char desc[64];
 
     if (!zigbee_bridge_resolve_control_target(point_id, &target)) {
         ESP_LOGW(TAG, "Unsupported control point_id=%lu", (unsigned long)point_id);
-        return;
+        return false;
     }
 
     ESP_LOGI(TAG, "Device control: point_id=%lu type=0x%02X id=%u on=%d",
              (unsigned long)point_id, target.dev_type, target.dev_id, on);
-    zigbee_bridge_send_control(target.dev_type, target.dev_id, on);
+    ret = zigbee_bridge_send_control(target.dev_type, target.dev_id, on);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Device control send failed: point_id=%lu err=%s",
+                 (unsigned long)point_id, esp_err_to_name(ret));
+        return false;
+    }
 
-    char desc[64];
-    snprintf(desc, sizeof(desc), "设备控制: point=%lu -> %s",
-             (unsigned long)point_id, on ? "开启" : "关闭");
+    snprintf(desc, sizeof(desc), "%s: point=%lu -> %s",
+             log_prefix ? log_prefix : "设备控制",
+             (unsigned long)point_id,
+             on ? "开启" : "关闭");
     persist_basic_event_now(EVT_TYPE_CONTROL, desc);
+    request_cloud_report_now();
+    return true;
+}
+
+static bool execute_set_auto_mode(bool enabled, const char *log_prefix)
+{
+    char desc[64];
+
+    if (!irrigation_scheduler_set_auto_enabled(enabled)) {
+        return false;
+    }
+
+    snprintf(desc, sizeof(desc), "%s: %s自动模式",
+             log_prefix ? log_prefix : "操作",
+             enabled ? "启用" : "禁用");
+    enqueue_operation_log(desc);
+    request_cloud_report_now();
+    return true;
+}
+
+static bool execute_start_program(int index, const char *log_prefix)
+{
+    char desc[64];
+
+    if (!irrigation_scheduler_start_program(index)) {
+        return false;
+    }
+
+    snprintf(desc, sizeof(desc), "%s: 手动运行程序 #%d",
+             log_prefix ? log_prefix : "操作",
+             index + 1);
+    enqueue_operation_log(desc);
+    request_cloud_report_now();
+    return true;
+}
+
+static bool execute_start_manual_irrigation(const irr_manual_irrigation_request_t *req, const char *log_prefix)
+{
+    char desc[64];
+
+    if (!req) {
+        return false;
+    }
+
+    if (!irrigation_scheduler_start_manual_irrigation(req)) {
+        return false;
+    }
+
+    snprintf(desc, sizeof(desc), "%s: 手动灌溉 %u分钟",
+             log_prefix ? log_prefix : "操作",
+             (unsigned)req->total_duration);
+    enqueue_operation_log(desc);
+    request_cloud_report_now();
+    return true;
+}
+
+static bool execute_stop_irrigation(const char *log_prefix)
+{
+    char desc[64];
+
+    if (!irrigation_scheduler_stop()) {
+        return false;
+    }
+
+    snprintf(desc, sizeof(desc), "%s: 停止灌溉",
+             log_prefix ? log_prefix : "操作");
+    enqueue_operation_log(desc);
+    request_cloud_report_now();
+    return true;
+}
+
+static bool execute_report_now(const char *log_prefix)
+{
+    char desc[64];
+
+    snprintf(desc, sizeof(desc), "%s: 立即上报",
+             log_prefix ? log_prefix : "操作");
+    enqueue_operation_log(desc);
+    request_cloud_report_now();
+    return true;
+}
+
+static bool on_cloud_rpc_command(const cloud_rpc_command_t *cmd, cloud_rpc_result_t *result)
+{
+    irr_manual_irrigation_request_t req = {0};
+    uint32_t point_id = 0;
+
+    if (!cmd || !result) {
+        return false;
+    }
+
+    switch (cmd->type) {
+        case CLOUD_RPC_SET_AUTO_MODE:
+            if (execute_set_auto_mode(cmd->enabled, "云端操作")) {
+                set_cloud_rpc_result(result, true, "OK", cmd->enabled ? "已启用自动模式" : "已禁用自动模式");
+                return true;
+            }
+            set_cloud_rpc_result(result, false, "EXECUTION_FAILED", "自动模式切换失败");
+            return false;
+
+        case CLOUD_RPC_START_PROGRAM:
+            if (cmd->program_index < 0 || cmd->program_index >= irrigation_scheduler_get_program_count()) {
+                set_cloud_rpc_result(result, false, "INVALID_PROGRAM_INDEX", "程序索引无效");
+                return false;
+            }
+            if (execute_start_program(cmd->program_index, "云端操作")) {
+                set_cloud_rpc_result(result, true, "OK", "程序启动指令已下发");
+                return true;
+            }
+            set_cloud_rpc_result(result, false, "DEVICE_BUSY", "程序启动失败，调度器忙碌或程序无效");
+            return false;
+
+        case CLOUD_RPC_START_MANUAL_IRRIGATION:
+            if (cmd->manual.formula[0] == '\0'
+                || cmd->manual.pre_water < 0
+                || cmd->manual.post_water < 0
+                || cmd->manual.total_duration <= 0) {
+                set_cloud_rpc_result(result, false, "INVALID_PARAMS", "手动灌溉参数无效");
+                return false;
+            }
+            req.pre_water = cmd->manual.pre_water;
+            req.post_water = cmd->manual.post_water;
+            req.total_duration = cmd->manual.total_duration;
+            snprintf(req.formula, sizeof(req.formula), "%s", cmd->manual.formula);
+            if (execute_start_manual_irrigation(&req, "云端操作")) {
+                set_cloud_rpc_result(result, true, "OK", "手动灌溉已启动");
+                return true;
+            }
+            set_cloud_rpc_result(result, false, "DEVICE_BUSY", "手动灌溉启动失败，调度器忙碌");
+            return false;
+
+        case CLOUD_RPC_STOP_IRRIGATION:
+            if (execute_stop_irrigation("云端操作")) {
+                set_cloud_rpc_result(result, true, "OK", "灌溉已停止");
+                return true;
+            }
+            set_cloud_rpc_result(result, false, "NO_ACTIVE_IRRIGATION", "当前没有正在执行的灌溉任务");
+            return false;
+
+        case CLOUD_RPC_CONTROL_DEVICE:
+            if (!execute_device_control(cmd->point_id, cmd->on, "云端控制")) {
+                set_cloud_rpc_result(result, false, "INVALID_POINT_ID", "控制点位无效或下发失败");
+                return false;
+            }
+            set_cloud_rpc_result(result, true, "OK", "控制指令已下发");
+            return true;
+
+        case CLOUD_RPC_CONTROL_VALVE:
+            point_id = cmd->point_id;
+            if (point_id == 0) {
+                set_cloud_rpc_result(result, false, "INVALID_POINT_ID", "阀门点位无效");
+                return false;
+            }
+            if (execute_device_control(point_id, cmd->on, "云端控制")) {
+                set_cloud_rpc_result(result, true, "OK", "阀门控制指令已下发");
+                return true;
+            }
+            set_cloud_rpc_result(result, false, "EXECUTION_FAILED", "阀门控制下发失败");
+            return false;
+
+        case CLOUD_RPC_REPORT_NOW:
+            if (execute_report_now("云端操作")) {
+                set_cloud_rpc_result(result, true, "OK", "已触发立即上报");
+                return true;
+            }
+            set_cloud_rpc_result(result, false, "EXECUTION_FAILED", "立即上报触发失败");
+            return false;
+
+        case CLOUD_RPC_UNKNOWN:
+        default:
+            set_cloud_rpc_result(result, false, "UNSUPPORTED_METHOD", "不支持的RPC方法");
+            return false;
+    }
+}
+
+static void on_device_control(uint32_t point_id, bool on)
+{
+    execute_device_control(point_id, on, "本地控制");
 }
 
 
@@ -1573,7 +1816,7 @@ static bool on_valve_add(const ui_valve_add_params_t *params)
 {
     dev_valve_info_t valve = {0};
     valve.type = params->type;
-    valve.channel = params->channel;
+    valve.channel = 0;
     valve.parent_device_id = params->parent_device_id;
     snprintf(valve.name, sizeof(valve.name), "%s", params->name);
     esp_err_t ret = valve_registry_add(&valve);
@@ -1581,9 +1824,8 @@ static bool on_valve_add(const ui_valve_add_params_t *params)
         ESP_LOGW(TAG, "Add valve failed: %s", esp_err_to_name(ret));
     } else {
         char desc[64];
-        snprintf(desc, sizeof(desc), "设置: 新增阀门 dev=%u ch=%u",
-                 (unsigned)params->parent_device_id,
-                 (unsigned)params->channel);
+        snprintf(desc, sizeof(desc), "设置: 新增阀门 parent=%u",
+                 (unsigned)params->parent_device_id);
         persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
@@ -1623,12 +1865,12 @@ static bool on_device_delete(uint16_t device_id)
     return (ret == ESP_OK);
 }
 
-static bool on_valve_delete(uint16_t valve_id)
+static bool on_valve_delete(uint32_t valve_id)
 {
     esp_err_t ret = valve_registry_remove(valve_id);
     if (ret == ESP_OK) {
         char desc[64];
-        snprintf(desc, sizeof(desc), "设置: 删除阀门 id=%u", (unsigned)valve_id);
+        snprintf(desc, sizeof(desc), "设置: 删除阀门 id=%lu", (unsigned long)valve_id);
         persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return (ret == ESP_OK);
@@ -1660,17 +1902,17 @@ static bool on_device_edit(uint16_t id, const ui_device_edit_params_t *params)
     return ok;
 }
 
-static bool on_valve_edit(uint16_t id, const ui_valve_add_params_t *params)
+static bool on_valve_edit(uint32_t id, const ui_valve_add_params_t *params)
 {
     dev_valve_info_t valve = {0};
     valve.type = params->type;
-    valve.channel = params->channel;
+    valve.channel = 0;
     valve.parent_device_id = params->parent_device_id;
     snprintf(valve.name, sizeof(valve.name), "%s", params->name);
     bool ok = valve_registry_update(id, &valve) == ESP_OK;
     if (ok) {
         char desc[64];
-        snprintf(desc, sizeof(desc), "设置: 编辑阀门 id=%u", (unsigned)id);
+        snprintf(desc, sizeof(desc), "设置: 编辑阀门 id=%lu", (unsigned long)id);
         persist_basic_event_now(EVT_TYPE_OPERATION, desc);
     }
     return ok;
@@ -1727,7 +1969,7 @@ static int on_get_valve_list(ui_valve_row_t *out, int max, int offset)
         if (!all[i].valid) continue;
         if (skipped < offset) { skipped++; continue; }
         out[filled].type = all[i].type;
-        out[filled].channel = all[i].channel;
+        out[filled].channel = 0;
         out[filled].id   = all[i].id;
         out[filled].parent_device_id = all[i].parent_device_id;
         snprintf(out[filled].name, sizeof(out[filled].name), "%s", all[i].name);
@@ -1787,9 +2029,44 @@ static int on_get_device_dropdown(char *buf, int buf_size)
     return device_registry_build_dropdown_str(buf, buf_size);
 }
 
-static int on_get_channel_count(uint16_t device_id)
+static int on_get_valve_parent_dropdown(char *buf, int buf_size)
 {
-    return device_registry_get_channel_count(device_id);
+    uint16_t parent_ids[ZB_MAX_PIPES] = {0};
+    int count;
+    int pos = 0;
+
+    if (!buf || buf_size <= 0) {
+        return 0;
+    }
+
+    buf[0] = '\0';
+    count = collect_valve_parent_device_ids(parent_ids, ZB_MAX_PIPES);
+
+    for (int i = 0; i < count; i++) {
+        const dev_device_info_t *dev = device_registry_get_by_id(parent_ids[i]);
+        int written;
+
+        if (!dev || !dev->valid) {
+            continue;
+        }
+
+        if (pos > 0) {
+            if (pos >= buf_size - 1) {
+                break;
+            }
+            buf[pos++] = '\n';
+            buf[pos] = '\0';
+        }
+
+        written = snprintf(buf + pos, buf_size - pos, "%s (%u)",
+                           dev->name, (unsigned int)dev->id);
+        if (written <= 0 || pos + written >= buf_size) {
+            break;
+        }
+        pos += written;
+    }
+
+    return count;
 }
 
 static bool on_is_sensor_added(uint32_t point_id)
@@ -1814,6 +2091,18 @@ static uint16_t on_parse_device_id(int dropdown_index)
     return 0;
 }
 
+static uint16_t on_parse_valve_parent_device_id(int dropdown_index)
+{
+    uint16_t parent_ids[ZB_MAX_PIPES] = {0};
+    int count = collect_valve_parent_device_ids(parent_ids, ZB_MAX_PIPES);
+
+    if (dropdown_index < 0 || dropdown_index >= count) {
+        return 0;
+    }
+
+    return parent_ids[dropdown_index];
+}
+
 /* ---- 查重桥接回调 ---- */
 static bool on_device_name_taken(const char *name) { return device_registry_is_name_taken(name); }
 static bool on_device_id_taken(uint16_t id)        { return device_registry_is_id_taken(id); }
@@ -1829,7 +2118,7 @@ static bool on_zone_add(const ui_zone_add_params_t *params)
     snprintf(zone.name, sizeof(zone.name), "%s", params->name);
     zone.valve_count = params->valve_count;
     zone.device_count = params->device_count;
-    memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
+    memcpy(zone.valve_ids, params->valve_ids, sizeof(uint32_t) * params->valve_count);
     memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
     bool ok = zone_registry_add(&zone) == ESP_OK;
     if (ok) {
@@ -1857,7 +2146,7 @@ static bool on_zone_edit(int slot_index, const ui_zone_add_params_t *params)
     snprintf(zone.name, sizeof(zone.name), "%s", params->name);
     zone.valve_count = params->valve_count;
     zone.device_count = params->device_count;
-    memcpy(zone.valve_ids, params->valve_ids, sizeof(uint16_t) * params->valve_count);
+    memcpy(zone.valve_ids, params->valve_ids, sizeof(uint32_t) * params->valve_count);
     memcpy(zone.device_ids, params->device_ids, sizeof(uint16_t) * params->device_count);
     bool ok = zone_registry_update(slot_index, &zone) == ESP_OK;
     if (ok) {
@@ -1910,7 +2199,7 @@ static int on_get_zone_list(ui_zone_row_t *out, int max, int offset)
                     sizeof(out[filled].valve_names) - pos, "%s", vname);
             } else {
                 pos += snprintf(out[filled].valve_names + pos,
-                    sizeof(out[filled].valve_names) - pos, "ID:%d", all[i].valve_ids[v]);
+                    sizeof(out[filled].valve_names) - pos, "ID:%lu", (unsigned long)all[i].valve_ids[v]);
             }
         }
 
@@ -1953,7 +2242,7 @@ static bool on_get_zone_detail(int slot_index, ui_zone_add_params_t *out)
     out->valve_count = all[slot_index].valve_count;
     out->device_count = all[slot_index].device_count;
     memcpy(out->valve_ids, all[slot_index].valve_ids,
-           sizeof(uint16_t) * all[slot_index].valve_count);
+           sizeof(uint32_t) * all[slot_index].valve_count);
     memcpy(out->device_ids, all[slot_index].device_ids,
            sizeof(uint16_t) * all[slot_index].device_count);
     return true;
@@ -2095,10 +2384,11 @@ static void register_ui_callbacks(void)
         on_get_sensor_count,
         on_get_sensor_list,
         on_get_device_dropdown,
-        on_get_channel_count,
+        on_get_valve_parent_dropdown,
         on_is_sensor_added,
         on_next_sensor_point_no,
-        on_parse_device_id
+        on_parse_device_id,
+        on_parse_valve_parent_device_id
     );
     ui_settings_register_device_name_check_cb(on_device_name_taken);
     ui_settings_register_device_id_check_cb(on_device_id_taken);
@@ -2219,12 +2509,28 @@ void app_main(void)
         ESP_LOGE(TAG, "Device registry init failed: %s", esp_err_to_name(dr_ret));
     }
 
+    startup_progress_update("正在初始化云平台...", 68);
+    cloud_manager_config_t cloud_cfg = {
+        .host = "10.238.162.222",
+        .port = 1883,
+        .access_token = "DpUQon6NtvxpomLzfppq",
+        .enable_tls = false,
+        .enabled = true,
+    };
+    esp_err_t cloud_ret = cloud_manager_init(&cloud_cfg);
+    if (cloud_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Cloud manager init failed: %s", esp_err_to_name(cloud_ret));
+    } else {
+        cloud_manager_register_rpc_handler(on_cloud_rpc_command);
+    }
+
     startup_progress_update("正在加载灌溉程序...", 74);
     esp_err_t irr_ret = irrigation_scheduler_init();
     if (irr_ret != ESP_OK) {
         ESP_LOGE(TAG, "Irrigation scheduler init failed: %s", esp_err_to_name(irr_ret));
     }
     irrigation_scheduler_set_time_valid(s_time_synced);
+    cloud_manager_notify_time_synced(s_time_synced);
 
     ui_program_store_init();
 

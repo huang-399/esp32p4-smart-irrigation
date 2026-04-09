@@ -47,8 +47,8 @@ static void refresh_sensor_field_card(int field_idx);
 static void refresh_sensor_pipe_label(int pipe_idx);
 static void set_switch_checked(lv_obj_t *sw, bool checked);
 static void clear_view_object_refs(void);
-static uint32_t valve_index_to_point_id(int valve_idx);
-static uint32_t valve_channel_to_point_id(uint8_t channel);
+static uint32_t valve_row_to_point_id(const ui_valve_row_t *row);
+static bool valve_point_id_is_on(uint32_t point_id);
 static const char *sensor_type_name(uint8_t type);
 static const char *zone_switch_title_for_point(uint32_t point_id, char *buf, size_t buf_size);
 static int point_id_to_pipe_index(uint32_t point_id);
@@ -221,20 +221,24 @@ static int point_id_to_pipe_index(uint32_t point_id)
     return (int)(node_id - 2000U);
 }
 
-static uint32_t valve_channel_to_point_id(uint8_t channel)
+static uint32_t valve_row_to_point_id(const ui_valve_row_t *row)
 {
-    if (channel == 0U || channel > 6U) {
+    if (!row) {
         return 0;
     }
-    return (2000U + (uint32_t)channel) * 100U + 1U;
+
+    return row->id;
 }
 
-static uint32_t valve_index_to_point_id(int valve_idx)
+static bool valve_point_id_is_on(uint32_t point_id)
 {
-    if (valve_idx < 0 || valve_idx > 6) {
-        return 0;
+    int pipe_idx = point_id_to_pipe_index(point_id);
+
+    if (pipe_idx < 0 || pipe_idx >= 7) {
+        return false;
     }
-    return (2000U + (uint32_t)valve_idx) * 100U + 1U;
+
+    return s_pipe_cache[pipe_idx].valid && s_pipe_cache[pipe_idx].valve_on;
 }
 
 static const char *zone_switch_title_for_point(uint32_t point_id, char *buf, size_t buf_size)
@@ -352,6 +356,7 @@ static void refresh_dynamic_valve_items(void)
 {
     for (int i = 0; i < g_valve_dynamic_count; i++) {
         uint32_t point_id = g_valve_dynamic_point_ids[i];
+        uint32_t node_id = point_id / 100U;
         int pipe_idx = point_id_to_pipe_index(point_id);
         const device_pipe_cache_t *pipe;
         char buf[96];
@@ -364,11 +369,11 @@ static void refresh_dynamic_valve_items(void)
         char pressure_buf[24];
         bool is_on;
 
-        if (pipe_idx < 0) {
+        if (pipe_idx < 0 || node_id < 2000U || node_id > 2006U) {
             continue;
         }
 
-        pipe = &s_pipe_cache[pipe_idx];
+        pipe = &s_pipe_cache[node_id - 2000U];
         is_on = pipe->valid && pipe->valve_on;
         g_valve_states[pipe_idx] = is_on;
 
@@ -428,11 +433,7 @@ static void refresh_dynamic_zone_switches(void)
             const device_tank_cache_t *tank = &s_tank_cache[point_id - 300006U];
             checked = tank->valid && tank->switch_on;
         } else {
-            int pipe_idx = point_id_to_pipe_index(point_id);
-            if (pipe_idx >= 0) {
-                const device_pipe_cache_t *pipe = &s_pipe_cache[pipe_idx];
-                checked = pipe->valid && pipe->valve_bound && pipe->valve_on;
-            }
+            checked = valve_point_id_is_on(point_id);
         }
 
         if (g_zone_confirm_states[i] == DEV_CONFIRM_PENDING ||
@@ -1094,20 +1095,21 @@ static void device_card_click_cb(lv_event_t *e)
 
 /**
  * @brief 阀门按钮回调 - 弹出确认对话框（单按钮切换）
- * user_data = valve_idx (0~6)
+ * user_data = point_id
  */
 static void valve_btn_cb(lv_event_t *e)
 {
-    int valve_idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (valve_idx < 0 || valve_idx >= 7) return;
+    uint32_t point_id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    char title_buf[32];
 
-    static const char *valve_names[] = {"主管道阀", "副管道1阀", "副管道2阀", "副管道3阀",
-                                         "副管道4阀", "副管道5阀", "副管道6阀"};
+    if (point_id == 0) {
+        return;
+    }
 
-    g_pending_point_id = valve_index_to_point_id(valve_idx);
-    g_pending_on = !g_valve_states[valve_idx];
+    g_pending_point_id = point_id;
+    g_pending_on = !valve_point_id_is_on(point_id);
 
-    show_device_confirm_dialog(valve_names[valve_idx], g_pending_on);
+    show_device_confirm_dialog(zone_switch_title_for_point(point_id, title_buf, sizeof(title_buf)), g_pending_on);
 }
 
 /**
@@ -1390,7 +1392,8 @@ static void create_valve_control_view(lv_obj_t *parent)
     lv_obj_set_style_pad_column(g_valve_container, 10, 0);
 
     for (int i = 0; i < fetch_count; i++) {
-        uint32_t point_id = valve_channel_to_point_id(valve_rows[i].channel);
+        uint32_t point_id = valve_row_to_point_id(&valve_rows[i]);
+        bool valve_on = valve_point_id_is_on(point_id);
         lv_obj_t *card = lv_obj_create(g_valve_container);
         lv_obj_set_size(card, 260, 100);
         lv_obj_set_style_bg_color(card, lv_color_hex(0xf0f8ff), 0);
@@ -1406,7 +1409,7 @@ static void create_valve_control_view(lv_obj_t *parent)
         lv_obj_set_pos(name, 5, 5);
 
         lv_obj_t *state = lv_label_create(card);
-        lv_label_set_text(state, "关闭");
+        lv_label_set_text(state, valve_on ? "开启" : "关闭");
         lv_obj_set_style_text_font(state, &my_font_cn_16, 0);
         lv_obj_set_pos(state, 5, 40);
         g_valve_dynamic_state_labels[i] = state;
@@ -1431,7 +1434,7 @@ static void create_valve_control_view(lv_obj_t *parent)
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_set_style_radius(btn, 4, 0);
         lv_obj_set_style_pad_all(btn, 0, 0);
-        lv_obj_add_event_cb(btn, valve_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)valve_rows[i].channel);
+        lv_obj_add_event_cb(btn, valve_btn_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)point_id);
         g_valve_dynamic_btns[i] = btn;
 
         lv_obj_t *btn_label = lv_label_create(btn);
@@ -1667,25 +1670,8 @@ static void create_zone_control_view(lv_obj_t *parent)
         lv_obj_set_pos(summary, 5, 32);
 
         if (g_get_zone_detail_cb && g_get_zone_detail_cb(zone_rows[i].slot_index, &detail) && detail.valve_count > 0) {
-            uint16_t valve_id = detail.valve_ids[0];
-            uint8_t channel = 0;
-            uint32_t point_id = 0;
+            uint32_t point_id = detail.valve_ids[0];
 
-            for (int v = 0; v < UI_DEVICE_MAX_VALVE_ROWS; v++) {
-                ui_valve_row_t valve_row;
-                if (!g_get_valve_list_cb) {
-                    break;
-                }
-                if (g_get_valve_list_cb(&valve_row, 1, v) != 1) {
-                    break;
-                }
-                if (valve_row.id == valve_id) {
-                    channel = valve_row.channel;
-                    break;
-                }
-            }
-
-            point_id = valve_channel_to_point_id(channel);
             if (point_id != 0) {
                 int idx = g_zone_dynamic_switch_count++;
                 lv_obj_t *info = lv_label_create(card);
@@ -1875,6 +1861,7 @@ void ui_device_update_pipe(int pipe_id,
     bool pressure_bound, float pressure)
 {
     device_pipe_cache_t *pipe;
+    uint32_t point_id;
 
     if (pipe_id < 0 || pipe_id >= 7) {
         return;
@@ -1889,7 +1876,8 @@ void ui_device_update_pipe(int pipe_id,
     pipe->pressure_bound = pressure_bound;
     pipe->pressure = pressure;
 
-    resolve_control_confirm(valve_index_to_point_id(pipe_id), valve_on);
+    point_id = ((uint32_t)pipe_id + 2000U) * 100U + 1U;
+    resolve_control_confirm(point_id, valve_on);
 
     refresh_main_data_panel();
     refresh_valve_card(pipe_id);

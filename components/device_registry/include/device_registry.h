@@ -76,9 +76,9 @@ typedef struct __attribute__((packed)) {
     uint8_t    channel;     /* 挂接通道号 (1-based) */
     uint8_t    reserved;
     uint16_t   parent_device_id;
-    uint16_t   id;          /* 阀门编号 (自动分配) */
+    uint32_t   id;          /* 阀门编号 (自动分配) */
     char       name[DEV_REG_NAME_LEN];
-} dev_valve_info_t;         /* 40 bytes per entry, 32 * 40 = 1280 bytes total */
+} dev_valve_info_t;         /* 42 bytes per entry, 32 * 42 = 1344 bytes total */
 
 /* ---- 传感器信息 / 业务点绑定 ---- */
 typedef struct __attribute__((packed)) {
@@ -97,10 +97,10 @@ typedef struct __attribute__((packed)) {
     uint8_t    valve_count;         /* 实际关联阀门数 */
     uint8_t    device_count;        /* 实际关联设备数 */
     uint8_t    reserved;
-    uint16_t   valve_ids[DEV_REG_ZONE_MAX_VALVES];   /* 关联阀门 ID 列表 */
+    uint32_t   valve_ids[DEV_REG_ZONE_MAX_VALVES];   /* 关联阀门 ID 列表 */
     uint16_t   device_ids[DEV_REG_ZONE_MAX_DEVICES];  /* 关联设备 ID 列表 */
     char       name[DEV_REG_NAME_LEN];
-} dev_zone_info_t;          /* 84 bytes per entry, 16 * 84 = 1344 bytes total */
+} dev_zone_info_t;          /* 116 bytes per entry, 16 * 116 = 1856 bytes total */
 
 /* ========== API ========== */
 
@@ -126,8 +126,8 @@ int device_registry_get_channel_count(uint16_t device_id);
 int valve_registry_get_count(void);
 const dev_valve_info_t *valve_registry_get_all(void);
 esp_err_t valve_registry_add(const dev_valve_info_t *valve);
-esp_err_t valve_registry_remove(uint16_t id);
-esp_err_t valve_registry_update(uint16_t id, const dev_valve_info_t *valve);
+esp_err_t valve_registry_remove(uint32_t id);
+esp_err_t valve_registry_update(uint32_t id, const dev_valve_info_t *valve);
 
 /* ---- 传感器 CRUD ---- */
 int sensor_registry_get_count(void);

@@ -37,7 +37,7 @@ static TaskHandle_t s_scheduler_task = NULL;
 static time_t s_runtime_started_at = 0;
 static time_t s_runtime_deadline_at = 0;
 static int s_last_fire_yyyymmdd[IRR_MAX_PROGRAMS][IRR_MAX_PERIODS];
-static uint16_t s_active_valve_ids[DEV_REG_MAX_VALVES];
+static uint32_t s_active_valve_ids[DEV_REG_MAX_VALVES];
 static int s_active_valve_count = 0;
 
 typedef struct {
@@ -382,7 +382,7 @@ static esp_err_t save_auto_enabled_setting(bool enabled)
     return ret;
 }
 
-static bool valve_id_exists(const uint16_t *ids, int count, uint16_t valve_id)
+static bool valve_id_exists(const uint32_t *ids, int count, uint32_t valve_id)
 {
     for (int i = 0; i < count; i++) {
         if (ids[i] == valve_id) {
@@ -393,7 +393,7 @@ static bool valve_id_exists(const uint16_t *ids, int count, uint16_t valve_id)
     return false;
 }
 
-static int collect_program_valve_ids(const irr_program_t *program, uint16_t *out_ids, int max_ids)
+static int collect_program_valve_ids(const irr_program_t *program, uint32_t *out_ids, int max_ids)
 {
     int count = 0;
     const dev_valve_info_t *valves = valve_registry_get_all();
@@ -425,7 +425,7 @@ static int collect_program_valve_ids(const irr_program_t *program, uint16_t *out
         }
 
         for (int j = 0; j < zones[i].valve_count && count < max_ids; j++) {
-            uint16_t valve_id = zones[i].valve_ids[j];
+            uint32_t valve_id = zones[i].valve_ids[j];
             if (valve_id == 0 || valve_id_exists(out_ids, count, valve_id)) {
                 continue;
             }
@@ -436,29 +436,28 @@ static int collect_program_valve_ids(const irr_program_t *program, uint16_t *out
     return count;
 }
 
-static esp_err_t control_valve_id(uint16_t valve_id, bool on)
+static esp_err_t control_valve_id(uint32_t valve_id, bool on)
 {
     const dev_valve_info_t *valves = valve_registry_get_all();
 
     for (int i = 0; i < DEV_REG_MAX_VALVES; i++) {
         zb_control_target_t target;
-        uint32_t point_id;
 
         if (!valves[i].valid || valves[i].id != valve_id) {
             continue;
         }
 
-        point_id = (2000U + (uint32_t)valves[i].channel) * 100U + 1U;
-        if (!zigbee_bridge_resolve_control_target(point_id, &target)) {
-            ESP_LOGW(TAG, "Skip valve control, unsupported point_id=%lu valve_id=%u channel=%u",
-                     (unsigned long)point_id, valve_id, valves[i].channel);
+        if (!zigbee_bridge_resolve_control_target(valve_id, &target)) {
+            ESP_LOGW(TAG, "Skip valve control, unsupported point_id=%lu valve_id=%lu parent_device_id=%u",
+                     (unsigned long)valve_id, (unsigned long)valve_id,
+                     (unsigned int)valves[i].parent_device_id);
             return ESP_ERR_NOT_SUPPORTED;
         }
 
         return zigbee_bridge_send_control(target.dev_type, target.dev_id, on);
     }
 
-    ESP_LOGW(TAG, "Valve not found: id=%u", valve_id);
+    ESP_LOGW(TAG, "Valve not found: id=%lu", (unsigned long)valve_id);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -467,8 +466,8 @@ static void stop_active_valves(void)
     for (int i = 0; i < s_active_valve_count; i++) {
         esp_err_t ret = control_valve_id(s_active_valve_ids[i], false);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Close valve failed: id=%u err=%s",
-                     s_active_valve_ids[i], esp_err_to_name(ret));
+            ESP_LOGW(TAG, "Close valve failed: id=%lu err=%s",
+                     (unsigned long)s_active_valve_ids[i], esp_err_to_name(ret));
         }
     }
 
@@ -478,7 +477,7 @@ static void stop_active_valves(void)
 
 static bool apply_program_targets(const irr_program_t *program)
 {
-    uint16_t valve_ids[DEV_REG_MAX_VALVES] = {0};
+    uint32_t valve_ids[DEV_REG_MAX_VALVES] = {0};
     int valve_count = collect_program_valve_ids(program, valve_ids, DEV_REG_MAX_VALVES);
     bool any_success = false;
 
@@ -496,8 +495,8 @@ static bool apply_program_targets(const irr_program_t *program)
             s_active_valve_ids[s_active_valve_count++] = valve_ids[i];
             any_success = true;
         } else {
-            ESP_LOGW(TAG, "Open valve failed: id=%u err=%s",
-                     valve_ids[i], esp_err_to_name(ret));
+            ESP_LOGW(TAG, "Open valve failed: id=%lu err=%s",
+                     (unsigned long)valve_ids[i], esp_err_to_name(ret));
         }
     }
 
@@ -1207,6 +1206,19 @@ bool irrigation_scheduler_start_manual_irrigation(const irr_manual_irrigation_re
     }
 
     return start_manual_irrigation_internal(req);
+}
+
+bool irrigation_scheduler_stop(void)
+{
+    if (!s_runtime.busy) {
+        ESP_LOGW(TAG, "Stop irrigation rejected, scheduler idle");
+        return false;
+    }
+
+    clear_queued_programs();
+    set_idle_status();
+    ESP_LOGI(TAG, "Irrigation stopped by request");
+    return true;
 }
 
 void irrigation_scheduler_get_runtime_status(irr_runtime_status_t *out)

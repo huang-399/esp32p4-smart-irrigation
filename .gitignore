@@ -29,3 +29,11 @@ build_run.bat
 build_temp.bat
 build_temp2.bat
 _build.bat
+
+# 本地文档与资料（不上传）
+docs/*.md
+docs/image/
+*.doc
+*.docx
+中期报告.md
+交流.txt

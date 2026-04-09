@@ -125,7 +125,7 @@ static void show_delete_selected_target_confirm_dialog(bool is_zone, int index);
 static void btn_delete_selected_target_cancel_cb(lv_event_t *e);
 static void btn_delete_selected_target_confirm_cb(lv_event_t *e);
 static void ensure_program_selection_cache_loaded(void);
-static void find_zone_name_for_valve(uint16_t valve_id, char *buf, int buf_size);
+static void find_zone_name_for_valve(uint32_t valve_id, char *buf, int buf_size);
 
 /*********************
  *  STATIC VARIABLES
@@ -4181,7 +4181,7 @@ static void btn_delete_selected_target_confirm_cb(lv_event_t *e)
     refresh_irrigation_zone_table();
 }
 
-static void find_zone_name_for_valve(uint16_t valve_id, char *buf, int buf_size)
+static void find_zone_name_for_valve(uint32_t valve_id, char *buf, int buf_size)
 {
     if (!buf || buf_size <= 0) {
         return;

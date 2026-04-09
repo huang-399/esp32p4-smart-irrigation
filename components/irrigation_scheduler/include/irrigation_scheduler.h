@@ -83,6 +83,7 @@ bool irrigation_scheduler_set_auto_enabled(bool enabled);
 bool irrigation_scheduler_get_auto_enabled(void);
 bool irrigation_scheduler_start_program(int index);
 bool irrigation_scheduler_start_manual_irrigation(const irr_manual_irrigation_request_t *req);
+bool irrigation_scheduler_stop(void);
 void irrigation_scheduler_get_runtime_status(irr_runtime_status_t *out);
 
 #ifdef __cplusplus

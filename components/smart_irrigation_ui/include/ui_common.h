@@ -416,10 +416,10 @@ typedef bool (*ui_device_add_cb_t)(const ui_device_add_params_t *params);
 typedef bool (*ui_valve_add_cb_t)(const ui_valve_add_params_t *params);
 typedef bool (*ui_sensor_add_cb_t)(const ui_sensor_add_params_t *params);
 typedef bool (*ui_device_delete_cb_t)(uint16_t device_id);
-typedef bool (*ui_valve_delete_cb_t)(uint16_t valve_id);
+typedef bool (*ui_valve_delete_cb_t)(uint32_t valve_id);
 typedef bool (*ui_sensor_delete_cb_t)(uint32_t point_id);
 typedef bool (*ui_device_edit_cb_t)(uint16_t device_id, const ui_device_edit_params_t *params);
-typedef bool (*ui_valve_edit_cb_t)(uint16_t valve_id, const ui_valve_add_params_t *params);
+typedef bool (*ui_valve_edit_cb_t)(uint32_t valve_id, const ui_valve_add_params_t *params);
 typedef bool (*ui_sensor_edit_cb_t)(uint32_t point_id, const ui_sensor_edit_params_t *params);
 
 /* 查重回调类型 */
@@ -437,7 +437,7 @@ typedef struct {
 typedef struct {
     uint8_t  type;
     uint8_t  channel;
-    uint16_t id;
+    uint32_t id;
     uint16_t parent_device_id;
     char     name[32];
     char     parent_name[32];
@@ -460,12 +460,13 @@ typedef int  (*ui_get_valve_list_cb_t)(ui_valve_row_t *out, int max, int offset)
 typedef int  (*ui_get_sensor_count_cb_t)(void);
 typedef int  (*ui_get_sensor_list_cb_t)(ui_sensor_row_t *out, int max, int offset);
 typedef int  (*ui_get_device_dropdown_cb_t)(char *buf, int buf_size);
-typedef int  (*ui_get_channel_count_cb_t)(uint16_t device_id);
+typedef int  (*ui_get_valve_parent_dropdown_cb_t)(char *buf, int buf_size);
 typedef bool (*ui_is_sensor_added_cb_t)(uint32_t point_id);
 typedef uint8_t (*ui_next_sensor_point_no_cb_t)(uint16_t parent_device_id);
 
 /* 从下拉框选项解析出设备 ID */
 typedef uint16_t (*ui_parse_device_id_cb_t)(int dropdown_index);
+typedef uint16_t (*ui_parse_valve_parent_device_id_cb_t)(int dropdown_index);
 
 /* 注册函数 */
 void ui_settings_register_device_add_cb(ui_device_add_cb_t cb);
@@ -486,17 +487,18 @@ void ui_settings_register_sensor_name_check_cb(ui_is_name_taken_cb_t cb);
 void ui_settings_register_zone_name_check_cb(ui_is_name_taken_cb_t cb);
 
 void ui_settings_register_query_cbs(
-    ui_get_device_count_cb_t    dev_count_cb,
-    ui_get_device_list_cb_t     dev_list_cb,
-    ui_get_valve_count_cb_t     valve_count_cb,
-    ui_get_valve_list_cb_t      valve_list_cb,
-    ui_get_sensor_count_cb_t    sensor_count_cb,
-    ui_get_sensor_list_cb_t     sensor_list_cb,
-    ui_get_device_dropdown_cb_t dev_dropdown_cb,
-    ui_get_channel_count_cb_t   ch_count_cb,
-    ui_is_sensor_added_cb_t     is_added_cb,
+    ui_get_device_count_cb_t     dev_count_cb,
+    ui_get_device_list_cb_t      dev_list_cb,
+    ui_get_valve_count_cb_t      valve_count_cb,
+    ui_get_valve_list_cb_t       valve_list_cb,
+    ui_get_sensor_count_cb_t     sensor_count_cb,
+    ui_get_sensor_list_cb_t      sensor_list_cb,
+    ui_get_device_dropdown_cb_t  dev_dropdown_cb,
+    ui_get_valve_parent_dropdown_cb_t valve_parent_dropdown_cb,
+    ui_is_sensor_added_cb_t      is_added_cb,
     ui_next_sensor_point_no_cb_t next_point_no_cb,
-    ui_parse_device_id_cb_t     parse_id_cb
+    ui_parse_device_id_cb_t      parse_id_cb,
+    ui_parse_valve_parent_device_id_cb_t parse_valve_parent_id_cb
 );
 
 /* 刷新表格（添加/删除后调用） */
@@ -520,7 +522,7 @@ typedef struct {
     char     name[32];
     uint8_t  valve_count;
     uint8_t  device_count;
-    uint16_t valve_ids[16];
+    uint32_t valve_ids[16];
     uint16_t device_ids[8];
 } ui_zone_add_params_t;
 

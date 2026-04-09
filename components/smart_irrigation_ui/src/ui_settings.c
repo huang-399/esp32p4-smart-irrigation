@@ -17,6 +17,19 @@
 
 static const char *TAG = "ui_set";
 
+#define UI_DEVICE_TYPE_CTRL_8CH         0
+#define UI_DEVICE_TYPE_CTRL_16CH        1
+#define UI_DEVICE_TYPE_CTRL_32CH        2
+#define UI_DEVICE_TYPE_ZIGBEE_TERMINAL  3
+#define UI_DEVICE_TYPE_VIRTUAL          4
+
+#define BACKEND_DEV_TYPE_CTRL_8CH       0
+#define BACKEND_DEV_TYPE_CTRL_16CH      1
+#define BACKEND_DEV_TYPE_CTRL_32CH      2
+#define BACKEND_DEV_TYPE_ZB_SENSOR_NODE 3
+#define BACKEND_DEV_TYPE_ZB_CTRL_NODE   4
+#define BACKEND_DEV_TYPE_VIRTUAL        5
+
 /*********************
  *  STATIC PROTOTYPES
  *********************/
@@ -55,9 +68,14 @@ static void device_type_changed_cb(lv_event_t *e);
 static void sensor_type_changed_cb(lv_event_t *e);
 static void update_device_default_name(void);
 static void update_device_default_id(void);
+static void update_valve_default_name(void);
 static void update_sensor_default_name(void);
+static uint8_t ui_device_type_to_backend_type(int ui_idx);
+static int backend_device_type_to_ui_index(uint8_t backend_type);
+static const char *device_type_display_name(uint8_t backend_type);
 static const char *get_device_type_base_name(int idx);
 static bool is_device_id_used(uint16_t candidate_id);
+static uint16_t get_selected_valve_parent_device_id(void);
 static void device_page_cb(lv_event_t *e);
 static void valve_page_cb(lv_event_t *e);
 static void sensor_page_cb(lv_event_t *e);
@@ -131,7 +149,6 @@ static lv_obj_t *g_add_valve_dialog = NULL;
 static lv_obj_t *g_valve_type_dropdown = NULL;
 static lv_obj_t *g_valve_name_input = NULL;
 static lv_obj_t *g_valve_parent_dropdown = NULL;
-static lv_obj_t *g_valve_channel_dropdown = NULL;
 
 /* 传感器编号自动组合相关 */
 static lv_obj_t *g_sensor_id_prefix_label = NULL;  /* 父设备ID前缀显示 */
@@ -161,10 +178,11 @@ static ui_get_valve_list_cb_t     g_valve_list_cb = NULL;
 static ui_get_sensor_count_cb_t   g_sensor_count_cb = NULL;
 static ui_get_sensor_list_cb_t    g_sensor_list_cb = NULL;
 static ui_get_device_dropdown_cb_t g_dev_dropdown_cb = NULL;
-static ui_get_channel_count_cb_t   g_ch_count_cb = NULL;
+static ui_get_valve_parent_dropdown_cb_t g_valve_parent_dropdown_cb = NULL;
 static ui_is_sensor_added_cb_t     g_is_sensor_added_cb = NULL;
 static ui_next_sensor_point_no_cb_t g_next_sensor_point_no_cb = NULL;
 static ui_parse_device_id_cb_t     g_parse_device_id_cb = NULL;
+static ui_parse_valve_parent_device_id_cb_t g_parse_valve_parent_id_cb = NULL;
 
 /* ---- 查重回调指针 ---- */
 static ui_is_name_taken_cb_t      g_device_name_check_cb = NULL;
@@ -206,7 +224,7 @@ static void *g_delete_confirm_data = NULL;
 static bool g_is_editing_device = false;
 static uint16_t g_editing_device_id = 0;
 static bool g_is_editing_valve = false;
-static uint16_t g_editing_valve_id = 0;
+static uint32_t g_editing_valve_id = 0;
 static bool g_is_editing_sensor = false;
 static uint32_t g_editing_sensor_point_id = 0;
 
@@ -236,7 +254,7 @@ static int  g_editing_zone_slot = -1;
 #define ZONE_MAX_VALVES_LIST 64
 #define ZONE_MAX_DEVICES_LIST 32
 static lv_obj_t *g_zone_valve_checkboxes[ZONE_MAX_VALVES_LIST];
-static uint16_t  g_zone_valve_ids[ZONE_MAX_VALVES_LIST];
+static uint32_t  g_zone_valve_ids[ZONE_MAX_VALVES_LIST];
 static int       g_zone_valve_total = 0;
 static lv_obj_t *g_zone_device_checkboxes[ZONE_MAX_DEVICES_LIST];
 static uint16_t  g_zone_device_ids[ZONE_MAX_DEVICES_LIST];
@@ -257,6 +275,71 @@ static void create_zone_management_view(lv_obj_t *parent);
 static void create_device_management_view(lv_obj_t *parent);
 static void create_valve_management_view(lv_obj_t *parent);
 static void create_sensor_view(lv_obj_t *parent);
+
+static uint8_t ui_device_type_to_backend_type(int ui_idx)
+{
+    switch (ui_idx) {
+        case UI_DEVICE_TYPE_CTRL_8CH:
+            return BACKEND_DEV_TYPE_CTRL_8CH;
+        case UI_DEVICE_TYPE_CTRL_16CH:
+            return BACKEND_DEV_TYPE_CTRL_16CH;
+        case UI_DEVICE_TYPE_CTRL_32CH:
+            return BACKEND_DEV_TYPE_CTRL_32CH;
+        case UI_DEVICE_TYPE_ZIGBEE_TERMINAL:
+            return BACKEND_DEV_TYPE_ZB_SENSOR_NODE;
+        case UI_DEVICE_TYPE_VIRTUAL:
+            return BACKEND_DEV_TYPE_VIRTUAL;
+        default:
+            return BACKEND_DEV_TYPE_CTRL_8CH;
+    }
+}
+
+static int backend_device_type_to_ui_index(uint8_t backend_type)
+{
+    switch (backend_type) {
+        case BACKEND_DEV_TYPE_CTRL_8CH:
+            return UI_DEVICE_TYPE_CTRL_8CH;
+        case BACKEND_DEV_TYPE_CTRL_16CH:
+            return UI_DEVICE_TYPE_CTRL_16CH;
+        case BACKEND_DEV_TYPE_CTRL_32CH:
+            return UI_DEVICE_TYPE_CTRL_32CH;
+        case BACKEND_DEV_TYPE_ZB_SENSOR_NODE:
+        case BACKEND_DEV_TYPE_ZB_CTRL_NODE:
+            return UI_DEVICE_TYPE_ZIGBEE_TERMINAL;
+        case BACKEND_DEV_TYPE_VIRTUAL:
+            return UI_DEVICE_TYPE_VIRTUAL;
+        default:
+            return 0;
+    }
+}
+
+static const char *device_type_display_name(uint8_t backend_type)
+{
+    switch (backend_device_type_to_ui_index(backend_type)) {
+        case UI_DEVICE_TYPE_CTRL_8CH:
+            return "8路控制器";
+        case UI_DEVICE_TYPE_CTRL_16CH:
+            return "16路控制器";
+        case UI_DEVICE_TYPE_CTRL_32CH:
+            return "32路控制器";
+        case UI_DEVICE_TYPE_ZIGBEE_TERMINAL:
+            return "Zigbee终端节点";
+        case UI_DEVICE_TYPE_VIRTUAL:
+            return "虚拟节点";
+        default:
+            return "未知";
+    }
+}
+
+static uint16_t get_selected_valve_parent_device_id(void)
+{
+    if (!g_valve_parent_dropdown) {
+        return 0;
+    }
+
+    int sel = lv_dropdown_get_selected(g_valve_parent_dropdown);
+    return g_parse_valve_parent_id_cb ? g_parse_valve_parent_id_cb(sel) : 0;
+}
 static void create_system_settings_view(lv_obj_t *parent);
 static void create_host_settings_view(lv_obj_t *parent);
 static void switch_to_zone_management(void);
@@ -718,7 +801,7 @@ static void create_valve_management_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(table_header, 0, 0);
     lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
 
-    const char *headers[] = {"序号", "电磁阀名称", "类型", "编号", "关联设备", "通道号", "操作"};
+    const char *headers[] = {"序号", "电磁阀名称", "类型", "编号", "关联设备", "业务点", "操作"};
     int header_x[] = {20, 120, 350, 480, 610, 830, 1000};
 
     for (int i = 0; i < 7; i++) {
@@ -1930,9 +2013,7 @@ static void show_add_zone_dialog(void)
             int got = g_dev_list_cb(drows, ROWS_PER_PAGE, offset);
             if (got <= 0) break;
             for (int j = 0; j < got && g_zone_device_total < ZONE_MAX_DEVICES_LIST; j++) {
-                const char *type_names[] = {"8路控制器", "16路控制器", "32路控制器",
-                                             "Zigbee传感节点", "Zigbee控制节点", "虚拟节点"};
-                const char *type_str = (drows[j].type < 6) ? type_names[drows[j].type] : "未知";
+                const char *type_str = device_type_display_name(drows[j].type);
                 char cb_text[80];
                 snprintf(cb_text, sizeof(cb_text), "%s (%s)", drows[j].name, type_str);
 
@@ -2106,16 +2187,18 @@ static void show_add_device_dialog(void)
     lv_obj_set_style_text_color(label_type, lv_color_black(), 0);
 
     g_device_type_dropdown = lv_dropdown_create(g_add_device_dialog);
-    lv_dropdown_set_options(g_device_type_dropdown, "8路控制器\n16路控制器\n32路控制器\nZigbee传感节点\nZigbee控制节点\n虚拟节点");
+    lv_dropdown_set_options(g_device_type_dropdown, "8路控制器\n16路控制器\n32路控制器\nZigbee终端节点\n虚拟节点");
     lv_obj_set_size(g_device_type_dropdown, 420, 45);
     lv_obj_set_pos(g_device_type_dropdown, 130, 55);
     lv_obj_set_style_text_font(g_device_type_dropdown, &my_font_cn_16, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(g_device_type_dropdown), &my_font_cn_16, 0);
+    lv_obj_add_event_cb(g_device_type_dropdown, ui_dropdown_list_font_cb, LV_EVENT_READY, NULL);
     lv_obj_set_style_text_font(g_device_type_dropdown, &my_font_cn_16, LV_PART_SELECTED);
 
     /* 设置下拉列表的字体 */
-    lv_dropdown_set_selected(g_device_type_dropdown, 0);
     lv_obj_add_event_cb(g_device_type_dropdown, device_type_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_dropdown_set_selected(g_device_type_dropdown, 0);
+    update_device_default_name();
+    update_device_default_id();
 
     /* 设备名称 */
     lv_obj_t *label_name = lv_label_create(g_add_device_dialog);
@@ -2270,7 +2353,6 @@ static void show_add_valve_dialog(void)
     g_valve_name_input = lv_textarea_create(g_add_valve_dialog);
     lv_obj_set_size(g_valve_name_input, 420, 45);
     lv_obj_set_pos(g_valve_name_input, 130, 125);
-    lv_textarea_set_text(g_valve_name_input, "电磁阀1");
     lv_textarea_set_one_line(g_valve_name_input, true);
     lv_obj_set_style_text_font(g_valve_name_input, &my_font_cn_16, 0);
     lv_obj_set_style_bg_color(g_valve_name_input, lv_color_hex(0xf0f0f0), 0);
@@ -2292,10 +2374,10 @@ static void show_add_valve_dialog(void)
     lv_obj_add_event_cb(g_valve_parent_dropdown, ui_dropdown_list_font_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(g_valve_parent_dropdown, valve_parent_device_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* 动态填充设备列表 */
+    /* 动态填充阀门父设备列表 */
     static char dev_dd_buf[512];
-    if (g_dev_dropdown_cb) {
-        int cnt = g_dev_dropdown_cb(dev_dd_buf, sizeof(dev_dd_buf));
+    if (g_valve_parent_dropdown_cb) {
+        int cnt = g_valve_parent_dropdown_cb(dev_dd_buf, sizeof(dev_dd_buf));
         if (cnt > 0) {
             lv_dropdown_set_options(g_valve_parent_dropdown, dev_dd_buf);
         } else {
@@ -2305,21 +2387,7 @@ static void show_add_valve_dialog(void)
         lv_dropdown_set_options(g_valve_parent_dropdown, "(无设备)");
     }
 
-    /* 挂接通道号 */
-    lv_obj_t *label_channel = lv_label_create(g_add_valve_dialog);
-    lv_label_set_text(label_channel, "挂接通道号");
-    lv_obj_set_pos(label_channel, 10, 275);
-    lv_obj_set_style_text_font(label_channel, &my_font_cn_16, 0);
-    lv_obj_set_style_text_color(label_channel, lv_color_black(), 0);
-
-    g_valve_channel_dropdown = lv_dropdown_create(g_add_valve_dialog);
-    lv_obj_set_size(g_valve_channel_dropdown, 420, 45);
-    lv_obj_set_pos(g_valve_channel_dropdown, 130, 265);
-    lv_obj_set_style_text_font(g_valve_channel_dropdown, &my_font_cn_16, 0);
-    lv_obj_add_event_cb(g_valve_channel_dropdown, ui_dropdown_list_font_cb, LV_EVENT_READY, NULL);
-
-    /* 根据选中的父设备初始化通道列表 */
-    valve_parent_device_changed_cb(NULL);
+    update_valve_default_name();
 
     /* 取消添加按钮 */
     lv_obj_t *btn_cancel = lv_btn_create(g_add_valve_dialog);
@@ -2774,7 +2842,7 @@ static void add_device_confirm_cb(lv_event_t *e)
 
     ui_device_add_params_t add_params;
     ui_device_edit_params_t edit_params;
-    add_params.type = lv_dropdown_get_selected(g_device_type_dropdown);
+    add_params.type = ui_device_type_to_backend_type(lv_dropdown_get_selected(g_device_type_dropdown));
     edit_params.type = add_params.type;
     const char *name = lv_textarea_get_text(g_device_name_input);
     snprintf(add_params.name, sizeof(add_params.name), "%s", name ? name : "");
@@ -4213,11 +4281,7 @@ void ui_settings_refresh_device_table(void)
         create_row_label(row_bg, buf, header_x[0], 12);
         create_row_label(row_bg, rows[i].name, header_x[1], 12);
 
-        /* 类型名称映射 */
-        const char *type_names[] = {"8路控制器", "16路控制器", "32路控制器",
-                                     "Zigbee传感节点", "Zigbee控制节点", "虚拟节点"};
-        const char *type_str = (rows[i].type < 6) ? type_names[rows[i].type] : "未知";
-        create_row_label(row_bg, type_str, header_x[2], 12);
+        create_row_label(row_bg, device_type_display_name(rows[i].type), header_x[2], 12);
 
         snprintf(buf, sizeof(buf), "%d", rows[i].id);
         create_row_label(row_bg, buf, header_x[3], 12);
@@ -4289,12 +4353,12 @@ void ui_settings_refresh_valve_table(void)
         const char *vtype = (rows[i].type == 0) ? "电磁阀" : "未知";
         create_row_label(row_bg, vtype, header_x[2], 12);
 
-        snprintf(buf, sizeof(buf), "%d", rows[i].id);
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)rows[i].id);
         create_row_label(row_bg, buf, header_x[3], 12);
 
         create_row_label(row_bg, rows[i].parent_name, header_x[4], 12);
 
-        snprintf(buf, sizeof(buf), "通道%d", rows[i].channel);
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)rows[i].id);
         create_row_label(row_bg, buf, header_x[5], 12);
 
         create_edit_btn(row_bg, 920, 6, valve_edit_btn_cb,
@@ -4606,7 +4670,7 @@ static void do_device_delete(lv_event_t *e)
 static void do_valve_delete(lv_event_t *e)
 {
     (void)e;
-    uint16_t id = (uint16_t)(uintptr_t)g_delete_confirm_data;
+    uint32_t id = (uint32_t)(uintptr_t)g_delete_confirm_data;
     if (g_valve_delete_cb) g_valve_delete_cb(id);
     ui_settings_refresh_valve_table();
 }
@@ -4652,7 +4716,8 @@ static void device_edit_btn_cb(lv_event_t *e)
             show_add_device_dialog();
             /* 预填字段（先设类型触发自动命名，再覆盖为实际名称） */
             if (g_device_type_dropdown)
-                lv_dropdown_set_selected(g_device_type_dropdown, g_cached_device_rows[i].type);
+                lv_dropdown_set_selected(g_device_type_dropdown,
+                                         backend_device_type_to_ui_index(g_cached_device_rows[i].type));
             if (g_device_name_input)
                 lv_textarea_set_text(g_device_name_input, g_cached_device_rows[i].name);
             if (g_device_id_input) {
@@ -4671,7 +4736,7 @@ static void device_edit_btn_cb(lv_event_t *e)
 
 static void valve_edit_btn_cb(lv_event_t *e)
 {
-    uint16_t vlv_id = (uint16_t)(uintptr_t)lv_event_get_user_data(e);
+    uint32_t vlv_id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
     for (int i = 0; i < g_cached_valve_count; i++) {
         if (g_cached_valve_rows[i].id == vlv_id) {
             g_is_editing_valve = true;
@@ -4681,18 +4746,15 @@ static void valve_edit_btn_cb(lv_event_t *e)
             if (g_valve_type_dropdown)
                 lv_dropdown_set_selected(g_valve_type_dropdown, g_cached_valve_rows[i].type);
             /* 选择父设备：遍历下拉选项找到匹配的 parent_device_id */
-            if (g_valve_parent_dropdown && g_parse_device_id_cb) {
+            if (g_valve_parent_dropdown && g_parse_valve_parent_id_cb) {
                 int opt_cnt = lv_dropdown_get_option_count(g_valve_parent_dropdown);
                 for (int j = 0; j < opt_cnt; j++) {
-                    if (g_parse_device_id_cb(j) == g_cached_valve_rows[i].parent_device_id) {
+                    if (g_parse_valve_parent_id_cb(j) == g_cached_valve_rows[i].parent_device_id) {
                         lv_dropdown_set_selected(g_valve_parent_dropdown, j);
-                        valve_parent_device_changed_cb(NULL); /* 刷新通道列表 */
                         break;
                     }
                 }
             }
-            if (g_valve_channel_dropdown && g_cached_valve_rows[i].channel > 0)
-                lv_dropdown_set_selected(g_valve_channel_dropdown, g_cached_valve_rows[i].channel - 1);
             if (g_valve_name_input)
                 lv_textarea_set_text(g_valve_name_input, g_cached_valve_rows[i].name);
             return;
@@ -4740,37 +4802,27 @@ static void sensor_edit_btn_cb(lv_event_t *e)
 static void valve_parent_device_changed_cb(lv_event_t *e)
 {
     (void)e;
-    if (!g_valve_channel_dropdown || !g_valve_parent_dropdown) return;
-
-    int sel = lv_dropdown_get_selected(g_valve_parent_dropdown);
-    uint16_t dev_id = g_parse_device_id_cb ? g_parse_device_id_cb(sel) : 0;
-    int ch_count = g_ch_count_cb ? g_ch_count_cb(dev_id) : 8;
-
-    static char ch_buf[256];
-    ch_buf[0] = '\0';
-    int pos = 0;
-    for (int i = 1; i <= ch_count && pos < (int)sizeof(ch_buf) - 12; i++) {
-        if (i > 1) ch_buf[pos++] = '\n';
-        pos += snprintf(ch_buf + pos, sizeof(ch_buf) - pos, "通道%d", i);
-    }
-    lv_dropdown_set_options(g_valve_channel_dropdown, ch_buf);
+    update_valve_default_name();
 }
 
 static void add_valve_confirm_cb(lv_event_t *e)
 {
     (void)e;
     int64_t t0 = esp_timer_get_time();
-    if (!g_valve_type_dropdown || !g_valve_name_input ||
-        !g_valve_parent_dropdown || !g_valve_channel_dropdown) return;
+    if (!g_valve_type_dropdown || !g_valve_name_input || !g_valve_parent_dropdown) return;
 
     ui_valve_add_params_t params;
     params.type = lv_dropdown_get_selected(g_valve_type_dropdown);
     const char *name = lv_textarea_get_text(g_valve_name_input);
     snprintf(params.name, sizeof(params.name), "%s", name ? name : "");
 
-    int parent_idx = lv_dropdown_get_selected(g_valve_parent_dropdown);
-    params.parent_device_id = g_parse_device_id_cb ? g_parse_device_id_cb(parent_idx) : 0;
-    params.channel = lv_dropdown_get_selected(g_valve_channel_dropdown) + 1;
+    params.parent_device_id = get_selected_valve_parent_device_id();
+    params.channel = 0;
+
+    if (params.parent_device_id == 0) {
+        show_settings_warning_dialog("添加失败", "请选择有效的父设备");
+        return;
+    }
 
     /* 新增模式下检查重复名称 */
     if (!g_is_editing_valve) {
@@ -4787,7 +4839,6 @@ static void add_valve_confirm_cb(lv_event_t *e)
         g_valve_type_dropdown = NULL;
         g_valve_name_input = NULL;
         g_valve_parent_dropdown = NULL;
-        g_valve_channel_dropdown = NULL;
     }
     int64_t t1 = esp_timer_get_time();
 
@@ -4818,7 +4869,6 @@ static void add_valve_cancel_cb(lv_event_t *e)
         g_valve_type_dropdown = NULL;
         g_valve_name_input = NULL;
         g_valve_parent_dropdown = NULL;
-        g_valve_channel_dropdown = NULL;
     }
 }
 
@@ -4840,16 +4890,7 @@ static void device_type_changed_cb(lv_event_t *e)
 
 static const char *get_device_type_base_name(int idx)
 {
-    static const char *type_names[] = {
-        "8路控制器", "16路控制器", "32路控制器",
-        "Zigbee传感节点", "Zigbee控制节点", "虚拟节点"
-    };
-
-    if (idx < 0 || idx >= (int)(sizeof(type_names) / sizeof(type_names[0]))) {
-        return NULL;
-    }
-
-    return type_names[idx];
+    return device_type_display_name(ui_device_type_to_backend_type(idx));
 }
 
 static void update_device_default_name(void)
@@ -4857,6 +4898,7 @@ static void update_device_default_name(void)
     if (!g_device_type_dropdown || !g_device_name_input || g_is_editing_device) return;
 
     int idx = lv_dropdown_get_selected(g_device_type_dropdown);
+    uint8_t backend_type = ui_device_type_to_backend_type(idx);
     const char *base_name = get_device_type_base_name(idx);
     if (!base_name) return;
 
@@ -4871,7 +4913,7 @@ static void update_device_default_name(void)
             if (count <= 0) break;
 
             for (int i = 0; i < count; i++) {
-                if (rows[i].type != idx) continue;
+                if (rows[i].type != backend_type) continue;
 
                 size_t base_len = strlen(base_name);
                 if (strncmp(rows[i].name, base_name, base_len) != 0) continue;
@@ -4951,6 +4993,54 @@ static void sensor_type_changed_cb(lv_event_t *e)
 {
     (void)e;
     update_sensor_default_name();
+}
+
+static void update_valve_default_name(void)
+{
+    if (!g_valve_name_input || g_is_editing_valve) return;
+
+    static const char *base_name = "电磁阀";
+    bool used_suffix[128] = {false};
+    int next_suffix = 1;
+
+    if (g_valve_count_cb && g_valve_list_cb) {
+        int total = g_valve_count_cb();
+        ui_valve_row_t rows[ROWS_PER_PAGE];
+        for (int offset = 0; offset < total; offset += ROWS_PER_PAGE) {
+            int count = g_valve_list_cb(rows, ROWS_PER_PAGE, offset);
+            if (count <= 0) break;
+
+            for (int i = 0; i < count; i++) {
+                size_t base_len = strlen(base_name);
+                if (strncmp(rows[i].name, base_name, base_len) != 0) continue;
+
+                const char *suffix = rows[i].name + base_len;
+                int suffix_value = 0;
+
+                if (*suffix == '\0') {
+                    suffix_value = 1;
+                } else {
+                    char *endptr = NULL;
+                    long value = strtol(suffix, &endptr, 10);
+                    if (endptr && *endptr == '\0' && value > 0 && value < (long)(sizeof(used_suffix) / sizeof(used_suffix[0]))) {
+                        suffix_value = (int)value;
+                    }
+                }
+
+                if (suffix_value > 0) {
+                    used_suffix[suffix_value] = true;
+                }
+            }
+        }
+    }
+
+    while (next_suffix < (int)(sizeof(used_suffix) / sizeof(used_suffix[0])) && used_suffix[next_suffix]) {
+        next_suffix++;
+    }
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s%d", base_name, next_suffix);
+    lv_textarea_set_text(g_valve_name_input, buf);
 }
 
 static void update_sensor_default_name(void)
@@ -5075,29 +5165,31 @@ void ui_settings_register_sensor_name_check_cb(ui_is_name_taken_cb_t cb)      { 
 void ui_settings_register_zone_name_check_cb(ui_is_name_taken_cb_t cb)        { g_zone_name_check_cb = cb; }
 
 void ui_settings_register_query_cbs(
-    ui_get_device_count_cb_t    dev_count_cb,
-    ui_get_device_list_cb_t     dev_list_cb,
-    ui_get_valve_count_cb_t     valve_count_cb,
-    ui_get_valve_list_cb_t      valve_list_cb,
-    ui_get_sensor_count_cb_t    sensor_count_cb,
-    ui_get_sensor_list_cb_t     sensor_list_cb,
-    ui_get_device_dropdown_cb_t dev_dropdown_cb,
-    ui_get_channel_count_cb_t   ch_count_cb,
-    ui_is_sensor_added_cb_t     is_added_cb,
+    ui_get_device_count_cb_t     dev_count_cb,
+    ui_get_device_list_cb_t      dev_list_cb,
+    ui_get_valve_count_cb_t      valve_count_cb,
+    ui_get_valve_list_cb_t       valve_list_cb,
+    ui_get_sensor_count_cb_t     sensor_count_cb,
+    ui_get_sensor_list_cb_t      sensor_list_cb,
+    ui_get_device_dropdown_cb_t  dev_dropdown_cb,
+    ui_get_valve_parent_dropdown_cb_t valve_parent_dropdown_cb,
+    ui_is_sensor_added_cb_t      is_added_cb,
     ui_next_sensor_point_no_cb_t next_point_no_cb,
-    ui_parse_device_id_cb_t     parse_id_cb)
+    ui_parse_device_id_cb_t      parse_id_cb,
+    ui_parse_valve_parent_device_id_cb_t parse_valve_parent_id_cb)
 {
-    g_dev_count_cb       = dev_count_cb;
-    g_dev_list_cb        = dev_list_cb;
-    g_valve_count_cb     = valve_count_cb;
-    g_valve_list_cb      = valve_list_cb;
-    g_sensor_count_cb    = sensor_count_cb;
-    g_sensor_list_cb     = sensor_list_cb;
-    g_dev_dropdown_cb    = dev_dropdown_cb;
-    g_ch_count_cb        = ch_count_cb;
-    g_is_sensor_added_cb = is_added_cb;
-    g_next_sensor_point_no_cb = next_point_no_cb;
-    g_parse_device_id_cb = parse_id_cb;
+    g_dev_count_cb             = dev_count_cb;
+    g_dev_list_cb              = dev_list_cb;
+    g_valve_count_cb           = valve_count_cb;
+    g_valve_list_cb            = valve_list_cb;
+    g_sensor_count_cb          = sensor_count_cb;
+    g_sensor_list_cb           = sensor_list_cb;
+    g_dev_dropdown_cb          = dev_dropdown_cb;
+    g_valve_parent_dropdown_cb = valve_parent_dropdown_cb;
+    g_is_sensor_added_cb       = is_added_cb;
+    g_next_sensor_point_no_cb  = next_point_no_cb;
+    g_parse_device_id_cb       = parse_id_cb;
+    g_parse_valve_parent_id_cb = parse_valve_parent_id_cb;
 }
 
 /* ---- 灌区回调注册 ---- */
@@ -5143,7 +5235,6 @@ void ui_settings_close_overlays(void)
         g_valve_type_dropdown = NULL;
         g_valve_name_input = NULL;
         g_valve_parent_dropdown = NULL;
-        g_valve_channel_dropdown = NULL;
     }
 
     if (g_warning_dialog) {
@@ -5309,7 +5400,7 @@ static void zone_delete_btn_cb(lv_event_t *e)
 /* ---- 灌区编辑 ---- */
 
 /* 编辑时保存原始的 valve_ids / device_ids 以便预勾选 */
-static uint16_t g_editing_zone_valve_ids[16];
+static uint32_t g_editing_zone_valve_ids[16];
 static uint8_t  g_editing_zone_valve_count = 0;
 static uint16_t g_editing_zone_device_ids[8];
 static uint8_t  g_editing_zone_device_count = 0;
@@ -5330,7 +5421,7 @@ static void zone_edit_btn_cb(lv_event_t *e)
         if (g_zone_detail_cb(slot, &detail)) {
             g_editing_zone_valve_count = detail.valve_count;
             memcpy(g_editing_zone_valve_ids, detail.valve_ids,
-                   sizeof(uint16_t) * detail.valve_count);
+                   sizeof(uint32_t) * detail.valve_count);
             g_editing_zone_device_count = detail.device_count;
             memcpy(g_editing_zone_device_ids, detail.device_ids,
                    sizeof(uint16_t) * detail.device_count);
